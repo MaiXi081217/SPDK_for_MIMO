@@ -92,7 +92,7 @@ main(int argc, char **argv)
 	int rc;
 
 	spdk_app_opts_init(&opts, sizeof(opts));
-	opts.name = "spdk_tgt";
+	opts.name = "mimo_tgt";
 	if ((rc = spdk_app_parse_args(argc, argv, &opts, g_spdk_tgt_get_opts_string,
 				      NULL, spdk_tgt_parse_arg, spdk_tgt_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {

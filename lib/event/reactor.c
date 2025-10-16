@@ -998,7 +998,7 @@ reactor_run(void *arg)
 	/* Rename the POSIX thread because the reactor is tied to the POSIX
 	 * thread in the SPDK event library.
 	 */
-	snprintf(thread_name, sizeof(thread_name), "reactor_%u", reactor->lcore);
+	snprintf(thread_name, sizeof(thread_name), "MIMO_server_%u", reactor->lcore);
 	_set_thread_name(thread_name);
 
 	reactor->trace_id = spdk_trace_register_owner(OWNER_TYPE_REACTOR, thread_name);
@@ -1042,7 +1042,7 @@ reactor_run(void *arg)
 		 */
 		if (spdk_thread_is_running(thread)) {
 			if (!spdk_thread_is_app_thread(thread)) {
-				SPDK_ERRLOG("spdk_thread_exit() was not called on thread '%s'\n",
+				SPDK_ERRLOG("mimo_thread_exit() was not called on thread '%s'\n",
 					    spdk_thread_get_name(thread));
 				SPDK_ERRLOG("This will result in a non-zero exit code in a future release.\n");
 			}

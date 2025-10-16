@@ -705,11 +705,11 @@ spdk_env_init(const struct spdk_env_opts *opts_user)
 	 */
 	if (g_external_init == false) {
 		if (opts_user != NULL) {
-			fprintf(stderr, "Invalid arguments to reinitialize SPDK env\n");
+			fprintf(stderr, "Invalid arguments to reinitialize env\n");
 			return -EINVAL;
 		}
 
-		printf("Starting %s / %s reinitialization...\n", SPDK_VERSION_STRING, rte_version());
+		// printf("Starting %s / %s reinitialization...\n", SPDK_VERSION_STRING, rte_version());
 		pci_env_reinit();
 
 		return 0;
@@ -754,23 +754,23 @@ spdk_env_init(const struct spdk_env_opts *opts_user)
 		return -EINVAL;
 	}
 
-	SPDK_PRINTF("Starting %s / %s initialization...\n", SPDK_VERSION_STRING, rte_version());
+	// SPDK_PRINTF("Starting %s / %s initialization...\n", SPDK_VERSION_STRING, rte_version());
 
-	args_print = _sprintf_alloc("[ DPDK EAL parameters: ");
-	if (args_print == NULL) {
-		return -ENOMEM;
-	}
-	for (i = 0; i < g_eal_cmdline_argcount; i++) {
-		args_tmp = args_print;
-		args_print = _sprintf_alloc("%s%s ", args_tmp, g_eal_cmdline[i]);
-		if (args_print == NULL) {
-			free(args_tmp);
-			return -ENOMEM;
-		}
-		free(args_tmp);
-	}
-	SPDK_PRINTF("%s]\n", args_print);
-	free(args_print);
+	// args_print = _sprintf_alloc("[ DPDK EAL parameters: ");
+	// if (args_print == NULL) {
+	// 	return -ENOMEM;
+	// }
+	// for (i = 0; i < g_eal_cmdline_argcount; i++) {
+	// 	args_tmp = args_print;
+	// 	args_print = _sprintf_alloc("%s%s ", args_tmp, g_eal_cmdline[i]);
+	// 	if (args_print == NULL) {
+	// 		free(args_tmp);
+	// 		return -ENOMEM;
+	// 	}
+	// 	free(args_tmp);
+	// }
+	// SPDK_PRINTF("%s]\n", args_print);
+	// free(args_print);
 
 	/* DPDK rearranges the array we pass to it, so make a copy
 	 * before passing so we can still free the individual strings
