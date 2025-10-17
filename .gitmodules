@@ -18,4 +18,4 @@
 	url = https://github.com/xnvme/xnvme.git
 [submodule "isa-l-crypto"]
 	path = isa-l-crypto
-	url = https://github.com/intel/isa-l_crypto
+	url = https://github.com/intel/isa-l_crypto.git
