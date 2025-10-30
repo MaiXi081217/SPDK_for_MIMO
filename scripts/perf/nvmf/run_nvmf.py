@@ -1351,10 +1351,10 @@ class SPDKTarget(Target):
         self.log.info("SPDK NVMeOF Target PID=%s" % self.pid)
         self.log.info("Waiting for spdk to initialize...")
         while True:
-            if os.path.exists("/var/tmp/spdk.sock"):
+            if os.path.exists("/var/tmp/mimo.sock"):
                 break
             time.sleep(1)
-        self.client = rpc_client.JSONRPCClient("/var/tmp/spdk.sock")
+        self.client = rpc_client.JSONRPCClient("/var/tmp/mimo.sock")
 
         rpc.sock.sock_set_default_impl(self.client, impl_name=self.sock_impl)
         rpc.iobuf.iobuf_set_options(self.client,
@@ -1404,8 +1404,8 @@ class SPDKTarget(Target):
                 # Try to clean up RPC socket files if they were not removed
                 # because of using 'kill'
                 try:
-                    os.remove("/var/tmp/spdk.sock")
-                    os.remove("/var/tmp/spdk.sock.lock")
+                    os.remove("/var/tmp/mimo.sock")
+                    os.remove("/var/tmp/mimo.sock.lock")
                 except FileNotFoundError:
                     pass
         self.restore_settings()

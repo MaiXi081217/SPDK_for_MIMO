@@ -102,7 +102,7 @@ _set_rpc_sock() {
 	done
 
 	# default .sock
-	[[ -S /var/tmp/spdk.sock ]] && rpc_sock=/var/tmp/spdk.sock
+	[[ -S /var/tmp/mimo.sock ]] && rpc_sock=/var/tmp/mimo.sock
 
 	return 0
 }

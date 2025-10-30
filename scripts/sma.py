@@ -35,7 +35,7 @@ def parse_argv():
     parser.add_argument('--port', '-p', type=int, help='IP port to listen on')
     parser.add_argument('--config', '-c', help='Path to config file')
     defaults = {'address': 'localhost',
-                'socket': '/var/tmp/spdk.sock',
+                'socket': '/var/tmp/mimo.sock',
                 'port': 8080,
                 'discovery_timeout': 10.0,
                 'volume_cleanup_period': 60.0}
