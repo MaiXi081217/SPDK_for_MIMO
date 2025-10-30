@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("SPDK")
 
 # Create an SPDK client
-client = JSONRPCClient(addr=os.getenv("SPDK_RPC_ADDRESS", default="/var/tmp/spdk.sock"), port=8080)
+client = JSONRPCClient(addr=os.getenv("SPDK_RPC_ADDRESS", default="/var/tmp/mimo.sock"), port=8080)
 
 
 @mcp.tool()

@@ -29,7 +29,7 @@ parser.add_argument('host', help='Host name / IP representing proxy server')
 parser.add_argument('port', help='Port number', type=int)
 parser.add_argument('user', help='User name used for authentication')
 parser.add_argument('password', help='Password used for authentication')
-parser.add_argument('-s', dest='sock', help='RPC domain socket path', default='/var/tmp/spdk.sock')
+parser.add_argument('-s', dest='sock', help='RPC domain socket path', default='/var/tmp/mimo.sock')
 parser.add_argument('-c', dest='cert', help='SSL certificate')
 
 

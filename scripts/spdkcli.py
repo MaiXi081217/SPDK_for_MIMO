@@ -44,7 +44,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="SPDK command line interface")
     parser.add_argument('-s', dest='server_addr',
-                        help='RPC domain socket path or IP address', default='/var/tmp/spdk.sock')
+                        help='RPC domain socket path or IP address', default='/var/tmp/mimo.sock')
     parser.add_argument('-p', dest='port',
                         help='RPC port number (if server_addr is IP address)',
                         default=None, type=int)
