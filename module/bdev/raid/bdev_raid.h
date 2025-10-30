@@ -553,6 +553,9 @@ void raid_bdev_free_superblock(struct raid_bdev *raid_bdev);
 void raid_bdev_init_superblock(struct raid_bdev *raid_bdev);
 void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb,
 				void *cb_ctx);
+/* Wipe the superblock on all base bdevs belonging to the specified raid bdev. */
+void raid_bdev_wipe_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb,
+				void *cb_ctx);
 int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 					raid_bdev_load_sb_cb cb, void *cb_ctx);
 

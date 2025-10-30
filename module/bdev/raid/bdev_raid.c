@@ -175,6 +175,14 @@ static void	raid_bdev_examine(struct spdk_bdev *bdev);
 static int	raid_bdev_init(void);
 static void	raid_bdev_deconfigure(struct raid_bdev *raid_bdev,
 				      raid_bdev_destruct_cb cb_fn, void *cb_arg);
+/* Forward declarations for delete flow helpers */
+static void	raid_bdev_delete_continue(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn,
+			       void *cb_arg);
+static void	raid_bdev_delete_on_quiesced(void *arg, int status);
+static void	raid_bdev_delete_on_unquiesced(void *arg, int status);
+static void	raid_bdev_delete_wipe_cb(int status, struct raid_bdev *raid_bdev, void *arg);
+static void	raid_bdev_delete_restore_sb_cb(int restore_status, struct raid_bdev *raid_bdev,
+			       void *arg);
 
 static void
 raid_bdev_ch_process_cleanup(struct raid_bdev_io_channel *raid_ch)
@@ -2451,45 +2459,154 @@ raid_bdev_event_base_bdev(enum spdk_bdev_event_type type, struct spdk_bdev *bdev
  * cb_fn - callback function
  * cb_arg - argument to callback function
  */
+struct raid_bdev_delete_ctx {
+    struct raid_bdev *raid_bdev;
+    raid_bdev_destruct_cb cb_fn;
+    void *cb_arg;
+    bool abort_delete;
+};
+
 void
 raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_arg)
 {
-	struct raid_base_bdev_info *base_info;
+    SPDK_DEBUGLOG(bdev_raid, "delete raid bdev: %s\n", raid_bdev->bdev.name);
 
-	SPDK_DEBUGLOG(bdev_raid, "delete raid bdev: %s\n", raid_bdev->bdev.name);
+    if (raid_bdev->destroy_started) {
+        SPDK_DEBUGLOG(bdev_raid, "destroying raid bdev %s is already started\n",
+                      raid_bdev->bdev.name);
+        if (cb_fn) {
+            cb_fn(cb_arg, -EALREADY);
+        }
+        return;
+    }
 
-	if (raid_bdev->destroy_started) {
-		SPDK_DEBUGLOG(bdev_raid, "destroying raid bdev %s is already started\n",
-			      raid_bdev->bdev.name);
-		if (cb_fn) {
-			cb_fn(cb_arg, -EALREADY);
-		}
-		return;
-	}
+    raid_bdev->destroy_started = true;
 
-	raid_bdev->destroy_started = true;
+    /* If superblock is enabled and the raid is online with discovered bases, quiesce and wipe SB first */
+    if (raid_bdev->superblock_enabled && raid_bdev->state == RAID_BDEV_STATE_ONLINE &&
+        raid_bdev->num_base_bdevs_discovered > 0) {
+        struct raid_bdev_delete_ctx *ctx = calloc(1, sizeof(*ctx));
 
-	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
-		base_info->remove_scheduled = true;
+        if (ctx != NULL) {
+            int rc;
+            ctx->raid_bdev = raid_bdev;
+            ctx->cb_fn = cb_fn;
+            ctx->cb_arg = cb_arg;
+            ctx->abort_delete = false;
 
-		if (raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
-			/*
-			 * As raid bdev is not registered yet or already unregistered,
-			 * so cleanup should be done here itself.
-			 */
-			raid_bdev_free_base_bdev_resource(base_info);
-		}
-	}
+            rc = spdk_bdev_quiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_delete_on_quiesced, ctx);
+            if (rc == 0) {
+                return;
+            }
 
-	if (raid_bdev->num_base_bdevs_discovered == 0) {
-		/* There is no base bdev for this raid, so free the raid device. */
-		raid_bdev_cleanup_and_free(raid_bdev);
-		if (cb_fn) {
-			cb_fn(cb_arg, 0);
-		}
-	} else {
-		raid_bdev_deconfigure(raid_bdev, cb_fn, cb_arg);
-	}
+            /* If quiesce fails, abort deletion and restore state */
+            free(ctx);
+            raid_bdev->destroy_started = false;
+            if (cb_fn) {
+                cb_fn(cb_arg, rc);
+            }
+            return;
+        }
+    }
+
+    raid_bdev_delete_continue(raid_bdev, cb_fn, cb_arg);
+}
+
+static void
+raid_bdev_delete_continue(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_arg)
+{
+    struct raid_base_bdev_info *base_info;
+
+    RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+        base_info->remove_scheduled = true;
+
+        if (raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
+            /*
+             * As raid bdev is not registered yet or already unregistered,
+             * so cleanup should be done here itself.
+             */
+            raid_bdev_free_base_bdev_resource(base_info);
+        }
+    }
+
+    if (raid_bdev->num_base_bdevs_discovered == 0) {
+        /* There is no base bdev for this raid, so free the raid device. */
+        raid_bdev_cleanup_and_free(raid_bdev);
+        if (cb_fn) {
+            cb_fn(cb_arg, 0);
+        }
+    } else {
+        raid_bdev_deconfigure(raid_bdev, cb_fn, cb_arg);
+    }
+}
+
+static void
+raid_bdev_delete_on_unquiesced(void *arg, int status)
+{
+    struct raid_bdev_delete_ctx *ctx = arg;
+    struct raid_bdev *raid_bdev = ctx->raid_bdev;
+
+    if (status != 0) {
+        SPDK_ERRLOG("Failed to unquiesce raid bdev %s: %s\n", raid_bdev->bdev.name, spdk_strerror(-status));
+    }
+
+    if (ctx->abort_delete) {
+        /* Restore state and stop with error */
+        raid_bdev->destroy_started = false;
+        if (ctx->cb_fn) {
+            ctx->cb_fn(ctx->cb_arg, status != 0 ? status : -EIO);
+        }
+        free(ctx);
+        return;
+    }
+
+    raid_bdev_delete_continue(raid_bdev, ctx->cb_fn, ctx->cb_arg);
+    free(ctx);
+}
+
+static void raid_bdev_delete_restore_sb_cb(int restore_status, struct raid_bdev *raid_bdev, void *arg)
+{
+    struct raid_bdev_delete_ctx *ctx = arg;
+    (void)restore_status; /* We will abort regardless, but we tried to restore. */
+    ctx->abort_delete = true;
+    spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_delete_on_unquiesced, ctx);
+}
+
+static void
+raid_bdev_delete_wipe_cb(int status, struct raid_bdev *raid_bdev, void *arg)
+{
+    struct raid_bdev_delete_ctx *ctx = arg;
+
+    if (status != 0) {
+        SPDK_ERRLOG("Failed to wipe raid bdev '%s' superblock: %s\n",
+                    raid_bdev->bdev.name, spdk_strerror(-status));
+        /* Attempt to restore original SB before aborting */
+        raid_bdev_write_superblock(raid_bdev, raid_bdev_delete_restore_sb_cb, ctx);
+        return;
+    }
+
+    spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_delete_on_unquiesced, ctx);
+}
+
+static void
+raid_bdev_delete_on_quiesced(void *arg, int status)
+{
+    struct raid_bdev_delete_ctx *ctx = arg;
+    struct raid_bdev *raid_bdev = ctx->raid_bdev;
+
+    if (status != 0) {
+        SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n", raid_bdev->bdev.name, spdk_strerror(-status));
+        /* Abort: restore state and return error */
+        raid_bdev->destroy_started = false;
+        if (ctx->cb_fn) {
+            ctx->cb_fn(ctx->cb_arg, status);
+        }
+        free(ctx);
+        return;
+    }
+
+    /* Now wipe the superblock only on this raid's base devices */
+    raid_bdev_wipe_superblock(raid_bdev, raid_bdev_delete_wipe_cb, ctx);
 }
 
 static void
