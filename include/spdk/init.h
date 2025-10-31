@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define SPDK_DEFAULT_RPC_ADDR "/var/tmp/spdk.sock"
+#define SPDK_DEFAULT_RPC_ADDR "/var/tmp/mimo.sock"
 
 /**
  * Structure with optional parameters for the JSON-RPC server initialization.
