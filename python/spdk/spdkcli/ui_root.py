@@ -232,7 +232,8 @@ class UIRoot(UINode):
 
     @verbose
     def bdev_raid_create(self, **kwargs):
-        self.client.bdev_raid_create(**kwargs)
+        response = self.client.bdev_raid_create(**kwargs)
+        return response
 
     @verbose
     def bdev_raid_delete(self, **kwargs):

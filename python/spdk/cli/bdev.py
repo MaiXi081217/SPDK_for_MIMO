@@ -1190,13 +1190,14 @@ def add_parser(subparsers):
         for u in args.base_bdevs.strip().split():
             base_bdevs.append(u)
 
-        args.client.bdev_raid_create(
+        # Print the created RAID name (RPC now returns a string)
+        print_json(args.client.bdev_raid_create(
                                   name=args.name,
                                   strip_size_kb=args.strip_size_kb,
                                   raid_level=args.raid_level,
                                   base_bdevs=base_bdevs,
                                   uuid=args.uuid,
-                                  superblock=args.superblock)
+                                  superblock=args.superblock))
     p = subparsers.add_parser('bdev_raid_create', help='Create new raid bdev')
     p.add_argument('-n', '--name', help='raid bdev name', required=True)
     p.add_argument('-z', '--strip-size-kb', help='strip size in KB', type=int)

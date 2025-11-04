@@ -228,15 +228,18 @@ rpc_bdev_raid_create_add_base_bdev_cb(void *_ctx, int status)
 		return;
 	}
 
-	if (ctx->status != 0) {
-		raid_bdev_delete(ctx->raid_bdev, NULL, NULL);
-		spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-						     "Failed to create RAID bdev %s: %s",
-						     ctx->req.name,
-						     spdk_strerror(-ctx->status));
-	} else {
-		spdk_jsonrpc_send_bool_response(ctx->request, true);
-	}
+    if (ctx->status != 0) {
+        raid_bdev_delete(ctx->raid_bdev, NULL, NULL);
+        spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+                                             "Failed to create RAID bdev %s: %s",
+                                             ctx->req.name,
+                                             spdk_strerror(-ctx->status));
+    } else {
+        /* Return the created RAID bdev name instead of just 'true' */
+        struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(ctx->request);
+        spdk_json_write_string(w, ctx->req.name);
+        spdk_jsonrpc_end_result(ctx->request, w);
+    }
 
 	free_rpc_bdev_raid_create_ctx(ctx);
 }
