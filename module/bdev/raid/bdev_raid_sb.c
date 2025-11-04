@@ -292,6 +292,7 @@ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_
 	ctx->buf = spdk_dma_malloc(ctx->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
 	if (!ctx->buf) {
 		rc = -ENOMEM;
+		
 		goto err;
 	}
 
@@ -422,6 +423,101 @@ raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb
 	}
 
 	_raid_bdev_write_superblock(ctx);
+	return;
+err:
+	cb(rc, raid_bdev, cb_ctx);
+}
+
+static void
+raid_bdev_wipe_superblock_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct raid_bdev_write_sb_ctx *ctx = cb_arg;
+	int status = 0;
+
+	if (!success) {
+		SPDK_ERRLOG("Failed to wipe superblock on bdev %s\n", bdev_io->bdev->name);
+		status = -EIO;
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	raid_bdev_write_sb_base_bdev_done(status, ctx);
+}
+
+static void
+_raid_bdev_wipe_superblock(void *_ctx)
+{
+	struct raid_bdev_write_sb_ctx *ctx = _ctx;
+	struct raid_bdev *raid_bdev = ctx->raid_bdev;
+	struct raid_base_bdev_info *base_info;
+	uint8_t i;
+	int rc;
+
+	for (i = ctx->submitted; i < raid_bdev->num_base_bdevs; i++) {
+		base_info = &raid_bdev->base_bdev_info[i];
+
+		if (!base_info->is_configured) {
+			assert(ctx->remaining > 1);
+			raid_bdev_write_sb_base_bdev_done(0, ctx);
+			ctx->submitted++;
+			continue;
+		}
+
+		rc = spdk_bdev_write(base_info->desc, base_info->app_thread_ch,
+				   raid_bdev->sb_io_buf, 0, raid_bdev->sb_io_buf_size,
+				   raid_bdev_wipe_superblock_cb, ctx);
+		if (rc != 0) {
+			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+
+			if (rc == -ENOMEM) {
+				ctx->wait_entry.bdev = bdev;
+				ctx->wait_entry.cb_fn = _raid_bdev_wipe_superblock;
+				ctx->wait_entry.cb_arg = ctx;
+				spdk_bdev_queue_io_wait(bdev, base_info->app_thread_ch, &ctx->wait_entry);
+				return;
+			}
+
+			assert(ctx->remaining > 1);
+			raid_bdev_write_sb_base_bdev_done(rc, ctx);
+		}
+
+		ctx->submitted++;
+	}
+
+	raid_bdev_write_sb_base_bdev_done(0, ctx);
+}
+
+void
+raid_bdev_wipe_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb, void *cb_ctx)
+{
+	struct raid_bdev_write_sb_ctx *ctx;
+	int rc;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+	assert(cb != NULL);
+
+	if (raid_bdev->sb_io_buf == NULL) {
+		rc = raid_bdev_alloc_sb_io_buf(raid_bdev);
+		if (rc != 0) {
+			goto err;
+		}
+	}
+
+	/* Overwrite the superblock area with zeros */
+	memset(raid_bdev->sb_io_buf, 0, raid_bdev->sb_io_buf_size);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		rc = -ENOMEM;
+		goto err;
+	}
+
+	ctx->raid_bdev = raid_bdev;
+	ctx->remaining = raid_bdev->num_base_bdevs + 1;
+	ctx->cb = cb;
+	ctx->cb_ctx = cb_ctx;
+
+	_raid_bdev_wipe_superblock(ctx);
 	return;
 err:
 	cb(rc, raid_bdev, cb_ctx);
