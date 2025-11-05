@@ -1553,3 +1553,94 @@ def add_parser(subparsers):
     p.add_argument('name', help='DAOS bdev name')
     p.add_argument('new_size', help='new bdev size for resize operation. The unit is MiB', type=int)
     p.set_defaults(func=bdev_daos_resize)
+
+    # ec
+    def bdev_ec_get_bdevs(args):
+        print_json(args.client.bdev_ec_get_bdevs(
+                                                category=args.category))
+
+    p = subparsers.add_parser('bdev_ec_get_bdevs',
+                              help="""This is used to list all the EC bdev details based on the input category
+    requested. Category should be one of 'all', 'online', 'configuring' or 'offline'. 'all' means all the EC bdevs whether
+    they are online or configuring or offline. 'online' is the EC bdev which is registered with bdev layer. 'configuring'
+    is the EC bdev which does not have full configuration discovered yet. 'offline' is the EC bdev which is not registered
+    with bdev as of now and it has encountered any error or user has requested to offline the EC bdev""")
+    p.add_argument('category', help='all or online or configuring or offline', nargs='?', default='all')
+    p.set_defaults(func=bdev_ec_get_bdevs)
+
+    def bdev_ec_create(args):
+        base_bdevs = []
+        
+        # Parse base_bdevs with their roles
+        # Format can be: "bdev1 bdev2 bdev3" or JSON format: '[{"name":"bdev1","is_data_block":true},...]'
+        if args.base_bdevs.startswith('['):
+            # JSON format
+            import json
+            bdev_list = json.loads(args.base_bdevs)
+            for bdev in bdev_list:
+                base_bdevs.append({
+                    "name": bdev.get("name", bdev),
+                    "is_data_block": bdev.get("is_data_block", True)
+                })
+        else:
+            # Simple format: space-separated list, optionally with :data or :parity suffix
+            for bdev_entry in args.base_bdevs.strip().split():
+                if ':' in bdev_entry:
+                    # Format: "bdev_name:data" or "bdev_name:parity"
+                    parts = bdev_entry.rsplit(':', 1)
+                    bdev_name = parts[0]
+                    is_data = parts[1].lower() in ['data', 'd', 'true']
+                    base_bdevs.append({
+                        "name": bdev_name,
+                        "is_data_block": is_data
+                    })
+                else:
+                    # Default to data block if no suffix
+                    base_bdevs.append({
+                        "name": bdev_entry,
+                        "is_data_block": True
+                    })
+
+        # Validate: must have at least one data block and one parity block
+        data_count = sum(1 for bdev in base_bdevs if bdev.get("is_data_block", True))
+        parity_count = sum(1 for bdev in base_bdevs if not bdev.get("is_data_block", True))
+        
+        if data_count == 0:
+            print("ERROR: At least one data block (k>=1) is required for EC bdev", file=sys.stderr)
+            print("       Hint: Use ':data' suffix or set is_data_block=true in JSON format", file=sys.stderr)
+            sys.exit(1)
+        
+        if parity_count == 0:
+            print("ERROR: At least one parity block (p>=1) is required for EC bdev", file=sys.stderr)
+            print("       Hint: Use ':parity' suffix or set is_data_block=false in JSON format", file=sys.stderr)
+            print("       Example: 'bdev1:data bdev2:data bdev3:parity'", file=sys.stderr)
+            sys.exit(1)
+
+        # Print the created EC name (RPC returns a string)
+        print_json(args.client.bdev_ec_create(
+                                  name=args.name,
+                                  strip_size_kb=args.strip_size_kb,
+                                  base_bdevs=base_bdevs,
+                                  uuid=args.uuid,
+                                  superblock=args.superblock))
+    
+    p = subparsers.add_parser('bdev_ec_create', help='Create new EC (Erasure Code) bdev')
+    p.add_argument('-n', '--name', help='EC bdev name', required=True)
+    p.add_argument('-z', '--strip-size-kb', help='strip size in KB', type=int)
+    p.add_argument('-b', '--base-bdevs', help='''base bdevs with their roles. 
+    Format 1 (simple): space-separated list with optional :data or :parity suffix
+    Example: "bdev1:data bdev2:data bdev3:parity bdev4:parity"
+    Format 2 (JSON): JSON array of objects with name and is_data_block fields
+    Example: '[{"name":"bdev1","is_data_block":true},{"name":"bdev2","is_data_block":false}]'
+    If no suffix is provided, bdev defaults to data block.''', required=True)
+    p.add_argument('--uuid', help='UUID for this EC bdev')
+    p.add_argument('-s', '--superblock', help='information about EC bdev will be stored in superblock on each base bdev, '
+                                              'disabled by default', action='store_true')
+    p.set_defaults(func=bdev_ec_create)
+
+    def bdev_ec_delete(args):
+        args.client.bdev_ec_delete(name=args.name)
+    
+    p = subparsers.add_parser('bdev_ec_delete', help='Delete existing EC bdev')
+    p.add_argument('name', help='EC bdev name')
+    p.set_defaults(func=bdev_ec_delete)

@@ -1916,6 +1916,29 @@ raid_bdev_configure(struct raid_bdev *raid_bdev, raid_bdev_configure_cb cb, void
  * none
  */
 static void
+raid_bdev_deconfigure_unregister_done(void *cb_arg)
+{
+	struct raid_bdev *raid_bdev = cb_arg;
+	raid_bdev_destruct_cb user_cb_fn = raid_bdev->deconfigure_cb_fn;
+	void *user_cb_arg = raid_bdev->deconfigure_cb_arg;
+
+	/* Clear the stored callbacks */
+	raid_bdev->deconfigure_cb_fn = NULL;
+	raid_bdev->deconfigure_cb_arg = NULL;
+
+	/* Close self_desc before calling user callback */
+	if (raid_bdev->self_desc != NULL) {
+		spdk_bdev_close(raid_bdev->self_desc);
+		raid_bdev->self_desc = NULL;
+	}
+
+	/* Call user callback */
+	if (user_cb_fn) {
+		user_cb_fn(user_cb_arg, 0);
+	}
+}
+
+static void
 raid_bdev_deconfigure(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn,
 		      void *cb_arg)
 {
@@ -1929,7 +1952,12 @@ raid_bdev_deconfigure(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn,
 	raid_bdev->state = RAID_BDEV_STATE_OFFLINE;
 	SPDK_DEBUGLOG(bdev_raid, "raid bdev state changing from online to offline\n");
 
-	spdk_bdev_unregister(&raid_bdev->bdev, cb_fn, cb_arg);
+	/* Store user callbacks to call them after unregister completes */
+	raid_bdev->deconfigure_cb_fn = cb_fn;
+	raid_bdev->deconfigure_cb_arg = cb_arg;
+
+	/* Use wrapper callback that will close self_desc and then call user callback */
+	spdk_bdev_unregister(&raid_bdev->bdev, raid_bdev_deconfigure_unregister_done, raid_bdev);
 }
 
 /*
