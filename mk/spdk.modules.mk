@@ -41,6 +41,11 @@ BLOCKDEV_MODULES_LIST += bdev_ocf
 BLOCKDEV_MODULES_LIST += ocfenv
 endif
 
+ifeq ($(CONFIG_ISAL),y)
+BLOCKDEV_MODULES_LIST += bdev_ec
+INTR_BLOCKDEV_MODULES_LIST += bdev_ec
+endif
+
 ifeq ($(CONFIG_RDMA),y)
 BLOCKDEV_MODULES_LIST += rdma_provider rdma_utils
 BLOCKDEV_MODULES_PRIVATE_LIBS += -libverbs -lrdmacm

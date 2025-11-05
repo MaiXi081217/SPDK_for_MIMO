@@ -176,6 +176,7 @@ struct raid_bdev_process_request {
 };
 
 typedef void (*raid_bdev_configure_cb)(void *cb_ctx, int rc);
+typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
 
 /*
  * raid_bdev is the single entity structure which contains SPDK block device
@@ -248,6 +249,10 @@ struct raid_bdev {
 	/* Callback and context for raid_bdev configuration */
 	raid_bdev_configure_cb		configure_cb;
 	void				*configure_cb_ctx;
+
+	/* Callback and context for raid_bdev deconfiguration (during deletion) */
+	raid_bdev_destruct_cb		deconfigure_cb_fn;
+	void				*deconfigure_cb_arg;
 };
 
 #define RAID_FOR_EACH_BASE_BDEV(r, i) \
@@ -259,8 +264,6 @@ struct raid_bdev_io_channel;
 TAILQ_HEAD(raid_all_tailq, raid_bdev);
 
 extern struct raid_all_tailq		g_raid_bdev_list;
-
-typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
 
 int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		     enum raid_level level, bool superblock, const struct spdk_uuid *uuid,

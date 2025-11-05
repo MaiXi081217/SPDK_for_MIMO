@@ -16,6 +16,8 @@ DIRS-$(CONFIG_OCF) += ocf
 
 DIRS-$(CONFIG_URING) += uring
 
+DIRS-$(CONFIG_ISAL) += ec
+
 ifeq ($(OS),Linux)
 DIRS-y += aio ftl
 DIRS-$(CONFIG_ISCSI_INITIATOR) += iscsi
