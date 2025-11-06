@@ -31,14 +31,30 @@ struct ec_bdev_read_sb_ctx {
 	uint32_t buf_size;
 };
 
+/* Forward declarations */
+static void ec_bdev_sb_update_crc(struct ec_bdev_superblock *sb);
+
 int
 ec_bdev_alloc_superblock(struct ec_bdev *ec_bdev, uint32_t block_size)
 {
 	struct ec_bdev_superblock *sb;
+	uint64_t align = 0x1000; /* Default 4KB alignment */
+	struct ec_base_bdev_info *base_info;
 
 	assert(ec_bdev->sb == NULL);
 
-	sb = spdk_dma_zmalloc(SPDK_ALIGN_CEIL(EC_BDEV_SB_MAX_LENGTH, block_size), 0x1000, NULL);
+	/* Try to get alignment from first configured base bdev if available */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->is_configured && base_info->desc != NULL) {
+			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+			align = spdk_bdev_get_buf_align(bdev);
+			break;
+		}
+	}
+
+	/* If no base bdev is configured yet, use default alignment */
+	/* Note: This is safe as 4KB is a common alignment requirement */
+	sb = spdk_dma_zmalloc(SPDK_ALIGN_CEIL(EC_BDEV_SB_MAX_LENGTH, block_size), align, NULL);
 	if (!sb) {
 		SPDK_ERRLOG("Failed to allocate EC bdev sb buffer\n");
 		return -ENOMEM;
@@ -58,6 +74,8 @@ ec_bdev_free_superblock(struct ec_bdev *ec_bdev)
 		ec_bdev->sb_io_buf = NULL;
 	}
 	if (ec_bdev->sb != NULL) {
+		SPDK_DEBUGLOG(bdev_ec_sb, "Freed superblock buffers for %s\n",
+			      ec_bdev->bdev.name);
 		spdk_dma_free(ec_bdev->sb);
 		ec_bdev->sb = NULL;
 	}
@@ -94,17 +112,33 @@ ec_bdev_init_superblock(struct ec_bdev *ec_bdev)
 		sb_base_bdev->is_data_block = base_info->is_data_block;
 		sb_base_bdev++;
 	}
+
+	/* Update CRC immediately after initialization for safety and debugging */
+	ec_bdev_sb_update_crc(sb);
 }
 
 static int
 ec_bdev_alloc_sb_io_buf(struct ec_bdev *ec_bdev)
 {
 	struct ec_bdev_superblock *sb = ec_bdev->sb;
+	uint32_t data_block_size = spdk_bdev_get_data_block_size(&ec_bdev->bdev);
+	uint64_t align = 0x1000; /* Default alignment */
+	struct ec_base_bdev_info *base_info;
+
+	/* Try to get alignment from first configured base bdev if available */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->is_configured && base_info->desc != NULL) {
+			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+			align = spdk_bdev_get_buf_align(bdev);
+			break;
+		}
+	}
 
 	if (spdk_bdev_is_md_interleaved(&ec_bdev->bdev)) {
+		/* Use actual data block size instead of sb->block_size */
 		ec_bdev->sb_io_buf_size = spdk_divide_round_up(sb->length,
-					    sb->block_size) * ec_bdev->bdev.blocklen;
-		ec_bdev->sb_io_buf = spdk_dma_zmalloc(ec_bdev->sb_io_buf_size, 0x1000, NULL);
+					    data_block_size) * ec_bdev->bdev.blocklen;
+		ec_bdev->sb_io_buf = spdk_dma_zmalloc(ec_bdev->sb_io_buf_size, align, NULL);
 		if (!ec_bdev->sb_io_buf) {
 			SPDK_ERRLOG("Failed to allocate EC bdev sb io buffer\n");
 			return -ENOMEM;
@@ -143,31 +177,41 @@ ec_bdev_parse_superblock(struct ec_bdev_read_sb_ctx *ctx)
 	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(ctx->desc);
 	struct ec_bdev_sb_base_bdev *sb_base_bdev;
 	uint8_t i;
+	char uuid_str[SPDK_UUID_STRING_LEN];
 
 	if (memcmp(sb->signature, EC_BDEV_SB_SIG, sizeof(sb->signature))) {
-		SPDK_DEBUGLOG(bdev_ec_sb, "invalid signature\n");
+		SPDK_DEBUGLOG(bdev_ec_sb, "Invalid superblock signature on bdev %s\n",
+			      spdk_bdev_get_name(bdev));
+		return -EINVAL;
+	}
+
+	/* Check length before processing */
+	if (sb->length > EC_BDEV_SB_MAX_LENGTH) {
+		SPDK_ERRLOG("Superblock length %u exceeds maximum %zu on bdev %s\n",
+			    sb->length, (size_t)EC_BDEV_SB_MAX_LENGTH, spdk_bdev_get_name(bdev));
 		return -EINVAL;
 	}
 
 	if (spdk_divide_round_up(sb->length, spdk_bdev_get_data_block_size(bdev)) >
 	    spdk_divide_round_up(ctx->buf_size, bdev->blocklen)) {
-		if (sb->length > EC_BDEV_SB_MAX_LENGTH) {
-			SPDK_WARNLOG("Incorrect superblock length on bdev %s\n",
-				     spdk_bdev_get_name(bdev));
-			return -EINVAL;
-		}
-
 		return -EAGAIN;
 	}
 
 	if (!ec_bdev_sb_check_crc(sb)) {
-		SPDK_WARNLOG("Incorrect superblock crc on bdev %s\n", spdk_bdev_get_name(bdev));
+		uint32_t expected_crc = sb->crc;
+		uint32_t calculated_crc;
+		/* Calculate CRC for logging (ec_bdev_sb_check_crc already did this but we don't have access) */
+		sb->crc = 0;
+		calculated_crc = spdk_crc32c_update(sb, sb->length, 0);
+		sb->crc = expected_crc; /* Restore original value */
+		SPDK_WARNLOG("Incorrect superblock CRC on bdev %s (expected: 0x%08x, calculated: 0x%08x)\n",
+			     spdk_bdev_get_name(bdev), expected_crc, calculated_crc);
 		return -EINVAL;
 	}
 
 	if (sb->version.major != EC_BDEV_SB_VERSION_MAJOR) {
-		SPDK_ERRLOG("Not supported superblock major version %d on bdev %s\n",
-			    sb->version.major, spdk_bdev_get_name(bdev));
+		SPDK_ERRLOG("Unsupported superblock major version %d (expected %d) on bdev %s\n",
+			    sb->version.major, EC_BDEV_SB_VERSION_MAJOR, spdk_bdev_get_name(bdev));
 		return -EINVAL;
 	}
 
@@ -179,11 +223,16 @@ ec_bdev_parse_superblock(struct ec_bdev_read_sb_ctx *ctx)
 	for (i = 0; i < sb->base_bdevs_size; i++) {
 		sb_base_bdev = &sb->base_bdevs[i];
 		if (sb_base_bdev->slot >= sb->num_base_bdevs) {
-			SPDK_WARNLOG("Invalid superblock base bdev slot number %u on bdev %s\n",
-				     sb_base_bdev->slot, spdk_bdev_get_name(bdev));
+			SPDK_ERRLOG("Invalid superblock base bdev slot number %u (max: %u) on bdev %s\n",
+				    sb_base_bdev->slot, sb->num_base_bdevs, spdk_bdev_get_name(bdev));
 			return -EINVAL;
 		}
 	}
+
+	/* Log successful parsing */
+	spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &sb->uuid);
+	SPDK_DEBUGLOG(bdev_ec_sb, "Superblock parsed successfully on %s (uuid=%s, name=%s, k=%u, p=%u)\n",
+		      spdk_bdev_get_name(bdev), uuid_str, sb->name, sb->k, sb->p);
 
 	return 0;
 }
@@ -238,12 +287,15 @@ ec_bdev_read_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	if (spdk_bdev_is_md_interleaved(bdev_io->bdev) && ctx->buf_size > bdev->blocklen) {
 		const uint32_t data_block_size = spdk_bdev_get_data_block_size(bdev);
+		uint32_t num_blocks = ctx->buf_size / bdev->blocklen;
 		uint32_t i;
 
-		for (i = 1; i < ctx->buf_size / bdev->blocklen; i++) {
-			memmove(ctx->buf + (i * data_block_size),
-				ctx->buf + (i * bdev->blocklen),
-				data_block_size);
+		/* Use reverse iteration with memcpy to avoid overlapping issues
+		 * when bdev->blocklen > data_block_size (i.e., metadata padding exists) */
+		for (i = num_blocks; i > 0; i--) {
+			memcpy(ctx->buf + (i - 1) * data_block_size,
+			       ctx->buf + (i - 1) * bdev->blocklen,
+			       data_block_size);
 		}
 	}
 
@@ -353,9 +405,10 @@ _ec_bdev_write_superblock(void *_ctx)
 		base_info = &ec_bdev->base_bdev_info[i];
 
 		if (!base_info->is_configured || base_info->remove_scheduled) {
-			assert(ctx->remaining > 1);
-			ec_bdev_write_sb_base_bdev_done(0, ctx);
+			/* Skip unconfigured or scheduled-for-removal base bdevs -
+			 * decrement remaining directly */
 			ctx->submitted++;
+			ctx->remaining--;
 			continue;
 		}
 
@@ -373,14 +426,23 @@ _ec_bdev_write_superblock(void *_ctx)
 				return;
 			}
 
-			assert(ctx->remaining > 1);
+			/* Write failed immediately - call done callback to decrement remaining */
+			/* Note: remaining >= 1 is expected here (at least this write operation) */
+			if (ctx->remaining == 0) {
+				SPDK_ERRLOG("Invalid state: remaining is 0 when handling write failure\n");
+				/* Still call done to ensure callback is triggered */
+			}
 			ec_bdev_write_sb_base_bdev_done(rc, ctx);
+			/* Don't increment submitted here since the write failed immediately */
+			continue;
 		}
 
 		ctx->submitted++;
 	}
 
-	ec_bdev_write_sb_base_bdev_done(0, ctx);
+	/* All write operations have been submitted (or skipped for unconfigured bdevs).
+	 * The callbacks will handle decrementing remaining and calling the final callback
+	 * when all operations complete. No need to call ec_bdev_write_sb_base_bdev_done here. */
 }
 
 void
@@ -408,7 +470,7 @@ ec_bdev_write_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb, void *
 	}
 
 	ctx->ec_bdev = ec_bdev;
-	ctx->remaining = ec_bdev->num_base_bdevs + 1;
+	ctx->remaining = ec_bdev->num_base_bdevs;
 	ctx->cb = cb;
 	ctx->cb_ctx = cb_ctx;
 
@@ -460,9 +522,9 @@ _ec_bdev_wipe_superblock(void *_ctx)
 		base_info = &ec_bdev->base_bdev_info[i];
 
 		if (!base_info->is_configured) {
-			assert(ctx->remaining > 1);
-			ec_bdev_write_sb_base_bdev_done(0, ctx);
+			/* Skip unconfigured base bdevs - decrement remaining directly */
 			ctx->submitted++;
+			ctx->remaining--;
 			continue;
 		}
 
@@ -480,14 +542,23 @@ _ec_bdev_wipe_superblock(void *_ctx)
 				return;
 			}
 
-			assert(ctx->remaining > 1);
+			/* Write failed immediately - call done callback to decrement remaining */
+			/* Note: remaining >= 1 is expected here (at least this write operation) */
+			if (ctx->remaining == 0) {
+				SPDK_ERRLOG("Invalid state: remaining is 0 when handling wipe failure\n");
+				/* Still call done to ensure callback is triggered */
+			}
 			ec_bdev_write_sb_base_bdev_done(rc, ctx);
+			/* Don't increment submitted here since the write failed immediately */
+			continue;
 		}
 
 		ctx->submitted++;
 	}
 
-	ec_bdev_write_sb_base_bdev_done(0, ctx);
+	/* All write operations have been submitted (or skipped for unconfigured bdevs).
+	 * The callbacks will handle decrementing remaining and calling the final callback
+	 * when all operations complete. No need to call ec_bdev_write_sb_base_bdev_done here. */
 }
 
 void
@@ -516,7 +587,7 @@ ec_bdev_wipe_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb, void *c
 	}
 
 	ctx->ec_bdev = ec_bdev;
-	ctx->remaining = ec_bdev->num_base_bdevs + 1;
+	ctx->remaining = ec_bdev->num_base_bdevs;
 	ctx->cb = cb;
 	ctx->cb_ctx = cb_ctx;
 

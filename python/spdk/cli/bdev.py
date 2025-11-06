@@ -1644,3 +1644,27 @@ def add_parser(subparsers):
     p = subparsers.add_parser('bdev_ec_delete', help='Delete existing EC bdev')
     p.add_argument('name', help='EC bdev name')
     p.set_defaults(func=bdev_ec_delete)
+
+    def bdev_ec_add_base_bdev(args):
+        # RPC expects boolean for is_data_block, default is True
+        # Always pass is_data_block to RPC (RPC decoder handles default)
+        args.client.bdev_ec_add_base_bdev(
+                                         ec_bdev=args.ec_bdev,
+                                         base_bdev=args.base_bdev,
+                                         is_data_block=args.is_data_block)
+    p = subparsers.add_parser('bdev_ec_add_base_bdev', help='Add base bdev to existing EC bdev')
+    p.add_argument('ec_bdev', help='EC bdev name')
+    p.add_argument('base_bdev', help='base bdev name')
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('-d', '--is-data-block', help='Set this base bdev as a data block (default)', 
+                       action='store_true', dest='is_data_block', default=True)
+    group.add_argument('-p', '--parity-block', help='Set this base bdev as a parity block', 
+                        action='store_false', dest='is_data_block')
+    p.set_defaults(is_data_block=True)
+    p.set_defaults(func=bdev_ec_add_base_bdev)
+
+    def bdev_ec_remove_base_bdev(args):
+        args.client.bdev_ec_remove_base_bdev(name=args.name)
+    p = subparsers.add_parser('bdev_ec_remove_base_bdev', help='Remove base bdev from existing EC bdev')
+    p.add_argument('name', help='base bdev name')
+    p.set_defaults(func=bdev_ec_remove_base_bdev)
