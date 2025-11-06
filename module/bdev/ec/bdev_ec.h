@@ -3,8 +3,8 @@
  *   All rights reserved.
  */
 
-#ifndef SPDK_BDEV_EC_INTERNAL_H
-#define SPDK_BDEV_EC_INTERNAL_H
+#ifndef SPDK_BDEV_EC_H
+#define SPDK_BDEV_EC_H
 
 #include "spdk/bdev_module.h"
 #include "spdk/uuid.h"
@@ -222,7 +222,14 @@ struct ec_bdev {
 #define EC_FOR_EACH_BASE_BDEV(e, i) \
 	for (i = e->base_bdev_info; i < e->base_bdev_info + e->num_base_bdevs; i++)
 
-struct ec_bdev_io_channel;
+/*
+ * ec_bdev_io_channel is the context of spdk_io_channel for EC bdev device. It
+ * contains the relationship of EC bdev io channel with base bdev io channels.
+ */
+struct ec_bdev_io_channel {
+	/* Array of IO channels of base bdevs */
+	struct spdk_io_channel	**base_channel;
+};
 
 /* TAIL head for EC bdev list */
 TAILQ_HEAD(ec_all_tailq, ec_bdev);
@@ -481,5 +488,5 @@ void ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_bdev_io_channel *ec_ch,
 		    uint64_t num_blocks, struct iovec *iovs, int iovcnt, void *md_buf,
 		    struct spdk_memory_domain *memory_domain, void *memory_domain_ctx);
 
-#endif /* SPDK_BDEV_EC_INTERNAL_H */
+#endif /* SPDK_BDEV_EC_H */
 
