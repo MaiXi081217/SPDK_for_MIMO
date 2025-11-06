@@ -55,6 +55,22 @@ static void ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spd
 				 ec_base_bdev_cb cb_fn, void *cb_ctx);
 static void ec_bdev_examine_others(void *_ctx, int status);
 
+/* Forward declare module symbol for early use */
+extern struct spdk_bdev_module g_ec_if;
+
+/* Examine-done helper to match SPDK contract */
+static void
+ec_bdev_examine_done_cb(void *ctx, int status)
+{
+    struct spdk_bdev *bdev = ctx;
+
+    if (status != 0 && bdev != NULL) {
+        SPDK_ERRLOG("Failed to examine bdev %s: %s\n",
+                    bdev->name, spdk_strerror(-status));
+    }
+    spdk_bdev_module_examine_done(&g_ec_if);
+}
+
 /* Structure for examine others context */
 struct ec_bdev_examine_others_ctx {
 	struct spdk_uuid ec_bdev_uuid;
@@ -2234,9 +2250,8 @@ static void
 ec_bdev_examine_cont_wrapper(struct spdk_bdev *bdev, const struct ec_bdev_superblock *sb,
 			      int status, void *cb_ctx)
 {
-	/* cb_ctx is actually a pointer to a structure containing cb_fn and cb_ctx */
-	/* For now, we'll just call examine_cont with NULL callback since examine_cont handles its own callbacks */
-	ec_bdev_examine_cont(sb, bdev, NULL, NULL);
+    /* Pass a completion callback so we can signal examine_done reliably */
+    ec_bdev_examine_cont(sb, bdev, ec_bdev_examine_done_cb, bdev);
 }
 
 /*
@@ -2262,9 +2277,12 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 
 	if (sb == NULL) {
 		SPDK_DEBUGLOG(bdev_ec, "No superblock found on bdev %s\n", bdev->name);
-		if (cb_fn) {
-			cb_fn(cb_ctx, 0);
-		}
+        if (cb_fn) {
+            cb_fn(cb_ctx, 0);
+        } else {
+            /* Ensure examine_done is always called */
+            ec_bdev_examine_done_cb(bdev, 0);
+        }
 		return;
 	}
 
@@ -2410,9 +2428,13 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	}
 
 out:
-	if (rc != 0 && cb_fn) {
-		cb_fn(cb_ctx, rc);
-	}
+    if (rc != 0) {
+        if (cb_fn) {
+            cb_fn(cb_ctx, rc);
+        } else {
+            ec_bdev_examine_done_cb(bdev, rc);
+        }
+    }
 }
 
 /* ec_bdev_examine_sb and ec_bdev_examine_no_sb merged into callers */
@@ -2521,7 +2543,8 @@ ec_bdev_examine(struct spdk_bdev *bdev)
 
 	return;
 done:
-	SPDK_DEBUGLOG(bdev_ec, "Examine done for bdev %s with status %d\n", bdev->name, rc);
+    SPDK_DEBUGLOG(bdev_ec, "Examine done for bdev %s with status %d\n", bdev->name, rc);
+    ec_bdev_examine_done_cb(bdev, rc);
 }
 
 struct spdk_bdev_module g_ec_if = {
