@@ -108,7 +108,6 @@ SPDK_RPC_REGISTER("bdev_ec_get_bdevs", rpc_bdev_ec_get_bdevs, SPDK_RPC_RUNTIME)
  */
 struct rpc_bdev_ec_base_bdev {
 	char *name;
-	bool is_data_block;
 };
 
 /*
@@ -129,10 +128,16 @@ struct rpc_bdev_ec_create {
 	/* EC bdev name */
 	char                                 *name;
 
+	/* Number of data blocks (k) */
+	uint8_t                              k;
+
+	/* Number of parity blocks (p) */
+	uint8_t                              p;
+
 	/* EC strip size in KB */
 	uint32_t                             strip_size_kb;
 
-	/* Base bdevs information - with data/parity designation */
+	/* Base bdevs list - all disks are equal, parity distributed round-robin */
 	struct rpc_bdev_ec_create_base_bdevs base_bdevs;
 
 	/* UUID for this EC bdev */
@@ -151,19 +156,16 @@ decode_ec_base_bdev_entry(const struct spdk_json_val *val, void *out)
 	struct rpc_bdev_ec_base_bdev *base_bdev = out;
 	const struct spdk_json_object_decoder decoders[] = {
 		{"name", offsetof(struct rpc_bdev_ec_base_bdev, name), spdk_json_decode_string},
-		{"is_data_block", offsetof(struct rpc_bdev_ec_base_bdev, is_data_block), spdk_json_decode_bool, true},
 	};
 	int rc;
 
 	/* Initialize to default values to avoid UB from uninitialized memory */
 	memset(base_bdev, 0, sizeof(*base_bdev));
-	base_bdev->is_data_block = true; /* Default to data block */
 
 	/* Try to decode as object format first */
 	rc = spdk_json_decode_object(val, decoders, SPDK_COUNTOF(decoders), base_bdev);
 	if (rc == 0) {
 		/* Object format decoded successfully */
-		/* If is_data_block was not provided, decoder leaves it as default (true) */
 		return 0;
 	}
 
@@ -172,7 +174,6 @@ decode_ec_base_bdev_entry(const struct spdk_json_val *val, void *out)
 	rc = spdk_json_decode_string(val, &base_bdev->name);
 	if (rc == 0) {
 		/* String format decoded successfully */
-		base_bdev->is_data_block = true; /* Default to data block for old format */
 		return 0;
 	}
 
@@ -215,6 +216,8 @@ decode_ec_base_bdevs(const struct spdk_json_val *val, void *out)
  */
 static const struct spdk_json_object_decoder rpc_bdev_ec_create_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_ec_create, name), spdk_json_decode_string},
+	{"k", offsetof(struct rpc_bdev_ec_create, k), spdk_json_decode_uint8},
+	{"p", offsetof(struct rpc_bdev_ec_create, p), spdk_json_decode_uint8},
 	{"strip_size_kb", offsetof(struct rpc_bdev_ec_create, strip_size_kb), spdk_json_decode_uint32, true},
 	{"base_bdevs", offsetof(struct rpc_bdev_ec_create, base_bdevs), decode_ec_base_bdevs},
 	{"uuid", offsetof(struct rpc_bdev_ec_create, uuid), spdk_json_decode_uuid, true},
@@ -308,15 +311,15 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 					}
 				}
 				if (found) {
-					/* Use ec_bdev_delete for consistent cleanup */
-					ec_bdev_delete(ctx->ec_bdev, NULL, NULL);
+					/* Use ec_bdev_delete for consistent cleanup - don't wipe superblock on error */
+					ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
 				} else {
 					/* Already removed, just free */
 					ec_bdev_free(ctx->ec_bdev);
 				}
 			} else {
-				/* Use full delete process for configured EC bdevs */
-				ec_bdev_delete(ctx->ec_bdev, NULL, NULL);
+				/* Use full delete process for configured EC bdevs - don't wipe superblock on error */
+				ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
 			}
 		}
 		
@@ -366,7 +369,6 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 	int				rc;
 	size_t				i;
 	struct rpc_bdev_ec_create_ctx *ctx;
-	uint8_t			k = 0, p = 0;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
@@ -387,37 +389,41 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 
 
 
-	/* Count data blocks (k) and parity blocks (p) */
-	for (i = 0; i < req->base_bdevs.num_base_bdevs; i++) {
+	/* Validate k and p */
+	if (req->k == 0 || req->p == 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+					     "Must have at least one data block (k) and one parity block (p)");
+		goto cleanup;
+	}
 
+	/* Note: req->k and req->p are uint8_t, so they are automatically limited to 0-255.
+	 * EC_MAX_K and EC_MAX_P are 255, so no explicit range check is needed here.
+	 * The decoder will reject values outside uint8_t range automatically. */
+
+	/* Validate that number of base bdevs matches k + p */
+	if (req->base_bdevs.num_base_bdevs != req->k + req->p) {
+		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+					     "Number of base bdevs (%zu) must equal k + p (%u + %u = %u)",
+					     req->base_bdevs.num_base_bdevs, req->k, req->p, req->k + req->p);
+		goto cleanup;
+	}
+
+	/* Validate base bdev names */
+	for (i = 0; i < req->base_bdevs.num_base_bdevs; i++) {
 		if (req->base_bdevs.base_bdevs[i].name == NULL ||
 		    strlen(req->base_bdevs.base_bdevs[i].name) == 0) {
 			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
 						     "The base bdev name cannot be empty");
 			goto cleanup;
 		}
-
-		if (req->base_bdevs.base_bdevs[i].is_data_block) {
-			k++;
-		} else {
-			p++;
-		}
 	}
 
-	if (k == 0 || p == 0) {
-		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
-					     "Must have at least one data block (k) and one parity block (p)");
-		goto cleanup;
-	}
-
-	/* Note: k and p are uint8_t counters and cannot exceed EC_MAX_*; no need to check > EC_MAX */
-
-	ctx->k = k;
-	ctx->p = p;
+	ctx->k = req->k;
+	ctx->p = req->p;
 
 
 	/* Create EC bdev */
-	rc = ec_bdev_create(req->name, req->strip_size_kb, k, p,
+	rc = ec_bdev_create(req->name, req->strip_size_kb, req->k, req->p,
 		   req->superblock_enabled, &req->uuid, &ec_bdev);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, rc,
@@ -432,67 +438,53 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 
 	assert(ctx->remaining > 0);
 
-	/* Add base bdevs with their roles */
+	/* Add base bdevs - all disks are equal, parity distributed round-robin */
 	for (i = 0; i < req->base_bdevs.num_base_bdevs; i++) {
 		const char *base_bdev_name = req->base_bdevs.base_bdevs[i].name;
-		bool is_data_block = req->base_bdevs.base_bdevs[i].is_data_block;
 
-		rc = ec_bdev_add_base_bdev(ec_bdev, base_bdev_name, is_data_block,
+		rc = ec_bdev_add_base_bdev(ec_bdev, base_bdev_name,
 				   rpc_bdev_ec_create_add_base_bdev_cb, ctx);
-		if (rc == -ENODEV) {
-			/* Base bdev doesn't exist - fail immediately and don't create EC bdev */
-			SPDK_DEBUGLOG(bdev_ec, "base bdev %s doesn't exist now\n", base_bdev_name);
-			ctx->status = -ENODEV;
-			/* Store the name of the missing base bdev for error reporting */
-			ctx->missing_base_bdev_name = strdup(base_bdev_name);
-			if (ctx->missing_base_bdev_name == NULL) {
-				/* strdup failed, but we can still proceed without the name */
-				SPDK_ERRLOG("Failed to allocate memory for missing base bdev name\n");
-				/* Continue without storing the name - error message will be generic */
+		if (rc != 0) {
+			/* ec_bdev_add_base_bdev failed - it doesn't call the callback on error,
+			 * so we need to handle it here to avoid hanging.
+			 */
+			SPDK_DEBUGLOG(bdev_ec, "Failed to add base bdev %s: %s\n",
+				      base_bdev_name, spdk_strerror(-rc));
+			
+			if (rc == -ENODEV) {
+				/* Base bdev doesn't exist - fail immediately */
+				ctx->status = -ENODEV;
+				/* Store the name of the missing base bdev for error reporting */
+				ctx->missing_base_bdev_name = strdup(base_bdev_name);
+				if (ctx->missing_base_bdev_name == NULL) {
+					SPDK_ERRLOG("Failed to allocate memory for missing base bdev name\n");
+				}
+			} else {
+				/* Other errors */
+				if (ctx->status == 0) {
+					ctx->status = rc;
+				}
 			}
+			
 			/* Decrement remaining for all base bdevs that haven't been added yet.
 			 * Note: We need to account for:
 			 * - The current base bdev that failed (i)
 			 * - All remaining base bdevs that won't be added (num_base_bdevs - i - 1)
 			 * Total to cancel: (num_base_bdevs - i) base bdevs
-			 * But we need to be careful: if ec_bdev_add_base_bdev returns error,
-			 * it doesn't call the callback, so we need to account for this failed
-			 * base bdev as well. The callback will decrement remaining by 1,
-			 * so we should cancel (num_base_bdevs - i - 1) here, and let the
-			 * callback handle the current failed one.
+			 * Since ec_bdev_add_base_bdev doesn't call the callback on error,
+			 * we need to cancel all remaining base bdevs including the current one.
 			 */
-			size_t remaining_to_cancel = req->base_bdevs.num_base_bdevs - i - 1;
+			size_t remaining_to_cancel = req->base_bdevs.num_base_bdevs - i;
 			if (remaining_to_cancel > 0 && remaining_to_cancel <= ctx->remaining) {
 				ctx->remaining -= (uint8_t)remaining_to_cancel;
 			}
+			
 			/* Call callback to delete EC bdev and send error response.
-			 * The callback will decrement remaining by 1 for this failed base bdev. */
-			rpc_bdev_ec_create_add_base_bdev_cb(ctx, -ENODEV);
-			break;
-		} else if (rc != 0) {
-			/* Normalize rc for spdk_strerror (expects positive errno) */
-			int err = rc;
-			if (err > 0) {
-				err = -err;
-			}
-			SPDK_DEBUGLOG(bdev_ec, "Failed to add base bdev %s to EC bdev %s: %s",
-				      base_bdev_name, req->name, spdk_strerror(-err));
-			/* Mark error status */
-			ctx->status = rc;
-			/* Decrement remaining for all base bdevs that haven't been added yet.
-			 * Same logic as above: cancel (num_base_bdevs - i - 1) remaining base bdevs,
-			 * and let the callback handle the current failed one. */
-			size_t remaining_to_cancel = req->base_bdevs.num_base_bdevs - i - 1;
-			if (remaining_to_cancel > 0 && remaining_to_cancel <= ctx->remaining) {
-				ctx->remaining -= (uint8_t)remaining_to_cancel;
-			}
-			/* Now call the callback for this failed operation.
-			 * The callback will decrement remaining by 1 and check if we're done. */
+			 * This will handle cleanup and response. */
 			rpc_bdev_ec_create_add_base_bdev_cb(ctx, rc);
 			break;
 		}
-		/* If rc == 0, ec_bdev_add_base_bdev will call the callback synchronously
-		 * (via ec_bdev_configure_base_bdev), so we continue the loop. */
+		/* else: rc == 0, callback will be called asynchronously by ec_bdev_configure_base_bdev */
 	}
 	return;
 cleanup:
@@ -589,7 +581,8 @@ rpc_bdev_ec_delete(struct spdk_jsonrpc_request *request,
 
 	ctx->request = request;
 
-	ec_bdev_delete(ec_bdev, bdev_ec_delete_done, ctx);
+	/* RPC delete command - wipe superblock */
+	ec_bdev_delete(ec_bdev, true, bdev_ec_delete_done, ctx);
 
 	return;
 
@@ -607,8 +600,6 @@ struct rpc_bdev_ec_add_base_bdev {
 	char *ec_bdev;
 	/* Base bdev name */
 	char *base_bdev;
-	/* Whether this is a data block (true) or parity block (false) */
-	bool is_data_block;
 };
 
 /*
@@ -628,7 +619,6 @@ free_rpc_bdev_ec_add_base_bdev(struct rpc_bdev_ec_add_base_bdev *req)
 static const struct spdk_json_object_decoder rpc_bdev_ec_add_base_bdev_decoders[] = {
 	{"ec_bdev", offsetof(struct rpc_bdev_ec_add_base_bdev, ec_bdev), spdk_json_decode_string},
 	{"base_bdev", offsetof(struct rpc_bdev_ec_add_base_bdev, base_bdev), spdk_json_decode_string},
-	{"is_data_block", offsetof(struct rpc_bdev_ec_add_base_bdev, is_data_block), spdk_json_decode_bool, true},
 };
 
 static void
@@ -678,7 +668,7 @@ rpc_bdev_ec_add_base_bdev(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	rc = ec_bdev_add_base_bdev(ec_bdev, req.base_bdev, req.is_data_block,
+	rc = ec_bdev_add_base_bdev(ec_bdev, req.base_bdev,
 				   rpc_bdev_ec_add_base_bdev_done, request);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, rc,

@@ -1,6 +1,7 @@
 #include "bdev_ec.h"
 #include "bdev_ec_internal.h"
 #include "spdk/bdev_module.h"
+#include "spdk/bdev.h"
 #include "spdk/util.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
@@ -8,6 +9,7 @@
 #include "spdk/thread.h"
 #include "spdk/json.h"
 #include "spdk/likely.h"
+#include "spdk/queue.h"
 
 #define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
 
@@ -38,9 +40,12 @@ int ec_bdev_examine_load_sb(const char *bdev_name, ec_bdev_examine_load_sb_cb cb
 
 /* Forward declarations for static functions */
 static void ec_bdev_examine(struct spdk_bdev *bdev);
+static void ec_bdev_examine_no_sb(struct spdk_bdev *bdev);
 static int ec_bdev_init(void);
 static void ec_bdev_deconfigure(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void *cb_arg);
 static void ec_bdev_configure_cont(struct ec_bdev *ec_bdev);
+static void ec_bdev_configure_write_sb_cb(int status, struct ec_bdev *ec_bdev, void *ctx);
+static void ec_bdev_configure_register_bdev(struct ec_bdev *ec_bdev);
 static int ec_bdev_configure(struct ec_bdev *ec_bdev, ec_bdev_configure_cb cb, void *cb_ctx);
 static int ec_start(struct ec_bdev *ec_bdev);
 static void ec_stop(struct ec_bdev *ec_bdev);
@@ -136,6 +141,68 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 		ec_ch->base_channel[i] = NULL;
 	}
 
+	/* Initialize buffer pools */
+	SLIST_INIT(&ec_ch->parity_buf_pool);
+	SLIST_INIT(&ec_ch->rmw_stripe_buf_pool);
+	ec_ch->parity_buf_count = 0;
+	ec_ch->rmw_buf_count = 0;
+	ec_ch->parity_buf_size = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+	ec_ch->rmw_buf_size = ec_ch->parity_buf_size * ec_bdev->k;
+
+	/* Pre-allocate buffers for better performance and stability */
+	/* Optimized: Pre-allocate more buffers to reduce allocation overhead during I/O */
+	/* Aggressive pre-allocation for maximum performance and stability */
+	/* This reduces performance variance by avoiding dynamic allocation during hot path */
+	size_t align = ec_bdev->buf_alignment > 0 ? ec_bdev->buf_alignment : 0x1000;
+	struct ec_parity_buf_entry *entry;
+	unsigned char *buf;
+	uint8_t j;
+	/* Optimized: Aggressive pre-allocation - pre-allocate more buffers for high concurrency */
+	/* Pre-allocate p*8 parity buffers (8x parity count) for high concurrency scenarios */
+	/* Pre-allocate 16 RMW buffers for concurrent partial stripe writes */
+	uint8_t parity_prealloc = ec_bdev->p * 8;  /* 8x parity count for high concurrency */
+	uint8_t rmw_prealloc = 16;  /* 16 RMW buffers for high concurrency */
+	
+	/* Cap pre-allocation to pool limits */
+	if (parity_prealloc > 128) {
+		parity_prealloc = 128;
+	}
+	if (rmw_prealloc > 64) {
+		rmw_prealloc = 64;
+	}
+
+	/* Pre-allocate parity buffers */
+	/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
+	for (j = 0; j < parity_prealloc && ec_ch->parity_buf_count < 128; j++) {
+		buf = spdk_dma_malloc(ec_ch->parity_buf_size, align, NULL);
+		if (buf != NULL) {
+			entry = malloc(sizeof(*entry));
+			if (entry != NULL) {
+				entry->buf = buf;
+				SLIST_INSERT_HEAD(&ec_ch->parity_buf_pool, entry, link);
+				ec_ch->parity_buf_count++;
+			} else {
+				spdk_dma_free(buf);
+			}
+		}
+	}
+
+	/* Pre-allocate RMW stripe buffers */
+	/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
+	for (j = 0; j < rmw_prealloc && ec_ch->rmw_buf_count < 64; j++) {
+		buf = spdk_dma_malloc(ec_ch->rmw_buf_size, align, NULL);
+		if (buf != NULL) {
+			entry = malloc(sizeof(*entry));
+			if (entry != NULL) {
+				entry->buf = buf;
+				SLIST_INSERT_HEAD(&ec_ch->rmw_stripe_buf_pool, entry, link);
+				ec_ch->rmw_buf_count++;
+			} else {
+				spdk_dma_free(buf);
+			}
+		}
+	}
+
 	i = 0;
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		/* Skip base bdevs that are not configured or have no descriptor.
@@ -183,6 +250,26 @@ ec_bdev_destroy_cb(void *io_device, void *ctx_buf)
 	uint8_t i;
 
 	SPDK_DEBUGLOG(bdev_ec, "ec_bdev_destroy_cb\n");
+
+	/* Free buffer pools */
+	struct ec_parity_buf_entry *buf_entry, *buf_entry_tmp;
+	SLIST_FOREACH_SAFE(buf_entry, &ec_ch->parity_buf_pool, link, buf_entry_tmp) {
+		SLIST_REMOVE(&ec_ch->parity_buf_pool, buf_entry, ec_parity_buf_entry, link);
+		if (buf_entry->buf != NULL) {
+			spdk_dma_free(buf_entry->buf);
+		}
+		free(buf_entry);
+	}
+	ec_ch->parity_buf_count = 0;
+	
+	SLIST_FOREACH_SAFE(buf_entry, &ec_ch->rmw_stripe_buf_pool, link, buf_entry_tmp) {
+		SLIST_REMOVE(&ec_ch->rmw_stripe_buf_pool, buf_entry, ec_parity_buf_entry, link);
+		if (buf_entry->buf != NULL) {
+			spdk_dma_free(buf_entry->buf);
+		}
+		free(buf_entry);
+	}
+	ec_ch->rmw_buf_count = 0;
 
 	if (ec_ch->base_channel == NULL) {
 		return;
@@ -349,7 +436,6 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 		}
 		spdk_json_write_named_uuid(w, "uuid", &base_info->uuid);
 		spdk_json_write_named_bool(w, "is_configured", base_info->is_configured);
-		spdk_json_write_named_bool(w, "is_data_block", base_info->is_data_block);
 		spdk_json_write_named_bool(w, "is_failed", base_info->is_failed);
 		spdk_json_write_named_uint64(w, "data_offset", base_info->data_offset);
 		spdk_json_write_named_uint64(w, "data_size", base_info->data_size);
@@ -422,7 +508,6 @@ ec_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 		if (base_info->name) {
 			spdk_json_write_object_begin(w);
 			spdk_json_write_named_string(w, "name", base_info->name);
-			spdk_json_write_named_bool(w, "is_data_block", base_info->is_data_block);
 			spdk_json_write_object_end(w);
 		} else {
 			char str[32];
@@ -431,7 +516,6 @@ ec_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 				 (uint8_t)(base_info - ec_bdev->base_bdev_info));
 			spdk_json_write_object_begin(w);
 			spdk_json_write_named_string(w, "name", str);
-			spdk_json_write_named_bool(w, "is_data_block", base_info->is_data_block);
 			spdk_json_write_object_end(w);
 		}
 	}
@@ -681,16 +765,31 @@ ec_bdev_destruct_impl(void *ctx)
 	struct ec_bdev *ec_bdev = ctx;
 	struct ec_base_bdev_info *base_info;
 
-	SPDK_DEBUGLOG(bdev_ec, "ec_bdev_destruct\n");
+	SPDK_DEBUGLOG(bdev_ec, "ec_bdev_destruct for EC bdev %s, shutdown_started=%d\n",
+		      ec_bdev->bdev.name, g_shutdown_started);
 
-	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
-		if (g_shutdown_started || base_info->remove_scheduled == true) {
-			ec_bdev_free_base_bdev_resource(base_info);
-		}
-	}
-
+	/* During shutdown, don't free base bdev resources immediately if superblock
+	 * wipe is in progress. The resources will be freed after superblock wipe
+	 * completes or is aborted. */
 	if (g_shutdown_started) {
 		ec_bdev->state = EC_BDEV_STATE_OFFLINE;
+		/* Mark base bdevs for removal, but don't free resources yet if
+		 * superblock wipe might be in progress */
+		EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+			base_info->remove_scheduled = true;
+			/* Only free resources if base bdev is not configured or
+			 * if we're sure no superblock operations are in progress */
+			if (!base_info->is_configured) {
+				ec_bdev_free_base_bdev_resource(base_info);
+			}
+		}
+	} else {
+		/* Normal deletion - free resources for scheduled removals */
+		EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+			if (base_info->remove_scheduled == true) {
+				ec_bdev_free_base_bdev_resource(base_info);
+			}
+		}
 	}
 
 	ec_stop(ec_bdev);
@@ -765,9 +864,11 @@ ec_start(struct ec_bdev *ec_bdev)
 	uint32_t data_block_size;
 	uint8_t k = ec_bdev->k;
 	uint8_t p = ec_bdev->p;
+	size_t alignment = 0;
+	struct spdk_bdev *base_bdev;
 	int rc;
 
-	/* Find minimum data size from all base bdevs */
+	/* Find minimum data size and maximum alignment from all base bdevs */
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		if (base_info->desc == NULL) {
 			continue;
@@ -784,15 +885,20 @@ ec_start(struct ec_bdev *ec_bdev)
 		if (data_size < min_data_size) {
 			min_data_size = data_size;
 		}
+
+		/* Get maximum alignment requirement from base bdevs */
+		base_bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+		alignment = spdk_max(alignment, spdk_bdev_get_buf_align(base_bdev));
 	}
+
+	/* Store alignment for memory allocations */
+	ec_bdev->buf_alignment = alignment > 0 ? alignment : 0x1000; /* Default 4KB if no base bdevs */
 
 	if (min_data_size == UINT64_MAX) {
 		SPDK_ERRLOG("No valid base bdevs found for EC bdev %s\n", ec_bdev->bdev.name);
 		return -ENODEV;
 	}
 
-	/* EC bdev size is the minimum data size available from all base bdevs */
-	ec_bdev->bdev.blockcnt = min_data_size;
 	data_block_size = spdk_bdev_get_data_block_size(&ec_bdev->bdev);
 
 	/* Convert strip_size_kb to blocks */
@@ -802,6 +908,19 @@ ec_start(struct ec_bdev *ec_bdev)
 		return -EINVAL;
 	}
 	ec_bdev->strip_size_shift = spdk_u32log2(ec_bdev->strip_size);
+
+	/* Align base bdev data size to strip_size boundary (similar to RAID) */
+	uint64_t base_bdev_data_size = (min_data_size >> ec_bdev->strip_size_shift) << ec_bdev->strip_size_shift;
+
+	/* Update all base bdev data_size to aligned value */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->desc != NULL) {
+			base_info->data_size = base_bdev_data_size;
+		}
+	}
+
+	/* EC bdev size is k * aligned_data_size (k data blocks per stripe) */
+	ec_bdev->bdev.blockcnt = base_bdev_data_size * k;
 
 	/* Initialize ISA-L tables */
 	if (ec_bdev->module_private == NULL) {
@@ -821,9 +940,16 @@ ec_start(struct ec_bdev *ec_bdev)
 	/* Set optimal_io_boundary for reading (similar to RAID0/RAID5F)
 	 * This allows bdev layer to automatically split I/O at strip boundaries
 	 * Note: We do NOT set write_unit_size to allow flexible writes (FTL-friendly)
+	 * Only set if we have multiple base bdevs (k + p > 1), similar to RAID0
 	 */
-	ec_bdev->bdev.optimal_io_boundary = ec_bdev->strip_size;
-	ec_bdev->bdev.split_on_optimal_io_boundary = true;
+	if (ec_bdev->num_base_bdevs > 1) {
+		ec_bdev->bdev.optimal_io_boundary = ec_bdev->strip_size;
+		ec_bdev->bdev.split_on_optimal_io_boundary = true;
+	} else {
+		/* Do not need to split reads/writes on single bdev EC modules. */
+		ec_bdev->bdev.optimal_io_boundary = 0;
+		ec_bdev->bdev.split_on_optimal_io_boundary = false;
+	}
 
 	return 0;
 }
@@ -1062,36 +1188,36 @@ static void
 ec_bdev_deconfigure_unregister_done(void *cb_arg, int rc)
 {
 	struct ec_bdev *ec_bdev = cb_arg;
+	struct ec_base_bdev_info *base_info;
 	ec_bdev_destruct_cb user_cb_fn = ec_bdev->deconfigure_cb_fn;
 	void *user_cb_arg = ec_bdev->deconfigure_cb_arg;
+
+	SPDK_DEBUGLOG(bdev_ec, "ec_bdev_deconfigure_unregister_done for EC bdev %s, rc=%d\n",
+		      ec_bdev->bdev.name, rc);
 
 	/* Clear the stored callbacks */
 	ec_bdev->deconfigure_cb_fn = NULL;
 	ec_bdev->deconfigure_cb_arg = NULL;
 
-	/* Close self_desc before calling user callback */
+	/* Close self_desc before cleaning up base bdevs */
 	if (ec_bdev->self_desc != NULL) {
 		spdk_bdev_close(ec_bdev->self_desc);
 		ec_bdev->self_desc = NULL;
+	}
+
+	/* Now that bdev is unregistered, we can safely free base bdev resources.
+	 * During shutdown, resources may have been marked for removal but not freed
+	 * yet to allow superblock wipe to complete. */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->remove_scheduled) {
+			ec_bdev_free_base_bdev_resource(base_info);
+		}
 	}
 
 	/* Call user callback */
 	if (user_cb_fn) {
 		user_cb_fn(user_cb_arg, rc);
 	}
-}
-
-/*
- * brief:
- * ec_bdev_deconfigure_io_device_unregister_done callback for IO device unregister during deconfigure
- */
-static void
-ec_bdev_deconfigure_io_device_unregister_done(void *io_device)
-{
-	struct ec_bdev *ec_bdev = io_device;
-
-	/* After IO device is unregistered, unregister the bdev */
-	spdk_bdev_unregister(&ec_bdev->bdev, ec_bdev_deconfigure_unregister_done, ec_bdev);
 }
 
 static void
@@ -1111,8 +1237,8 @@ ec_bdev_deconfigure(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void *cb
 	ec_bdev->deconfigure_cb_fn = cb_fn;
 	ec_bdev->deconfigure_cb_arg = cb_arg;
 
-	/* First unregister IO device to release all I/O channels, then unregister bdev */
-	spdk_io_device_unregister(ec_bdev, ec_bdev_deconfigure_io_device_unregister_done);
+	/* Unregister bdev - this will automatically unregister IO device as well */
+	spdk_bdev_unregister(&ec_bdev->bdev, ec_bdev_deconfigure_unregister_done, ec_bdev);
 }
 
 /*
@@ -1130,6 +1256,9 @@ ec_bdev_delete_continue(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void
 {
 	struct ec_base_bdev_info *base_info;
 
+	SPDK_DEBUGLOG(bdev_ec, "ec_bdev_delete_continue for EC bdev %s, state=%d\n",
+		      ec_bdev->bdev.name, ec_bdev->state);
+
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		base_info->remove_scheduled = true;
 
@@ -1137,8 +1266,12 @@ ec_bdev_delete_continue(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void
 			/*
 			 * As EC bdev is not registered yet or already unregistered,
 			 * so cleanup should be done here itself.
+			 * However, during shutdown, don't free resources immediately
+			 * if they might still be in use by superblock operations.
 			 */
-			ec_bdev_free_base_bdev_resource(base_info);
+			if (!g_shutdown_started || !base_info->is_configured) {
+				ec_bdev_free_base_bdev_resource(base_info);
+			}
 		}
 	}
 
@@ -1156,9 +1289,17 @@ ec_bdev_delete_continue(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void
 void
 ec_bdev_free_base_bdev_resource(struct ec_base_bdev_info *base_info)
 {
+	struct ec_bdev *ec_bdev;
+
 	if (base_info == NULL) {
 		return;
 	}
+
+	ec_bdev = base_info->ec_bdev;
+
+	/* Check if this base bdev was operational before closing resources */
+	bool was_operational = (base_info->is_configured && 
+				(base_info->desc != NULL || base_info->app_thread_ch != NULL));
 
 	if (base_info->app_thread_ch != NULL) {
 		spdk_put_io_channel(base_info->app_thread_ch);
@@ -1177,6 +1318,17 @@ ec_bdev_free_base_bdev_resource(struct ec_base_bdev_info *base_info)
 	}
 
 	spdk_uuid_set_null(&base_info->uuid);
+	
+	/* Update counters if this base bdev was configured */
+	if (base_info->is_configured && ec_bdev != NULL) {
+		assert(ec_bdev->num_base_bdevs_discovered > 0);
+		ec_bdev->num_base_bdevs_discovered--;
+		/* Decrement operational counter if it was operational */
+		if (was_operational && ec_bdev->num_base_bdevs_operational > 0) {
+			ec_bdev->num_base_bdevs_operational--;
+		}
+	}
+	
 	base_info->is_configured = false;
 	base_info->remove_scheduled = false;
 }
@@ -1416,6 +1568,7 @@ ec_bdev_create_from_sb(const struct ec_bdev_superblock *sb, struct ec_bdev **ec_
 		spdk_uuid_copy(&base_info->uuid, &sb_base->uuid);
 		base_info->data_offset = sb_base->data_offset;
 		base_info->data_size = sb_base->data_size;
+		/* is_data_block is kept for superblock compatibility but not used */
 		base_info->is_data_block = sb_base->is_data_block;
 	}
 
@@ -1462,6 +1615,13 @@ ec_bdev_examine_load_sb_cb_wrapper(const struct ec_bdev_superblock *sb, int stat
 
 	if (examine_ctx->desc != NULL) {
 		bdev = spdk_bdev_desc_get_bdev(examine_ctx->desc);
+	}
+
+	SPDK_DEBUGLOG(bdev_ec, "examine_load_sb_cb_wrapper called for bdev %s, status=%d, sb=%p\n",
+		      bdev ? bdev->name : "unknown", status, sb);
+	if (status != 0) {
+		SPDK_DEBUGLOG(bdev_ec, "Superblock load failed for bdev %s: %s\n",
+			      bdev ? bdev->name : "unknown", spdk_strerror(-status));
 	}
 
 	if (examine_ctx->ch != NULL) {
@@ -1532,6 +1692,8 @@ ec_bdev_examine_load_sb(const char *bdev_name, ec_bdev_examine_load_sb_cb cb, vo
 	rc = ec_bdev_load_base_bdev_superblock(examine_ctx->desc, examine_ctx->ch,
 					       ec_bdev_examine_load_sb_cb_wrapper, examine_ctx);
 	if (rc != 0) {
+		SPDK_DEBUGLOG(bdev_ec, "Failed to initiate superblock load for bdev %s: %s\n",
+			      bdev_name, spdk_strerror(-rc));
 		spdk_put_io_channel(examine_ctx->ch);
 		spdk_bdev_close(examine_ctx->desc);
 		free(examine_ctx);
@@ -1539,6 +1701,8 @@ ec_bdev_examine_load_sb(const char *bdev_name, ec_bdev_examine_load_sb_cb cb, vo
 		return rc;
 	}
 
+	SPDK_DEBUGLOG(bdev_ec, "Superblock load initiated for bdev %s, waiting for async completion\n",
+		      bdev_name);
 	return 0;
 }
 
@@ -1587,13 +1751,26 @@ ec_bdev_config_json(struct spdk_json_write_ctx *w)
 static void
 ec_bdev_fini_start(void)
 {
-	struct ec_bdev *ec_bdev, *tmp;
+	struct ec_bdev *ec_bdev;
+	struct ec_base_bdev_info *base_info;
+
+	SPDK_DEBUGLOG(bdev_ec, "ec_bdev_fini_start\n");
+
+	/* Similar to RAID module: during shutdown, don't actively delete EC bdevs.
+	 * The bdev layer will automatically call ec_bdev_destruct for each EC bdev.
+	 * We just need to:
+	 * 1. Free resources for non-online EC bdevs
+	 * 2. Set g_shutdown_started flag so destruct knows we're shutting down
+	 */
+	TAILQ_FOREACH(ec_bdev, &g_ec_bdev_list, global_link) {
+		if (ec_bdev->state != EC_BDEV_STATE_ONLINE) {
+			EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+				ec_bdev_free_base_bdev_resource(base_info);
+			}
+		}
+	}
 
 	g_shutdown_started = true;
-
-	TAILQ_FOREACH_SAFE(ec_bdev, &g_ec_bdev_list, global_link, tmp) {
-		ec_bdev_delete(ec_bdev, NULL, NULL);
-	}
 }
 
 /*
@@ -1641,9 +1818,25 @@ ec_bdev_configure_cont(struct ec_bdev *ec_bdev)
 	uint8_t num_base_bdevs = ec_bdev->k + ec_bdev->p;
 	int rc = 0;
 
+	/* Check if EC bdev is already registered or in the process of being registered */
+	if (ec_bdev->state == EC_BDEV_STATE_ONLINE) {
+		struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
+		if (registered_bdev != NULL && registered_bdev == &ec_bdev->bdev) {
+			/* Already registered, nothing to do */
+			SPDK_DEBUGLOG(bdev_ec, "EC bdev %s already registered, skipping configure_cont\n",
+				      ec_bdev->bdev.name);
+			return;
+		}
+	}
+
+	/* Count configured base bdevs with early exit optimization */
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		if (base_info->is_configured) {
 			num_configured++;
+			/* Early exit: if we have all configured, stop counting */
+			if (num_configured == num_base_bdevs) {
+				break;
+			}
 		}
 	}
 
@@ -1652,58 +1845,149 @@ ec_bdev_configure_cont(struct ec_bdev *ec_bdev)
 		rc = ec_start(ec_bdev);
 		
 		if (rc == 0) {
-			ec_bdev->state = EC_BDEV_STATE_ONLINE;
-			
-			/* Register IO device before registering bdev (similar to raid module) */
-			SPDK_DEBUGLOG(bdev_ec, "io device register %p\n", ec_bdev);
-			SPDK_DEBUGLOG(bdev_ec, "blockcnt %" PRIu64 ", blocklen %u\n",
-				      ec_bdev->bdev.blockcnt, ec_bdev->bdev.blocklen);
-			spdk_io_device_register(ec_bdev, ec_bdev_create_cb, ec_bdev_destroy_cb,
-						sizeof(struct ec_bdev_io_channel),
-						ec_bdev->bdev.name);
-			
-			rc = spdk_bdev_register(&ec_bdev->bdev);
-			if (rc != 0) {
-				SPDK_ERRLOG("Failed to register EC bdev '%s': %s\n",
-					    ec_bdev->bdev.name, spdk_strerror(-rc));
-				/* Cleanup IO device registration on failure */
-				spdk_io_device_unregister(ec_bdev, NULL);
-				ec_stop(ec_bdev);
-				ec_bdev->state = EC_BDEV_STATE_CONFIGURING;
-				goto out;
+			/* If superblock is enabled, write it before registering bdev */
+			if (ec_bdev->superblock_enabled && ec_bdev->sb != NULL) {
+				/* Update superblock with latest information */
+				ec_bdev_init_superblock(ec_bdev);
+				/* Write superblock asynchronously - continue in callback */
+				ec_bdev_write_superblock(ec_bdev, ec_bdev_configure_write_sb_cb, ec_bdev);
+				return;  /* Don't call configure_cb here, it will be called in write_sb callback */
 			}
 			
-			/*
-			 * Open the bdev internally to delay unregistering if needed.
-			 * During application shutdown, bdevs automatically get unregistered
-			 * by the bdev layer so this is needed to handle cleanup correctly.
-			 */
-			rc = spdk_bdev_open_ext(ec_bdev->bdev.name, false, ec_bdev_event_cb,
-						ec_bdev, &ec_bdev->self_desc);
-			if (rc != 0) {
-				SPDK_ERRLOG("Failed to open EC bdev '%s': %s\n",
-					    ec_bdev->bdev.name, spdk_strerror(-rc));
-				spdk_bdev_unregister(&ec_bdev->bdev, NULL, NULL);
-				spdk_io_device_unregister(ec_bdev, NULL);
-				ec_stop(ec_bdev);
-				ec_bdev->state = EC_BDEV_STATE_CONFIGURING;
-				goto out;
-			}
-			
-			SPDK_DEBUGLOG(bdev_ec, "EC bdev generic %p\n", &ec_bdev->bdev);
-			SPDK_DEBUGLOG(bdev_ec, "EC bdev is created with name %s, ec_bdev %p\n",
-				      ec_bdev->bdev.name, ec_bdev);
+			/* No superblock or superblock write not needed, continue with registration */
+			ec_bdev_configure_register_bdev(ec_bdev);
 		} else {
 			SPDK_ERRLOG("Failed to start EC bdev %s\n", ec_bdev->bdev.name);
 			ec_bdev->state = EC_BDEV_STATE_OFFLINE;
 			rc = -1; /* Set rc to error for callback */
+			if (ec_bdev->configure_cb != NULL) {
+				ec_bdev->configure_cb(ec_bdev->configure_cb_ctx, rc);
+				ec_bdev->configure_cb = NULL;
+				ec_bdev->configure_cb_ctx = NULL;
+			}
 		}
 	} else {
 		rc = 0; /* Still configuring, not an error */
+		if (ec_bdev->configure_cb != NULL) {
+			ec_bdev->configure_cb(ec_bdev->configure_cb_ctx, rc);
+			ec_bdev->configure_cb = NULL;
+			ec_bdev->configure_cb_ctx = NULL;
+		}
 	}
-out:
+}
+
+/*
+ * brief:
+ * ec_bdev_configure_write_sb_cb callback for superblock write during configuration
+ * params:
+ * status - write status
+ * ec_bdev - pointer to EC bdev
+ * ctx - context (ec_bdev pointer)
+ * returns:
+ * none
+ */
+static void
+ec_bdev_configure_write_sb_cb(int status, struct ec_bdev *ec_bdev, void *ctx)
+{
+	int rc = 0;
+	
+	if (status == 0) {
+		/* Superblock written successfully, continue with registration */
+		ec_bdev_configure_register_bdev(ec_bdev);
+	} else {
+		SPDK_ERRLOG("Failed to write EC bdev '%s' superblock: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-status));
+		ec_stop(ec_bdev);
+		ec_bdev->state = EC_BDEV_STATE_CONFIGURING;
+		rc = status;
+	}
+	
 	if (ec_bdev->configure_cb != NULL) {
 		ec_bdev->configure_cb(ec_bdev->configure_cb_ctx, rc);
+		ec_bdev->configure_cb = NULL;
+		ec_bdev->configure_cb_ctx = NULL;
+	}
+}
+
+/*
+ * brief:
+ * ec_bdev_configure_register_bdev registers EC bdev after configuration
+ * params:
+ * ec_bdev - pointer to EC bdev
+ * returns:
+ * none
+ */
+static void
+ec_bdev_configure_register_bdev(struct ec_bdev *ec_bdev)
+{
+	int rc;
+	
+	/* Check if EC bdev is already registered */
+	struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
+	if (registered_bdev != NULL && registered_bdev == &ec_bdev->bdev) {
+		SPDK_DEBUGLOG(bdev_ec, "EC bdev %s already registered, skipping registration\n",
+			      ec_bdev->bdev.name);
+		/* Already registered, just update state if needed */
+		if (ec_bdev->state != EC_BDEV_STATE_ONLINE) {
+			ec_bdev->state = EC_BDEV_STATE_ONLINE;
+		}
+		return;
+	}
+	
+	ec_bdev->state = EC_BDEV_STATE_ONLINE;
+	
+	/* Register IO device before registering bdev (similar to raid module) */
+	SPDK_DEBUGLOG(bdev_ec, "io device register %p\n", ec_bdev);
+	SPDK_DEBUGLOG(bdev_ec, "blockcnt %" PRIu64 ", blocklen %u\n",
+		      ec_bdev->bdev.blockcnt, ec_bdev->bdev.blocklen);
+	spdk_io_device_register(ec_bdev, ec_bdev_create_cb, ec_bdev_destroy_cb,
+				sizeof(struct ec_bdev_io_channel),
+				ec_bdev->bdev.name);
+	
+	rc = spdk_bdev_register(&ec_bdev->bdev);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to register EC bdev '%s': %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-rc));
+		/* Cleanup IO device registration on failure */
+		spdk_io_device_unregister(ec_bdev, NULL);
+		ec_stop(ec_bdev);
+		ec_bdev->state = EC_BDEV_STATE_CONFIGURING;
+		if (ec_bdev->configure_cb != NULL) {
+			ec_bdev->configure_cb(ec_bdev->configure_cb_ctx, rc);
+			ec_bdev->configure_cb = NULL;
+			ec_bdev->configure_cb_ctx = NULL;
+		}
+		return;
+	}
+	
+	/*
+	 * Open the bdev internally to delay unregistering if needed.
+	 * During application shutdown, bdevs automatically get unregistered
+	 * by the bdev layer so this is needed to handle cleanup correctly.
+	 */
+	rc = spdk_bdev_open_ext(ec_bdev->bdev.name, false, ec_bdev_event_cb,
+				ec_bdev, &ec_bdev->self_desc);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to open EC bdev '%s': %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-rc));
+		spdk_bdev_unregister(&ec_bdev->bdev, NULL, NULL);
+		spdk_io_device_unregister(ec_bdev, NULL);
+		ec_stop(ec_bdev);
+		ec_bdev->state = EC_BDEV_STATE_CONFIGURING;
+		if (ec_bdev->configure_cb != NULL) {
+			ec_bdev->configure_cb(ec_bdev->configure_cb_ctx, rc);
+			ec_bdev->configure_cb = NULL;
+			ec_bdev->configure_cb_ctx = NULL;
+		}
+		return;
+	}
+	
+	SPDK_DEBUGLOG(bdev_ec, "EC bdev generic %p\n", &ec_bdev->bdev);
+	SPDK_DEBUGLOG(bdev_ec, "EC bdev is created with name %s, ec_bdev %p\n",
+		      ec_bdev->bdev.name, ec_bdev);
+	
+	if (ec_bdev->configure_cb != NULL) {
+		ec_bdev->configure_cb(ec_bdev->configure_cb_ctx, 0);
 		ec_bdev->configure_cb = NULL;
 		ec_bdev->configure_cb_ctx = NULL;
 	}
@@ -1811,6 +2095,8 @@ ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
 	ec_bdev->strip_size_kb = strip_size;
 	ec_bdev->state = EC_BDEV_STATE_CONFIGURING;
 	ec_bdev->num_base_bdevs = num_base_bdevs;
+	ec_bdev->min_base_bdevs_operational = min_operational;
+	ec_bdev->alignment_warned = false;
 
 	/* Initialize base bdev info */
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
@@ -1832,9 +2118,11 @@ ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
 	ec_bdev_gen->module = &g_ec_if;
 
 	/* Set UUID */
-	if (uuid != NULL) {
+	if (uuid != NULL && !spdk_uuid_is_null(uuid)) {
+		/* User specified UUID - use it */
 		spdk_uuid_copy(&ec_bdev_gen->uuid, uuid);
 	} else {
+		/* No UUID specified - generate random UUID */
 		spdk_uuid_generate(&ec_bdev_gen->uuid);
 	}
 
@@ -1877,7 +2165,7 @@ ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
  * none
  */
 void
-ec_bdev_delete(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void *cb_ctx)
+ec_bdev_delete(struct ec_bdev *ec_bdev, bool wipe_sb, ec_bdev_destruct_cb cb_fn, void *cb_ctx)
 {
 	if (ec_bdev == NULL) {
 		if (cb_fn) {
@@ -1900,7 +2188,8 @@ ec_bdev_delete(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void *cb_ctx)
 
 	TAILQ_REMOVE(&g_ec_bdev_list, ec_bdev, global_link);
 
-	if (ec_bdev->sb != NULL) {
+	/* Only wipe superblock if explicitly requested (e.g., from RPC delete command) */
+	if (wipe_sb && ec_bdev->sb != NULL) {
 		ec_bdev_delete_sb(ec_bdev, cb_fn, cb_ctx);
 	} else {
 		ec_bdev_delete_continue(ec_bdev, cb_fn, cb_ctx);
@@ -1913,42 +2202,25 @@ ec_bdev_delete(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void *cb_ctx)
  * params:
  * ec_bdev - pointer to EC bdev
  * name - base bdev name
- * is_data_block - whether this is a data block
  * cb_fn - callback function
  * cb_ctx - callback context
  * returns:
  * 0 on success, non-zero on failure
  */
 int
-ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name, bool is_data_block,
+ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 		     ec_base_bdev_cb cb_fn, void *cb_ctx)
 {
 	struct ec_base_bdev_info *base_info;
 	uint8_t slot = UINT8_MAX;
-	uint8_t data_slots = 0;
-	uint8_t parity_slots = 0;
+	int rc;
 
 	/* Find an available slot */
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		if (base_info->name == NULL) {
-			slot = data_slots + parity_slots;
+			slot = (uint8_t)(base_info - ec_bdev->base_bdev_info);
 			break;
 		}
-		if (base_info->is_data_block) {
-			data_slots++;
-		} else {
-			parity_slots++;
-		}
-	}
-
-	/* Check if we have space */
-	if (is_data_block && data_slots >= ec_bdev->k) {
-		SPDK_ERRLOG("No available data slots for EC bdev %s\n", ec_bdev->bdev.name);
-		return -ENOSPC;
-	}
-	if (!is_data_block && parity_slots >= ec_bdev->p) {
-		SPDK_ERRLOG("No available parity slots for EC bdev %s\n", ec_bdev->bdev.name);
-		return -ENOSPC;
 	}
 
 	/* Check if we found an available slot */
@@ -1961,15 +2233,23 @@ ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name, bool is_data_bl
 	base_info->name = strdup(name);
 	if (base_info->name == NULL) {
 		SPDK_ERRLOG("Failed to allocate memory for base bdev name\n");
+		/* No cleanup needed - base_info->name is NULL, slot will be reused */
 		return -ENOMEM;
 	}
 
-	base_info->is_data_block = is_data_block;
 	base_info->configure_cb = cb_fn;
 	base_info->configure_cb_ctx = cb_ctx;
 
 	/* Configure the base bdev */
-	return ec_bdev_configure_base_bdev(base_info, false, cb_fn, cb_ctx);
+	rc = ec_bdev_configure_base_bdev(base_info, false, cb_fn, cb_ctx);
+	if (rc != 0) {
+		/* If configuration failed, clean up the name we allocated */
+		free(base_info->name);
+		base_info->name = NULL;
+		base_info->configure_cb = NULL;
+		base_info->configure_cb_ctx = NULL;
+	}
+	return rc;
 }
 
 /*
@@ -1993,11 +2273,12 @@ ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, voi
 	}
 
 	base_info->remove_scheduled = true;
-		base_info->remove_cb = cb_fn;
-		base_info->remove_cb_ctx = cb_ctx;
+	base_info->remove_cb = cb_fn;
+	base_info->remove_cb_ctx = cb_ctx;
 
 	ec_bdev_free_base_bdev_resource(base_info);
 
+	/* Always call callback, even if free_base_bdev_resource had issues */
 	if (cb_fn) {
 		cb_fn(cb_ctx, 0);
 	}
@@ -2105,18 +2386,68 @@ ec_bdev_configure_base_bdev(struct ec_base_bdev_info *base_info, bool existing,
 
 	base_info->desc = desc;
 	base_info->blockcnt = spdk_bdev_get_num_blocks(bdev);
-	base_info->data_offset = EC_BDEV_MIN_DATA_OFFSET_SIZE / spdk_bdev_get_block_size(bdev);
+	
+	/* Calculate data_offset - align to optimal_io_boundary if base bdev has one */
+	uint64_t data_offset = EC_BDEV_MIN_DATA_OFFSET_SIZE / spdk_bdev_get_block_size(bdev);
+	if (bdev->optimal_io_boundary != 0) {
+		data_offset = spdk_round_up(data_offset, bdev->optimal_io_boundary);
+	}
+	base_info->data_offset = data_offset;
 	base_info->data_size = base_info->blockcnt - base_info->data_offset;
+
+	/* Check DIF support - EC bdev does not support DIF/DIX */
+	if (spdk_bdev_get_dif_type(bdev) != SPDK_DIF_DISABLE) {
+		SPDK_ERRLOG("Base bdev '%s' has DIF or DIX enabled - unsupported EC configuration\n",
+			    bdev->name);
+		spdk_bdev_module_release_bdev(bdev);
+		spdk_bdev_close(desc);
+		return -EINVAL;
+	}
+
+	/*
+	 * Set the EC bdev properties if this is the first base bdev configured,
+	 * otherwise - verify. Assumption is that all the base bdevs for any EC bdev should
+	 * have the same blocklen and metadata format.
+	 */
+	if (ec_bdev->bdev.blocklen == 0) {
+		ec_bdev->bdev.blocklen = bdev->blocklen;
+		ec_bdev->bdev.md_len = spdk_bdev_get_md_size(bdev);
+		ec_bdev->bdev.md_interleave = spdk_bdev_is_md_interleaved(bdev);
+		ec_bdev->bdev.dif_type = spdk_bdev_get_dif_type(bdev);
+		ec_bdev->bdev.dif_check_flags = bdev->dif_check_flags;
+		ec_bdev->bdev.dif_is_head_of_md = spdk_bdev_is_dif_head_of_md(bdev);
+		ec_bdev->bdev.dif_pi_format = bdev->dif_pi_format;
+	} else {
+		if (ec_bdev->bdev.blocklen != bdev->blocklen) {
+			SPDK_ERRLOG("EC bdev '%s' blocklen %u differs from base bdev '%s' blocklen %u\n",
+				    ec_bdev->bdev.name, ec_bdev->bdev.blocklen, bdev->name, bdev->blocklen);
+			spdk_bdev_module_release_bdev(bdev);
+			spdk_bdev_close(desc);
+			return -EINVAL;
+		}
+
+		if (ec_bdev->bdev.md_len != spdk_bdev_get_md_size(bdev) ||
+		    ec_bdev->bdev.md_interleave != spdk_bdev_is_md_interleaved(bdev) ||
+		    ec_bdev->bdev.dif_type != spdk_bdev_get_dif_type(bdev) ||
+		    ec_bdev->bdev.dif_check_flags != bdev->dif_check_flags ||
+		    ec_bdev->bdev.dif_is_head_of_md != spdk_bdev_is_dif_head_of_md(bdev) ||
+		    ec_bdev->bdev.dif_pi_format != bdev->dif_pi_format) {
+			SPDK_ERRLOG("EC bdev '%s' has different metadata format than base bdev '%s'\n",
+				    ec_bdev->bdev.name, bdev->name);
+			spdk_bdev_module_release_bdev(bdev);
+			spdk_bdev_close(desc);
+			return -EINVAL;
+		}
+	}
 
 	/* Update EC bdev block count */
 	if (ec_bdev->bdev.blockcnt == 0) {
 		ec_bdev->bdev.blockcnt = base_info->data_size * ec_bdev->k;
-		ec_bdev->bdev.blocklen = spdk_bdev_get_block_size(bdev);
-		} else {
+	} else {
 		uint64_t min_data_size = base_info->data_size;
 		struct ec_base_bdev_info *iter;
 
-			EC_FOR_EACH_BASE_BDEV(ec_bdev, iter) {
+		EC_FOR_EACH_BASE_BDEV(ec_bdev, iter) {
 			if (iter->desc != NULL && iter->data_size < min_data_size) {
 				min_data_size = iter->data_size;
 			}
@@ -2176,11 +2507,15 @@ ec_bdev_event_cb(enum spdk_bdev_event_type event, struct spdk_bdev *bdev, void *
 		if (!found) {
 			/* EC bdev already removed from list, deletion is in progress.
 			 * This event was likely triggered by spdk_bdev_unregister called
-			 * from ec_bdev_deconfigure. The deletion will complete through
-			 * the normal flow (ec_bdev_deconfigure_unregister_done callback).
+			 * from ec_bdev_deconfigure. We need to close self_desc to allow
+			 * spdk_bdev_unregister to complete.
 			 */
-			SPDK_DEBUGLOG(bdev_ec, "EC bdev %s already removed from list, deletion in progress, ignoring event\n",
+			SPDK_DEBUGLOG(bdev_ec, "EC bdev %s already removed from list, deletion in progress, closing self_desc\n",
 				      ec_bdev->bdev.name);
+			if (ec_bdev->self_desc != NULL) {
+				spdk_bdev_close(ec_bdev->self_desc);
+				ec_bdev->self_desc = NULL;
+			}
 			return;
 		}
 		
@@ -2198,7 +2533,8 @@ ec_bdev_event_cb(enum spdk_bdev_event_type event, struct spdk_bdev *bdev, void *
 		/* This is an external removal (not via RPC delete).
 		 * The bdev layer will handle unregistering, we just need to clean up.
 		 */
-		ec_bdev_delete(ec_bdev, NULL, NULL);
+		/* Base bdev removal event - don't wipe superblock */
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
 		break;
 	case SPDK_BDEV_EVENT_RESIZE:
 		/* EC bdev resize is not supported */
@@ -2250,6 +2586,8 @@ static void
 ec_bdev_examine_cont_wrapper(struct spdk_bdev *bdev, const struct ec_bdev_superblock *sb,
 			      int status, void *cb_ctx)
 {
+	SPDK_DEBUGLOG(bdev_ec, "examine_cont_wrapper called for bdev %s, status=%d, sb=%p\n",
+		      bdev ? bdev->name : "unknown", status, sb);
     /* Pass a completion callback so we can signal examine_done reliably */
     ec_bdev_examine_cont(sb, bdev, ec_bdev_examine_done_cb, bdev);
 }
@@ -2275,8 +2613,11 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	uint8_t i;
 	int rc = 0;
 
+	SPDK_DEBUGLOG(bdev_ec, "examine_cont called for bdev %s, sb=%p\n", bdev->name, sb);
 	if (sb == NULL) {
 		SPDK_DEBUGLOG(bdev_ec, "No superblock found on bdev %s\n", bdev->name);
+		/* Try examine_no_sb for EC bdevs without superblock */
+		ec_bdev_examine_no_sb(bdev);
         if (cb_fn) {
             cb_fn(cb_ctx, 0);
         } else {
@@ -2284,6 +2625,13 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
             ec_bdev_examine_done_cb(bdev, 0);
         }
 		return;
+	}
+
+	{
+		char uuid_str[SPDK_UUID_STRING_LEN];
+		spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &sb->uuid);
+		SPDK_DEBUGLOG(bdev_ec, "Superblock found on bdev %s, EC name=%s, UUID=%s\n",
+			      bdev->name, sb->name, uuid_str);
 	}
 
 	if (sb->block_size != spdk_bdev_get_data_block_size(bdev)) {
@@ -2320,8 +2668,8 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 				goto out;
 			}
 
-			/* remove and then recreate the EC bdev using the newer superblock */
-			ec_bdev_delete(ec_bdev, NULL, NULL);
+			/* remove and then recreate the EC bdev using the newer superblock - don't wipe superblock */
+			ec_bdev_delete(ec_bdev, false, NULL, NULL);
 			ec_bdev = NULL;
 		} else if (sb->seq_number < ec_bdev->sb->seq_number) {
 			SPDK_DEBUGLOG(bdev_ec,
@@ -2373,6 +2721,50 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 
 		cb_fn = ec_bdev_examine_others;
 		cb_ctx = ctx;
+
+		/* For newly created EC bdev from superblock, we need to configure the current base bdev.
+		 * Find the base_info for this bdev and set its name before configuring. */
+		assert(sb_base_bdev->slot < ec_bdev->num_base_bdevs);
+		base_info = &ec_bdev->base_bdev_info[sb_base_bdev->slot];
+		
+		/* Set base_info->name if not set (from superblock creation, name is not set) */
+		if (base_info->name == NULL) {
+			base_info->name = strdup(spdk_bdev_get_name(bdev));
+			if (base_info->name == NULL) {
+				SPDK_ERRLOG("Failed to allocate name for base bdev %s\n",
+					    spdk_bdev_get_name(bdev));
+				free(ctx);
+				rc = -ENOMEM;
+				goto out;
+			}
+		}
+		
+		/* Configure this base bdev */
+		if (base_info->is_configured) {
+			SPDK_DEBUGLOG(bdev_ec, "Base bdev %s already configured for EC bdev %s\n",
+				      bdev->name, ec_bdev->bdev.name);
+			/* If EC bdev is not registered yet, trigger configure_cont to check if all
+			 * base bdevs are configured and register the EC bdev.
+			 * Only trigger if state is CONFIGURING to avoid duplicate calls. */
+			if (ec_bdev->state == EC_BDEV_STATE_CONFIGURING) {
+				struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
+				if (registered_bdev == NULL || registered_bdev != &ec_bdev->bdev) {
+					SPDK_DEBUGLOG(bdev_ec, "EC bdev %s not registered yet, triggering configure_cont\n",
+						      ec_bdev->bdev.name);
+					ec_bdev_configure_cont(ec_bdev);
+				}
+			}
+			rc = 0;
+		} else {
+			SPDK_DEBUGLOG(bdev_ec, "Configuring base bdev %s for EC bdev %s from superblock\n",
+				      bdev->name, ec_bdev->bdev.name);
+			rc = ec_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
+			if (rc != 0) {
+				SPDK_ERRLOG("Failed to configure bdev %s as base bdev of EC %s: %s\n",
+					    bdev->name, ec_bdev->bdev.name, spdk_strerror(-rc));
+			}
+		}
+		goto out;
 	}
 
 	if (ec_bdev->state == EC_BDEV_STATE_ONLINE) {
@@ -2383,6 +2775,7 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 		       sb_base_bdev->state == EC_SB_BASE_BDEV_FAILED);
 		assert(spdk_uuid_is_null(&base_info->uuid));
 		spdk_uuid_copy(&base_info->uuid, &sb_base_bdev->uuid);
+		/* is_data_block is kept for superblock compatibility but not used */
 		base_info->is_data_block = sb_base_bdev->is_data_block;
 		SPDK_NOTICELOG("Re-adding bdev %s to EC bdev %s.\n", bdev->name, ec_bdev->bdev.name);
 		rc = ec_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
@@ -2417,6 +2810,17 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	if (base_info->is_configured) {
 		SPDK_DEBUGLOG(bdev_ec, "Base bdev %s already configured for EC bdev %s\n",
 			      bdev->name, ec_bdev->bdev.name);
+		/* If EC bdev is not registered yet, trigger configure_cont to check if all
+		 * base bdevs are configured and register the EC bdev.
+		 * Only trigger if state is CONFIGURING to avoid duplicate calls. */
+		if (ec_bdev->state == EC_BDEV_STATE_CONFIGURING) {
+			struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
+			if (registered_bdev == NULL || registered_bdev != &ec_bdev->bdev) {
+				SPDK_DEBUGLOG(bdev_ec, "EC bdev %s not registered yet, triggering configure_cont\n",
+					      ec_bdev->bdev.name);
+				ec_bdev_configure_cont(ec_bdev);
+			}
+		}
 		rc = 0;
 		goto out;
 	}
@@ -2494,8 +2898,21 @@ ec_bdev_examine_others(void *_ctx, int status)
 			spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &sb_base_bdev->uuid);
 			target_bdev = spdk_bdev_get_by_name(uuid_str);
 			if (target_bdev == NULL) {
-				/* Bdev not found yet, skip it */
-				continue;
+				/* Bdev not found yet - try to examine it by UUID alias
+				 * This will trigger examine if the bdev exists but hasn't been examined yet */
+				int examine_rc = spdk_bdev_examine(uuid_str);
+				if (examine_rc != 0) {
+					/* Bdev doesn't exist yet or examine failed, skip it for now */
+					SPDK_DEBUGLOG(bdev_ec, "Base bdev with UUID %s not found or examine failed, will retry later\n",
+						      uuid_str);
+					continue;
+				}
+				/* Re-check after examine */
+				target_bdev = spdk_bdev_get_by_name(uuid_str);
+				if (target_bdev == NULL) {
+					/* Still not found, skip it */
+					continue;
+				}
 			}
 
 			/* Examine this base bdev */
@@ -2521,25 +2938,97 @@ ec_bdev_examine_others(void *_ctx, int status)
  * returns:
  * none
  */
+/*
+ * brief:
+ * ec_bdev_examine_no_sb examines base bdev when no superblock is found
+ * This allows EC bdevs created without superblock to be rebuilt by matching
+ * base bdev names or UUIDs with CONFIGURING EC bdevs
+ * params:
+ * bdev - pointer to base bdev
+ * returns:
+ * none
+ */
+static void
+ec_bdev_examine_no_sb(struct spdk_bdev *bdev)
+{
+	struct ec_bdev *ec_bdev;
+	struct ec_base_bdev_info *base_info;
+
+	TAILQ_FOREACH(ec_bdev, &g_ec_bdev_list, global_link) {
+		/* Only examine EC bdevs that are in CONFIGURING state and have no superblock */
+		if (ec_bdev->state != EC_BDEV_STATE_CONFIGURING || ec_bdev->sb != NULL) {
+			continue;
+		}
+		
+		EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+			/* Check if this base bdev slot is not yet configured */
+			if (base_info->desc == NULL &&
+			    ((base_info->name != NULL && strcmp(bdev->name, base_info->name) == 0) ||
+			     (!spdk_uuid_is_null(&base_info->uuid) && 
+			      spdk_uuid_compare(&base_info->uuid, spdk_bdev_get_uuid(bdev)) == 0))) {
+				/* Found a match - configure this base bdev */
+				SPDK_DEBUGLOG(bdev_ec, "Matching base bdev %s to EC bdev %s (no superblock)\n",
+					      bdev->name, ec_bdev->bdev.name);
+				ec_bdev_configure_base_bdev(base_info, true, NULL, NULL);
+				return;
+			}
+		}
+	}
+}
+
 static void
 ec_bdev_examine(struct spdk_bdev *bdev)
 {
 	int rc = 0;
+	struct ec_base_bdev_info *base_info;
 
-	if (ec_bdev_find_base_info_by_bdev(bdev) != NULL) {
-		goto done;
+	SPDK_DEBUGLOG(bdev_ec, "Examining bdev %s\n", bdev->name);
+	base_info = ec_bdev_find_base_info_by_bdev(bdev);
+	if (base_info != NULL) {
+		SPDK_DEBUGLOG(bdev_ec, "Base bdev %s already found in EC bdev list\n", bdev->name);
+		/* Base bdev is already configured. Check if EC bdev is registered.
+		 * If not, we need to continue examine to complete the configuration. */
+		struct ec_bdev *ec_bdev = base_info->ec_bdev;
+		if (ec_bdev != NULL) {
+			/* Check if EC bdev is registered by trying to get it by name */
+			struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
+			if (registered_bdev != NULL && registered_bdev == &ec_bdev->bdev) {
+				/* EC bdev is registered, base bdev is configured - nothing to do */
+				SPDK_DEBUGLOG(bdev_ec, "EC bdev %s is already registered, skipping examine\n",
+					      ec_bdev->bdev.name);
+				goto done;
+			}
+			/* EC bdev exists but not registered - continue examine to complete configuration */
+			SPDK_DEBUGLOG(bdev_ec, "Base bdev %s is configured but EC bdev %s is not registered, continuing examine\n",
+				      bdev->name, ec_bdev->bdev.name);
+			/* Continue to load superblock and examine_cont to complete configuration */
+		} else {
+			/* Base bdev is configured but EC bdev is NULL - this shouldn't happen,
+			 * but continue examine to be safe */
+			SPDK_WARNLOG("Base bdev %s is configured but EC bdev is NULL, continuing examine\n",
+				     bdev->name);
+		}
 	}
 
 	if (spdk_bdev_get_dif_type(bdev) != SPDK_DIF_DISABLE) {
-		SPDK_DEBUGLOG(bdev_ec, "No superblock found on bdev %s\n", bdev->name);
+		SPDK_DEBUGLOG(bdev_ec, "Base bdev %s has DIF enabled, skipping examine\n", bdev->name);
+		/* Try examine_no_sb for EC bdevs without superblock */
+		ec_bdev_examine_no_sb(bdev);
 		rc = 0;
 		goto done;
 	}
 
+	SPDK_DEBUGLOG(bdev_ec, "Loading superblock for bdev %s\n", bdev->name);
 	rc = ec_bdev_examine_load_sb(bdev->name, ec_bdev_examine_cont_wrapper, NULL);
 	if (rc != 0) {
+		SPDK_DEBUGLOG(bdev_ec, "Superblock load failed for bdev %s (rc=%d), trying examine_no_sb\n",
+			      bdev->name, rc);
+		/* Superblock load failed - try examine_no_sb for EC bdevs without superblock */
+		ec_bdev_examine_no_sb(bdev);
+		rc = 0;  /* Don't treat as error, examine_no_sb will handle it */
 		goto done;
 	}
+	SPDK_DEBUGLOG(bdev_ec, "Superblock load initiated for bdev %s, waiting for callback\n", bdev->name);
 
 	return;
 done:
