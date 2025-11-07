@@ -217,6 +217,12 @@ struct ec_bdev {
 
 	/* Extension interface for external modules (e.g., FTL for wear leveling) */
 	struct ec_bdev_extension_if	*extension_if;
+
+	/* Buffer alignment requirement for memory allocations */
+	size_t				buf_alignment;
+
+	/* Flag to track if alignment warning has been logged (to avoid log spam) */
+	bool				alignment_warned;
 };
 
 #define EC_FOR_EACH_BASE_BDEV(e, i) \
@@ -226,9 +232,31 @@ struct ec_bdev {
  * ec_bdev_io_channel is the context of spdk_io_channel for EC bdev device. It
  * contains the relationship of EC bdev io channel with base bdev io channels.
  */
+/* Buffer pool entry for parity buffers */
+struct ec_parity_buf_entry {
+	SLIST_ENTRY(ec_parity_buf_entry)	link;
+	unsigned char			*buf;
+};
+
 struct ec_bdev_io_channel {
 	/* Array of IO channels of base bdevs */
 	struct spdk_io_channel	**base_channel;
+	
+	/* Buffer pool for parity buffers to avoid frequent allocation/deallocation */
+	SLIST_HEAD(, ec_parity_buf_entry)	parity_buf_pool;
+	
+	/* Buffer pool for RMW stripe buffers */
+	SLIST_HEAD(, ec_parity_buf_entry)	rmw_stripe_buf_pool;
+	
+	/* Number of buffers in pool */
+	uint32_t			parity_buf_count;
+	uint32_t			rmw_buf_count;
+	
+	/* Buffer size for parity buffers */
+	uint32_t			parity_buf_size;
+	
+	/* Buffer size for RMW stripe buffers */
+	uint32_t			rmw_buf_size;
 };
 
 /* TAIL head for EC bdev list */
@@ -360,8 +388,8 @@ struct ec_bdev_module_private {
 int ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
 		   bool superblock, const struct spdk_uuid *uuid,
 		   struct ec_bdev **ec_bdev_out);
-void ec_bdev_delete(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void *cb_ctx);
-int ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name, bool is_data_block,
+void ec_bdev_delete(struct ec_bdev *ec_bdev, bool wipe_sb, ec_bdev_destruct_cb cb_fn, void *cb_ctx);
+int ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 			  ec_base_bdev_cb cb_fn, void *cb_ctx);
 struct ec_bdev *ec_bdev_find_by_name(const char *name);
 enum ec_bdev_state ec_bdev_str_to_state(const char *str);

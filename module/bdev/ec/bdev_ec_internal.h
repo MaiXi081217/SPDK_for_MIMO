@@ -68,13 +68,16 @@ void ec_submit_reset_request(struct ec_bdev_io *ec_io);
 /* ISA-L encoding/decoding functions */
 int ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 		     unsigned char **parity_ptrs, size_t len);
+int ec_encode_stripe_update(struct ec_bdev *ec_bdev, uint8_t vec_i,
+			    unsigned char *old_data, unsigned char *new_data,
+			    unsigned char **parity_ptrs, size_t len);
 int ec_bdev_init_tables(struct ec_bdev *ec_bdev, uint8_t k, uint8_t p);
 void ec_bdev_cleanup_tables(struct ec_bdev *ec_bdev);
 int ec_bdev_gen_decode_matrix(struct ec_bdev *ec_bdev, uint8_t *frag_err_list, int nerrs);
 
 /* Base bdev selection */
-int ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint8_t *data_indices,
-				 uint8_t *parity_indices);
+int ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
+				 uint8_t *data_indices, uint8_t *parity_indices);
 
 #endif /* SPDK_BDEV_EC_INTERNAL_H */
 

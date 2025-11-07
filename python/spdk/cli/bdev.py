@@ -1571,54 +1571,48 @@ def add_parser(subparsers):
     def bdev_ec_create(args):
         base_bdevs = []
         
-        # Parse base_bdevs with their roles
-        # Format can be: "bdev1 bdev2 bdev3" or JSON format: '[{"name":"bdev1","is_data_block":true},...]'
+        # Parse base_bdevs - now just a list of names
+        # Format can be: "bdev1 bdev2 bdev3" or JSON format: '["bdev1","bdev2","bdev3"]'
         if args.base_bdevs.startswith('['):
             # JSON format
             import json
             bdev_list = json.loads(args.base_bdevs)
             for bdev in bdev_list:
-                base_bdevs.append({
-                    "name": bdev.get("name", bdev),
-                    "is_data_block": bdev.get("is_data_block", True)
-                })
-        else:
-            # Simple format: space-separated list, optionally with :data or :parity suffix
-            for bdev_entry in args.base_bdevs.strip().split():
-                if ':' in bdev_entry:
-                    # Format: "bdev_name:data" or "bdev_name:parity"
-                    parts = bdev_entry.rsplit(':', 1)
-                    bdev_name = parts[0]
-                    is_data = parts[1].lower() in ['data', 'd', 'true']
-                    base_bdevs.append({
-                        "name": bdev_name,
-                        "is_data_block": is_data
-                    })
+                if isinstance(bdev, dict):
+                    # Support both {"name": "bdev1"} and just "bdev1"
+                    base_bdevs.append({"name": bdev.get("name", bdev)})
                 else:
-                    # Default to data block if no suffix
-                    base_bdevs.append({
-                        "name": bdev_entry,
-                        "is_data_block": True
-                    })
+                    base_bdevs.append({"name": bdev})
+        else:
+            # Simple format: space-separated list of bdev names
+            for bdev_entry in args.base_bdevs.strip().split():
+                # Ignore any :data or :parity suffixes (for backward compatibility)
+                if ':' in bdev_entry:
+                    bdev_name = bdev_entry.rsplit(':', 1)[0]
+                else:
+                    bdev_name = bdev_entry
+                base_bdevs.append({"name": bdev_name})
 
-        # Validate: must have at least one data block and one parity block
-        data_count = sum(1 for bdev in base_bdevs if bdev.get("is_data_block", True))
-        parity_count = sum(1 for bdev in base_bdevs if not bdev.get("is_data_block", True))
-        
-        if data_count == 0:
-            print("ERROR: At least one data block (k>=1) is required for EC bdev", file=sys.stderr)
-            print("       Hint: Use ':data' suffix or set is_data_block=true in JSON format", file=sys.stderr)
+        # Validate k and p
+        if args.k <= 0:
+            print("ERROR: k (number of data blocks) must be at least 1", file=sys.stderr)
             sys.exit(1)
         
-        if parity_count == 0:
-            print("ERROR: At least one parity block (p>=1) is required for EC bdev", file=sys.stderr)
-            print("       Hint: Use ':parity' suffix or set is_data_block=false in JSON format", file=sys.stderr)
-            print("       Example: 'bdev1:data bdev2:data bdev3:parity'", file=sys.stderr)
+        if args.p <= 0:
+            print("ERROR: p (number of parity blocks) must be at least 1", file=sys.stderr)
+            sys.exit(1)
+
+        # Validate that number of base bdevs matches k + p
+        if len(base_bdevs) != args.k + args.p:
+            print("ERROR: Number of base bdevs (%d) must equal k + p (%d + %d = %d)" % 
+                  (len(base_bdevs), args.k, args.p, args.k + args.p), file=sys.stderr)
             sys.exit(1)
 
         # Print the created EC name (RPC returns a string)
         print_json(args.client.bdev_ec_create(
                                   name=args.name,
+                                  k=args.k,
+                                  p=args.p,
                                   strip_size_kb=args.strip_size_kb,
                                   base_bdevs=base_bdevs,
                                   uuid=args.uuid,
@@ -1626,13 +1620,15 @@ def add_parser(subparsers):
     
     p = subparsers.add_parser('bdev_ec_create', help='Create new EC (Erasure Code) bdev')
     p.add_argument('-n', '--name', help='EC bdev name', required=True)
+    p.add_argument('-k', '--k', help='Number of data blocks (k)', type=int, required=True)
+    p.add_argument('-p', '--p', help='Number of parity blocks (p)', type=int, required=True)
     p.add_argument('-z', '--strip-size-kb', help='strip size in KB', type=int)
-    p.add_argument('-b', '--base-bdevs', help='''base bdevs with their roles. 
-    Format 1 (simple): space-separated list with optional :data or :parity suffix
-    Example: "bdev1:data bdev2:data bdev3:parity bdev4:parity"
-    Format 2 (JSON): JSON array of objects with name and is_data_block fields
-    Example: '[{"name":"bdev1","is_data_block":true},{"name":"bdev2","is_data_block":false}]'
-    If no suffix is provided, bdev defaults to data block.''', required=True)
+    p.add_argument('-b', '--base-bdevs', help='''base bdevs list. 
+    Format 1 (simple): space-separated list of bdev names
+    Example: "bdev1 bdev2 bdev3 bdev4" (for k=2, p=2)
+    Format 2 (JSON): JSON array of bdev names or objects
+    Example: '["bdev1","bdev2","bdev3","bdev4"]' or '[{"name":"bdev1"},{"name":"bdev2"}]'
+    Note: Number of base bdevs must equal k + p. Parity blocks are distributed round-robin across all disks.''', required=True)
     p.add_argument('--uuid', help='UUID for this EC bdev')
     p.add_argument('-s', '--superblock', help='information about EC bdev will be stored in superblock on each base bdev, '
                                               'disabled by default', action='store_true')
@@ -1646,21 +1642,13 @@ def add_parser(subparsers):
     p.set_defaults(func=bdev_ec_delete)
 
     def bdev_ec_add_base_bdev(args):
-        # RPC expects boolean for is_data_block, default is True
-        # Always pass is_data_block to RPC (RPC decoder handles default)
+        # All disks are equal, parity is distributed round-robin
         args.client.bdev_ec_add_base_bdev(
                                          ec_bdev=args.ec_bdev,
-                                         base_bdev=args.base_bdev,
-                                         is_data_block=args.is_data_block)
+                                         base_bdev=args.base_bdev)
     p = subparsers.add_parser('bdev_ec_add_base_bdev', help='Add base bdev to existing EC bdev')
     p.add_argument('ec_bdev', help='EC bdev name')
     p.add_argument('base_bdev', help='base bdev name')
-    group = p.add_mutually_exclusive_group()
-    group.add_argument('-d', '--is-data-block', help='Set this base bdev as a data block (default)', 
-                       action='store_true', dest='is_data_block', default=True)
-    group.add_argument('-p', '--parity-block', help='Set this base bdev as a parity block', 
-                        action='store_false', dest='is_data_block')
-    p.set_defaults(is_data_block=True)
     p.set_defaults(func=bdev_ec_add_base_bdev)
 
     def bdev_ec_remove_base_bdev(args):

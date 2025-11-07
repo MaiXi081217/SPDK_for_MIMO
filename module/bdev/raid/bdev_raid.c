@@ -1916,7 +1916,7 @@ raid_bdev_configure(struct raid_bdev *raid_bdev, raid_bdev_configure_cb cb, void
  * none
  */
 static void
-raid_bdev_deconfigure_unregister_done(void *cb_arg)
+raid_bdev_deconfigure_unregister_done(void *cb_arg, int rc)
 {
 	struct raid_bdev *raid_bdev = cb_arg;
 	raid_bdev_destruct_cb user_cb_fn = raid_bdev->deconfigure_cb_fn;
@@ -1934,7 +1934,7 @@ raid_bdev_deconfigure_unregister_done(void *cb_arg)
 
 	/* Call user callback */
 	if (user_cb_fn) {
-		user_cb_fn(user_cb_arg, 0);
+		user_cb_fn(user_cb_arg, rc);
 	}
 }
 
@@ -3952,8 +3952,10 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to configure bdev %s as base bdev of raid %s: %s\n",
 				    bdev->name, raid_bdev->bdev.name, spdk_strerror(-rc));
+			goto out;
 		}
-		goto out;
+		/* If rc == 0, raid_bdev_configure_base_bdev will call the callback asynchronously */
+		return;
 	}
 
 	if (sb_base_bdev->state != RAID_SB_BASE_BDEV_CONFIGURED) {
@@ -3979,15 +3981,23 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
 	}
 
 	if (base_info->is_configured) {
-		rc = -EEXIST;
-		goto out;
+		SPDK_DEBUGLOG(bdev_raid, "Base bdev %s already configured for raid bdev %s\n",
+			      bdev->name, raid_bdev->bdev.name);
+		rc = 0;
+		if (cb_fn != 0) {
+			cb_fn(cb_ctx, rc);
+		}
+		return;
 	}
 
 	rc = raid_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to configure bdev %s as base bdev of raid %s: %s\n",
 			    bdev->name, raid_bdev->bdev.name, spdk_strerror(-rc));
+		goto out;
 	}
+	/* If rc == 0, raid_bdev_configure_base_bdev will call the callback asynchronously */
+	return;
 out:
 	if (rc != 0 && cb_fn != 0) {
 		cb_fn(cb_ctx, rc);

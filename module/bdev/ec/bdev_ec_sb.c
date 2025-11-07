@@ -441,8 +441,12 @@ _ec_bdev_write_superblock(void *_ctx)
 	}
 
 	/* All write operations have been submitted (or skipped for unconfigured bdevs).
-	 * The callbacks will handle decrementing remaining and calling the final callback
-	 * when all operations complete. No need to call ec_bdev_write_sb_base_bdev_done here. */
+	 * If all base bdevs were unconfigured, remaining may have reached 0 during the loop.
+	 * Check if we need to call the final callback now. */
+	if (ctx->remaining == 0) {
+		ctx->cb(ctx->status, ctx->ec_bdev, ctx->cb_ctx);
+		free(ctx);
+	}
 }
 
 void
@@ -499,14 +503,30 @@ ec_bdev_wipe_superblock_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_
 	struct ec_bdev_write_sb_ctx *ctx = cb_arg;
 	int status = 0;
 
+	/* During shutdown, IO operations may be aborted, which is expected.
+	 * Don't treat aborted operations as errors during shutdown.
+	 * Check if EC bdev is in OFFLINE state, which indicates shutdown/cleanup.
+	 */
 	if (!success) {
-		SPDK_ERRLOG("Failed to wipe superblock on bdev %s\n", bdev_io->bdev->name);
-		status = -EIO;
+		if (ctx->ec_bdev != NULL && ctx->ec_bdev->state == EC_BDEV_STATE_OFFLINE) {
+			/* During shutdown, aborted operations are expected */
+			SPDK_DEBUGLOG(bdev_ec_sb, "Superblock wipe failed/aborted on bdev %s during shutdown\n",
+				      bdev_io->bdev->name);
+			status = 0;  /* Treat as success during shutdown */
+		} else {
+			SPDK_ERRLOG("Failed to wipe superblock on bdev %s\n", bdev_io->bdev->name);
+			status = -EIO;
+		}
 	}
 
+	/* Free the IO before calling the done callback, as the bdev_io might
+	 * reference resources that are being cleaned up during shutdown */
 	spdk_bdev_free_io(bdev_io);
 
-	ec_bdev_write_sb_base_bdev_done(status, ctx);
+	/* Check if ctx is still valid (might have been freed during shutdown) */
+	if (ctx != NULL) {
+		ec_bdev_write_sb_base_bdev_done(status, ctx);
+	}
 }
 
 static void
@@ -523,6 +543,15 @@ _ec_bdev_wipe_superblock(void *_ctx)
 
 		if (!base_info->is_configured) {
 			/* Skip unconfigured base bdevs - decrement remaining directly */
+			ctx->submitted++;
+			ctx->remaining--;
+			continue;
+		}
+
+		/* Check if desc or channel is NULL (might have been closed during shutdown) */
+		if (base_info->desc == NULL || base_info->app_thread_ch == NULL) {
+			SPDK_DEBUGLOG(bdev_ec_sb, "Base bdev %s desc or channel is NULL, skipping wipe\n",
+				      base_info->name ? base_info->name : "unknown");
 			ctx->submitted++;
 			ctx->remaining--;
 			continue;
@@ -557,8 +586,12 @@ _ec_bdev_wipe_superblock(void *_ctx)
 	}
 
 	/* All write operations have been submitted (or skipped for unconfigured bdevs).
-	 * The callbacks will handle decrementing remaining and calling the final callback
-	 * when all operations complete. No need to call ec_bdev_write_sb_base_bdev_done here. */
+	 * If all base bdevs were unconfigured, remaining may have reached 0 during the loop.
+	 * Check if we need to call the final callback now. */
+	if (ctx->remaining == 0) {
+		ctx->cb(ctx->status, ctx->ec_bdev, ctx->cb_ctx);
+		free(ctx);
+	}
 }
 
 void
