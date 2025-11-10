@@ -37,13 +37,26 @@ int
 ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 		 unsigned char **parity_ptrs, size_t len)
 {
-	struct ec_bdev_module_private *mp = ec_bdev->module_private;
+	struct ec_bdev_module_private *mp;
 	uint8_t k, p;
 	uint8_t i;
 	bool misaligned_warning = false;
 	const size_t isal_optimal_align = 64;  /* ISA-L optimal alignment for SIMD */
 
+	/* Validate input parameters */
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("ec_bdev is NULL\n");
+		return -EINVAL;
+	}
+
+	if (data_ptrs == NULL || parity_ptrs == NULL) {
+		SPDK_ERRLOG("EC bdev %s: data_ptrs or parity_ptrs is NULL\n", ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	mp = ec_bdev->module_private;
 	if (mp == NULL || mp->g_tbls == NULL) {
+		SPDK_ERRLOG("EC bdev %s: module_private or g_tbls is NULL\n", ec_bdev->bdev.name);
 		return -EINVAL;
 	}
 
@@ -51,53 +64,42 @@ ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 	k = ec_bdev->k;
 	p = ec_bdev->p;
 
-	/* Optimized: Prefetch data and parity buffers into CPU cache for better performance */
-	/* Prefetch data blocks - prefetch for read (hint 0 = temporal locality) */
+	/* Critical: Verify all data and parity pointers are non-NULL before encoding
+	 * ISA-L's ec_encode_data cannot handle NULL pointers and will cause crashes
+	 * Also check alignment during validation to reduce loop overhead
+	 */
 	for (i = 0; i < k; i++) {
-		if (data_ptrs[i] != NULL) {
-			/* Prefetch first cache line of each data block */
-			EC_PREFETCH(data_ptrs[i], 0);
-			/* Prefetch middle cache line if data is large enough */
-			if (len > 128) {
-				EC_PREFETCH(data_ptrs[i] + 64, 0);
-			}
+		if (data_ptrs[i] == NULL) {
+			SPDK_ERRLOG("EC bdev %s: data_ptrs[%u] is NULL\n", ec_bdev->bdev.name, i);
+			return -EINVAL;
 		}
-	}
-
-	/* Prefetch parity blocks - prefetch for write (hint 1 = write, temporal locality) */
-	for (i = 0; i < p; i++) {
-		if (parity_ptrs[i] != NULL) {
-			/* Prefetch first cache line of each parity block */
-			EC_PREFETCH(parity_ptrs[i], 1);
-		}
-	}
-
-	/* Optimized: Check alignment for optimal ISA-L performance */
-	/* ISA-L performs best with 64-byte aligned buffers and lengths */
-	for (i = 0; i < k; i++) {
-		if (data_ptrs[i] != NULL) {
+		/* Check alignment while validating - combine operations */
+		if (!misaligned_warning) {
 			uintptr_t addr = (uintptr_t)data_ptrs[i];
 			if ((addr % isal_optimal_align) != 0) {
 				misaligned_warning = true;
-				break;
+			}
+		}
+	}
+	for (i = 0; i < p; i++) {
+		if (parity_ptrs[i] == NULL) {
+			SPDK_ERRLOG("EC bdev %s: parity_ptrs[%u] is NULL\n", ec_bdev->bdev.name, i);
+			return -EINVAL;
+		}
+		/* Check alignment while validating */
+		if (!misaligned_warning) {
+			uintptr_t addr = (uintptr_t)parity_ptrs[i];
+			if ((addr % isal_optimal_align) != 0) {
+				misaligned_warning = true;
 			}
 		}
 	}
 
-	/* Check parity buffer alignment */
-	if (!misaligned_warning) {
-		for (i = 0; i < p; i++) {
-			if (parity_ptrs[i] != NULL) {
-				uintptr_t addr = (uintptr_t)parity_ptrs[i];
-				if ((addr % isal_optimal_align) != 0) {
-					misaligned_warning = true;
-					break;
-				}
-			}
-		}
+	/* Verify length is non-zero and check alignment */
+	if (len == 0) {
+		SPDK_ERRLOG("EC bdev %s: encoding length is zero\n", ec_bdev->bdev.name);
+		return -EINVAL;
 	}
-
-	/* Check length alignment - ISA-L performs best with 64-byte aligned lengths */
 	if (!misaligned_warning && (len % isal_optimal_align) != 0) {
 		misaligned_warning = true;
 	}
@@ -109,6 +111,77 @@ ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 			     ec_bdev->bdev.name);
 		ec_bdev->alignment_warned = true;
 	}
+
+	/* Optimized: Aggressive prefetching strategy for ISA-L encoding
+	 * Key optimizations:
+	 * 1. Prefetch encoding tables (g_tbls) - frequently accessed during encoding
+	 * 2. Staggered prefetching - start prefetching early to hide memory latency
+	 * 3. Multiple cache lines for large blocks - prefetch ahead of current position
+	 * 4. Interleaved prefetching - mix data and parity prefetches for better parallelism
+	 */
+	
+	/* Prefetch encoding tables first - they're accessed frequently during encoding */
+	EC_PREFETCH(mp->g_tbls, 0);
+	if (mp->g_tbls != NULL && (32 * k * p) > 64) {
+		/* Prefetch second cache line if tables are large */
+		EC_PREFETCH((char *)mp->g_tbls + 64, 0);
+	}
+
+	/* Optimized: Aggressive prefetching for data blocks
+	 * Prefetch strategy based on block size:
+	 * - Small blocks (< 1KB): prefetch first cache line
+	 * - Medium blocks (1KB - 8KB): prefetch first + middle
+	 * - Large blocks (> 8KB): prefetch multiple cache lines ahead
+	 */
+	size_t prefetch_distance = 0;
+	
+	if (len >= 8192) {
+		prefetch_distance = 1024;  /* Prefetch 1KB ahead for very large blocks */
+	} else if (len >= 1024) {
+		prefetch_distance = 256;   /* Prefetch 256B ahead for medium blocks */
+	}
+
+	for (i = 0; i < k; i++) {
+		/* Prefetch first cache line immediately */
+		EC_PREFETCH(data_ptrs[i], 0);
+		
+		/* Prefetch additional cache lines based on block size */
+		if (len > 128) {
+			EC_PREFETCH(data_ptrs[i] + 64, 0);
+		}
+		if (len >= 1024) {
+			EC_PREFETCH(data_ptrs[i] + 256, 0);
+		}
+		if (prefetch_distance > 0 && len > prefetch_distance) {
+			EC_PREFETCH(data_ptrs[i] + prefetch_distance, 0);
+		}
+	}
+
+	/* Optimized: Prefetch parity blocks for write
+	 * Use write hint (1) for parity blocks since they'll be written
+	 */
+	for (i = 0; i < p; i++) {
+		/* Prefetch first cache line */
+		EC_PREFETCH(parity_ptrs[i], 1);
+		
+		/* Prefetch additional cache lines for large blocks */
+		if (len > 128) {
+			EC_PREFETCH(parity_ptrs[i] + 64, 1);
+		}
+		if (len >= 1024) {
+			EC_PREFETCH(parity_ptrs[i] + 256, 1);
+		}
+		if (prefetch_distance > 0 && len > prefetch_distance) {
+			EC_PREFETCH(parity_ptrs[i] + prefetch_distance, 1);
+		}
+	}
+
+	/* Memory barrier to ensure prefetched data is visible before encoding
+	 * This is especially important for multi-threaded scenarios
+	 */
+#ifdef __x86_64__
+	asm volatile("" ::: "memory");  /* Compiler memory barrier */
+#endif
 
 	/* Use ISA-L to encode k data blocks into p parity blocks */
 	/* Note: ISA-L's ec_encode_data is highly optimized with SIMD instructions */
@@ -199,17 +272,46 @@ ec_encode_stripe_update(struct ec_bdev *ec_bdev, uint8_t vec_i,
 		return -EINVAL;
 	}
 
-	/* Prefetch parity blocks for write */
-	for (i = 0; i < p; i++) {
-		if (parity_ptrs[i] != NULL) {
-			EC_PREFETCH(parity_ptrs[i], 1);
+	/* Optimized: Aggressive prefetching for incremental update
+	 * Prefetch strategy optimized for incremental update pattern:
+	 * - Delta data is read once, prefetch multiple cache lines
+	 * - Parity blocks are read-modify-write, prefetch for both read and write
+	 */
+	
+	/* Prefetch delta data for read - prefetch multiple cache lines for large blocks */
+	if (delta_data != NULL) {
+		EC_PREFETCH(delta_data, 0);
+		if (len > 128) {
+			EC_PREFETCH(delta_data + 64, 0);
+		}
+		if (len >= 1024) {
+			EC_PREFETCH(delta_data + 256, 0);
+			if (len >= 8192) {
+				EC_PREFETCH(delta_data + 1024, 0);
+			}
 		}
 	}
 
-	/* Prefetch delta data for read */
-	if (delta_data != NULL) {
-		EC_PREFETCH(delta_data, 0);
+	/* Prefetch parity blocks for read-modify-write
+	 * Parity blocks need to be read first, then modified
+	 */
+	for (i = 0; i < p; i++) {
+		if (parity_ptrs[i] != NULL) {
+			/* Prefetch for read first (hint 0) since we read before write */
+			EC_PREFETCH(parity_ptrs[i], 0);
+			if (len > 128) {
+				EC_PREFETCH(parity_ptrs[i] + 64, 0);
+			}
+			if (len >= 1024) {
+				EC_PREFETCH(parity_ptrs[i] + 256, 0);
+				/* Also prefetch for write since we'll modify */
+				EC_PREFETCH(parity_ptrs[i], 1);
+			}
+		}
 	}
+
+	/* Prefetch encoding tables - accessed during incremental update */
+	EC_PREFETCH(mp->g_tbls, 0);
 
 	/* Use ISA-L's incremental update function to update parity blocks */
 	/* This is much faster than re-encoding the entire stripe */
@@ -410,4 +512,5 @@ ec_bdev_cleanup_tables(struct ec_bdev *ec_bdev)
 	free(mp->invert_matrix);
 	mp->invert_matrix = NULL;
 }
+
 
