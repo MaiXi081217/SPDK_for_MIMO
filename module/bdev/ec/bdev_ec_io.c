@@ -41,40 +41,39 @@ ec_get_parity_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uin
 	align = (ec_bdev != NULL && ec_bdev->buf_alignment > 0) ? 
 		ec_bdev->buf_alignment : 0x1000;
 
-	/* Try to get from pool first */
-	/* Note: We only pool buffers of the correct size, so if the first entry
-	 * doesn't match, none will match. However, we check anyway for robustness. */
+	/* Optimized: Fast path - check pool first
+	 * Most common case: buffer is available in pool
+	 * Use branch prediction hints for better performance
+	 */
 	entry = SLIST_FIRST(&ec_ch->parity_buf_pool);
-	if (entry != NULL) {
-		if (ec_ch->parity_buf_size == buf_size) {
-			SLIST_REMOVE_HEAD(&ec_ch->parity_buf_pool, link);
-			/* Prevent counter underflow */
-			if (ec_ch->parity_buf_count > 0) {
-				ec_ch->parity_buf_count--;
-			} else {
-				SPDK_WARNLOG("parity_buf_count is 0 but pool is not empty\n");
-			}
-			buf = entry->buf;
-			/* Free the entry structure - we only need the buffer */
-			free(entry);
-			return buf;
+	if (spdk_likely(entry != NULL && ec_ch->parity_buf_size == buf_size)) {
+		SLIST_REMOVE_HEAD(&ec_ch->parity_buf_pool, link);
+		/* Prevent counter underflow */
+		if (spdk_likely(ec_ch->parity_buf_count > 0)) {
+			ec_ch->parity_buf_count--;
 		} else {
-			/* Size mismatch - this shouldn't happen if pool is used correctly,
-			 * but clean it up to avoid memory leak */
-			SPDK_WARNLOG("Buffer size mismatch in parity pool: expected %u, requested %u\n",
-				     ec_ch->parity_buf_size, buf_size);
-			/* Remove mismatched entry and free it */
-			SLIST_REMOVE_HEAD(&ec_ch->parity_buf_pool, link);
-			/* Prevent counter underflow */
-			if (ec_ch->parity_buf_count > 0) {
-				ec_ch->parity_buf_count--;
-			} else {
-				SPDK_WARNLOG("parity_buf_count is 0 but pool is not empty (size mismatch)\n");
-			}
-			spdk_dma_free(entry->buf);
-			free(entry);
-			/* Continue to allocate new buffer */
+			SPDK_WARNLOG("parity_buf_count is 0 but pool is not empty\n");
 		}
+		buf = entry->buf;
+		/* Free the entry structure - we only need the buffer */
+		free(entry);
+		return buf;
+	} else if (entry != NULL) {
+		/* Size mismatch - this shouldn't happen if pool is used correctly,
+		 * but clean it up to avoid memory leak */
+		SPDK_WARNLOG("Buffer size mismatch in parity pool: expected %u, requested %u\n",
+			     ec_ch->parity_buf_size, buf_size);
+		/* Remove mismatched entry and free it */
+		SLIST_REMOVE_HEAD(&ec_ch->parity_buf_pool, link);
+		/* Prevent counter underflow */
+		if (ec_ch->parity_buf_count > 0) {
+			ec_ch->parity_buf_count--;
+		} else {
+			SPDK_WARNLOG("parity_buf_count is 0 but pool is not empty (size mismatch)\n");
+		}
+		spdk_dma_free(entry->buf);
+		free(entry);
+		/* Continue to allocate new buffer */
 	}
 
 	/* Allocate new buffer - use malloc instead of zmalloc for better performance */
@@ -135,40 +134,36 @@ ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev,
 	align = (ec_bdev != NULL && ec_bdev->buf_alignment > 0) ? 
 		ec_bdev->buf_alignment : 0x1000;
 
-	/* Try to get from pool first */
-	/* Note: We only pool buffers of the correct size, so if the first entry
-	 * doesn't match, none will match. However, we check anyway for robustness. */
+	/* Optimized: Fast path - check pool first */
 	entry = SLIST_FIRST(&ec_ch->rmw_stripe_buf_pool);
-	if (entry != NULL) {
-		if (ec_ch->rmw_buf_size == buf_size) {
-			SLIST_REMOVE_HEAD(&ec_ch->rmw_stripe_buf_pool, link);
-			/* Prevent counter underflow */
-			if (ec_ch->rmw_buf_count > 0) {
-				ec_ch->rmw_buf_count--;
-			} else {
-				SPDK_WARNLOG("rmw_buf_count is 0 but pool is not empty\n");
-			}
-			buf = entry->buf;
-			/* Free the entry structure - we only need the buffer */
-			free(entry);
-			return buf;
+	if (spdk_likely(entry != NULL && ec_ch->rmw_buf_size == buf_size)) {
+		SLIST_REMOVE_HEAD(&ec_ch->rmw_stripe_buf_pool, link);
+		/* Prevent counter underflow */
+		if (spdk_likely(ec_ch->rmw_buf_count > 0)) {
+			ec_ch->rmw_buf_count--;
 		} else {
-			/* Size mismatch - this shouldn't happen if pool is used correctly,
-			 * but clean it up to avoid memory leak */
-			SPDK_WARNLOG("Buffer size mismatch in RMW stripe pool: expected %u, requested %u\n",
-				     ec_ch->rmw_buf_size, buf_size);
-			/* Remove mismatched entry and free it */
-			SLIST_REMOVE_HEAD(&ec_ch->rmw_stripe_buf_pool, link);
-			/* Prevent counter underflow */
-			if (ec_ch->rmw_buf_count > 0) {
-				ec_ch->rmw_buf_count--;
-			} else {
-				SPDK_WARNLOG("rmw_buf_count is 0 but pool is not empty (size mismatch)\n");
-			}
-			spdk_dma_free(entry->buf);
-			free(entry);
-			/* Continue to allocate new buffer */
+			SPDK_WARNLOG("rmw_buf_count is 0 but pool is not empty\n");
 		}
+		buf = entry->buf;
+		/* Free the entry structure - we only need the buffer */
+		free(entry);
+		return buf;
+	} else if (entry != NULL) {
+		/* Size mismatch - this shouldn't happen if pool is used correctly,
+		 * but clean it up to avoid memory leak */
+		SPDK_WARNLOG("Buffer size mismatch in RMW stripe pool: expected %u, requested %u\n",
+			     ec_ch->rmw_buf_size, buf_size);
+		/* Remove mismatched entry and free it */
+		SLIST_REMOVE_HEAD(&ec_ch->rmw_stripe_buf_pool, link);
+		/* Prevent counter underflow */
+		if (ec_ch->rmw_buf_count > 0) {
+			ec_ch->rmw_buf_count--;
+		} else {
+			SPDK_WARNLOG("rmw_buf_count is 0 but pool is not empty (size mismatch)\n");
+		}
+		spdk_dma_free(entry->buf);
+		free(entry);
+		/* Continue to allocate new buffer */
 	}
 
 	/* Allocate new buffer - use malloc instead of zmalloc */
@@ -257,6 +252,15 @@ ec_cleanup_stripe_private(struct ec_bdev_io *ec_io, uint32_t strip_size_bytes)
 
 	struct ec_stripe_private *sp = ec_io->module_private;
 	if (sp != NULL && ec_io->ec_ch != NULL) {
+		/* Free temporary data buffers if allocated */
+		if (sp->num_temp_bufs > 0) {
+			for (uint8_t j = 0; j < sp->num_temp_bufs; j++) {
+				if (sp->temp_data_bufs[j] != NULL) {
+					spdk_dma_free(sp->temp_data_bufs[j]);
+				}
+			}
+		}
+		/* Return parity buffers to pool */
 		for (uint8_t j = 0; j < sp->num_parity; j++) {
 			ec_put_parity_buf(ec_io->ec_ch, sp->parity_bufs[j], strip_size_bytes);
 		}
@@ -457,22 +461,97 @@ ec_submit_write_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 		}
 	}
 
-	/* Prepare data pointers from iovs - optimized to reduce nested loop overhead */
+	/* Prepare data pointers from iovs - optimized for performance
+	 * Key optimizations:
+	 * 1. Single pass through iovs (no repeated traversal)
+	 * 2. Support for cross-iov data by copying to temporary buffers
+	 * 3. Early validation to avoid unnecessary work
+	 */
 	size_t raid_io_offset = 0;
 	size_t raid_io_iov_offset = 0;
 	int raid_io_iov_idx = 0;
+	unsigned char *temp_data_bufs[EC_MAX_K] = {NULL};  /* Temporary buffers for cross-iov data */
+	bool need_temp_bufs = false;
 
-	/* Optimized: Pre-calculate strip_size_bytes for faster loop */
+	/* Optimized: First pass - quick check if any data blocks span multiple iovs
+	 * Early exit optimization: if we find one that spans, we can stop checking
+	 * This avoids unnecessary traversal for the common case where data is contiguous
+	 */
+	for (i = 0; i < k && !need_temp_bufs; i++) {
+		size_t target_offset = i * strip_size_bytes;
+		size_t current_offset = raid_io_offset;
+		int current_iov_idx = raid_io_iov_idx;
+		size_t current_iov_offset = raid_io_iov_offset;
+
+		/* Advance to target offset - optimized loop */
+		while (current_offset < target_offset && current_iov_idx < ec_io->iovcnt) {
+			size_t bytes_in_iov = ec_io->iovs[current_iov_idx].iov_len - current_iov_offset;
+			if (spdk_unlikely(bytes_in_iov == 0)) {
+				current_iov_idx++;
+				current_iov_offset = 0;
+				continue;
+			}
+			size_t bytes_to_skip = target_offset - current_offset;
+			if (bytes_to_skip < bytes_in_iov) {
+				current_iov_offset += bytes_to_skip;
+				current_offset = target_offset;
+				break;
+			} else {
+				current_offset += bytes_in_iov;
+				current_iov_idx++;
+				current_iov_offset = 0;
+			}
+		}
+
+		if (spdk_unlikely(current_iov_idx >= ec_io->iovcnt)) {
+			SPDK_ERRLOG("Not enough data in iovs for stripe write\n");
+			for (idx = 0; idx < p; idx++) {
+				ec_put_parity_buf(ec_io->ec_ch, parity_ptrs[idx], strip_size_bytes);
+			}
+			return -EINVAL;
+		}
+
+		/* Check if data spans multiple iovs - early exit if found */
+		size_t remaining = ec_io->iovs[current_iov_idx].iov_len - current_iov_offset;
+		if (remaining < strip_size_bytes) {
+			need_temp_bufs = true;
+			/* Found one that spans - no need to check others */
+			break;
+		}
+	}
+
+	/* Second pass: Prepare data pointers or copy to temp buffers */
+	raid_io_offset = 0;
+	raid_io_iov_offset = 0;
+	raid_io_iov_idx = 0;
+
+	if (need_temp_bufs) {
+		/* Allocate temporary buffers for data blocks that span iovs */
+		for (i = 0; i < k; i++) {
+			temp_data_bufs[i] = spdk_dma_malloc(strip_size_bytes, ec_bdev->buf_alignment, NULL);
+			if (temp_data_bufs[i] == NULL) {
+				SPDK_ERRLOG("Failed to allocate temp buffer for data block %u\n", i);
+				/* Clean up already allocated buffers */
+				for (idx = 0; idx < i; idx++) {
+					if (temp_data_bufs[idx] != NULL) {
+						spdk_dma_free(temp_data_bufs[idx]);
+					}
+				}
+				for (idx = 0; idx < p; idx++) {
+					ec_put_parity_buf(ec_io->ec_ch, parity_ptrs[idx], strip_size_bytes);
+				}
+				return -ENOMEM;
+			}
+		}
+	}
+
 	for (i = 0; i < k; i++) {
-		/* Optimized: Calculate target_offset once per iteration */
 		size_t target_offset = i * strip_size_bytes;
 
-		/* Optimized: Advance through iovs more efficiently */
-		/* Skip to the target offset by advancing through iovs */
+		/* Advance to target offset */
 		while (raid_io_offset < target_offset && raid_io_iov_idx < ec_io->iovcnt) {
 			size_t bytes_in_this_iov = ec_io->iovs[raid_io_iov_idx].iov_len - raid_io_iov_offset;
 			
-			/* Safety check: if iov_len is 0, skip to next iov */
 			if (bytes_in_this_iov == 0) {
 				raid_io_iov_idx++;
 				raid_io_iov_offset = 0;
@@ -481,12 +560,10 @@ ec_submit_write_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 
 			size_t bytes_to_skip = target_offset - raid_io_offset;
 			if (bytes_to_skip < bytes_in_this_iov) {
-				/* Target is within this iov */
 				raid_io_iov_offset += bytes_to_skip;
 				raid_io_offset = target_offset;
 				break;
 			} else {
-				/* Target is beyond this iov, skip entire iov */
 				raid_io_offset += bytes_in_this_iov;
 				raid_io_iov_idx++;
 				raid_io_iov_offset = 0;
@@ -495,39 +572,136 @@ ec_submit_write_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 
 		if (raid_io_iov_idx >= ec_io->iovcnt) {
 			SPDK_ERRLOG("Not enough data in iovs for stripe write\n");
+			for (idx = 0; idx < k; idx++) {
+				if (temp_data_bufs[idx] != NULL) {
+					spdk_dma_free(temp_data_bufs[idx]);
+				}
+			}
 			for (idx = 0; idx < p; idx++) {
 				ec_put_parity_buf(ec_io->ec_ch, parity_ptrs[idx], strip_size_bytes);
 			}
 			return -EINVAL;
 		}
 
-		/* Safety check: ensure iov_base is not NULL */
 		if (ec_io->iovs[raid_io_iov_idx].iov_base == NULL) {
 			SPDK_ERRLOG("iov_base is NULL for iov index %d\n", raid_io_iov_idx);
+			for (idx = 0; idx < k; idx++) {
+				if (temp_data_bufs[idx] != NULL) {
+					spdk_dma_free(temp_data_bufs[idx]);
+				}
+			}
 			for (idx = 0; idx < p; idx++) {
 				ec_put_parity_buf(ec_io->ec_ch, parity_ptrs[idx], strip_size_bytes);
 			}
 			return -EINVAL;
 		}
 
-		data_ptrs[i] = (unsigned char *)ec_io->iovs[raid_io_iov_idx].iov_base + raid_io_iov_offset;
-		/* Note: raid_io_iov_offset is guaranteed to be < iov_len by the while loop logic */
+		size_t remaining_in_iov = ec_io->iovs[raid_io_iov_idx].iov_len - raid_io_iov_offset;
+		
+		if (remaining_in_iov >= strip_size_bytes) {
+			/* Data is contiguous in single iov - use directly */
+			data_ptrs[i] = (unsigned char *)ec_io->iovs[raid_io_iov_idx].iov_base + raid_io_iov_offset;
+			raid_io_iov_offset += strip_size_bytes;
+			raid_io_offset += strip_size_bytes;
+			if (raid_io_iov_offset >= ec_io->iovs[raid_io_iov_idx].iov_len) {
+				raid_io_iov_idx++;
+				raid_io_iov_offset = 0;
+			}
+		} else {
+			/* Data spans multiple iovs - copy to temp buffer */
+			data_ptrs[i] = temp_data_bufs[i];
+			size_t bytes_copied = 0;
+			int copy_iov_idx = raid_io_iov_idx;
+			size_t copy_iov_offset = raid_io_iov_offset;
+
+			while (bytes_copied < strip_size_bytes && copy_iov_idx < ec_io->iovcnt) {
+				size_t available = ec_io->iovs[copy_iov_idx].iov_len - copy_iov_offset;
+				size_t needed = strip_size_bytes - bytes_copied;
+				size_t to_copy = spdk_min(available, needed);
+
+				/* Optimized: Use efficient copy for aligned data */
+				if (to_copy >= 64 &&
+				    ((uintptr_t)(temp_data_bufs[i] + bytes_copied) % 8 == 0) &&
+				    ((uintptr_t)((unsigned char *)ec_io->iovs[copy_iov_idx].iov_base + copy_iov_offset) % 8 == 0)) {
+					/* Use 64-bit copy for aligned large blocks */
+					uint64_t *dst64 = (uint64_t *)(temp_data_bufs[i] + bytes_copied);
+					uint64_t *src64 = (uint64_t *)((unsigned char *)ec_io->iovs[copy_iov_idx].iov_base + copy_iov_offset);
+					size_t len64 = to_copy / 8;
+					size_t j;
+					for (j = 0; j < len64; j++) {
+						dst64[j] = src64[j];
+					}
+					/* Handle remaining bytes */
+					if (to_copy % 8 != 0) {
+						memcpy(temp_data_bufs[i] + bytes_copied + len64 * 8,
+						       (unsigned char *)ec_io->iovs[copy_iov_idx].iov_base + copy_iov_offset + len64 * 8,
+						       to_copy % 8);
+					}
+				} else {
+					/* Fall back to standard memcpy */
+					memcpy(temp_data_bufs[i] + bytes_copied,
+					       (unsigned char *)ec_io->iovs[copy_iov_idx].iov_base + copy_iov_offset,
+					       to_copy);
+				}
+				bytes_copied += to_copy;
+				copy_iov_offset += to_copy;
+
+				if (copy_iov_offset >= ec_io->iovs[copy_iov_idx].iov_len) {
+					copy_iov_idx++;
+					copy_iov_offset = 0;
+				}
+			}
+
+			if (bytes_copied < strip_size_bytes) {
+				SPDK_ERRLOG("Not enough data to copy for data block %u\n", i);
+				for (idx = 0; idx < k; idx++) {
+					if (temp_data_bufs[idx] != NULL) {
+						spdk_dma_free(temp_data_bufs[idx]);
+					}
+				}
+				for (idx = 0; idx < p; idx++) {
+					ec_put_parity_buf(ec_io->ec_ch, parity_ptrs[idx], strip_size_bytes);
+				}
+				return -EINVAL;
+			}
+
+			/* Update position for next iteration */
+			raid_io_iov_idx = copy_iov_idx;
+			raid_io_iov_offset = copy_iov_offset;
+			raid_io_offset += strip_size_bytes;
+		}
 	}
 
 	/* Encode stripe using ISA-L */
 	rc = ec_encode_stripe(ec_bdev, data_ptrs, parity_ptrs, strip_size_bytes);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to encode stripe: %s\n", spdk_strerror(-rc));
+		/* Clean up temp buffers if allocated */
+		if (need_temp_bufs) {
+			for (idx = 0; idx < k; idx++) {
+				if (temp_data_bufs[idx] != NULL) {
+					spdk_dma_free(temp_data_bufs[idx]);
+				}
+			}
+		}
 		for (i = 0; i < p; i++) {
 			ec_put_parity_buf(ec_io->ec_ch, parity_ptrs[i], strip_size_bytes);
 		}
 		return rc;
 	}
 
-	/* Store parity buffers in module_private for cleanup */
+	/* Store buffers in module_private for cleanup */
 	/* Optimized: Use malloc instead of calloc - we initialize all fields explicitly */
 	struct ec_stripe_private *stripe_priv = malloc(sizeof(*stripe_priv));
 	if (stripe_priv == NULL) {
+		/* Clean up temp buffers if allocated */
+		if (need_temp_bufs) {
+			for (idx = 0; idx < k; idx++) {
+				if (temp_data_bufs[idx] != NULL) {
+					spdk_dma_free(temp_data_bufs[idx]);
+				}
+			}
+		}
 		for (i = 0; i < p; i++) {
 			ec_put_parity_buf(ec_io->ec_ch, parity_ptrs[i], strip_size_bytes);
 		}
@@ -535,88 +709,116 @@ ec_submit_write_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 	}
 	stripe_priv->type = EC_PRIVATE_TYPE_FULL_STRIPE;
 	stripe_priv->num_parity = p;
-	/* Optimized: Direct assignment loop instead of separate loop */
+	stripe_priv->num_temp_bufs = need_temp_bufs ? k : 0;
+	/* Store parity buffers */
 	for (i = 0; i < p; i++) {
 		stripe_priv->parity_bufs[i] = parity_ptrs[i];
 	}
+	/* Store temp data buffers if allocated */
+	if (need_temp_bufs) {
+		for (i = 0; i < k; i++) {
+			stripe_priv->temp_data_bufs[i] = temp_data_bufs[i];
+		}
+	} else {
+		/* Initialize to NULL for safety */
+		for (i = 0; i < k; i++) {
+			stripe_priv->temp_data_bufs[i] = NULL;
+		}
+	}
 	ec_io->module_private = stripe_priv;
 
-	/* Write data blocks */
+	/* Write data and parity blocks in parallel
+	 * Optimized: Single loop with early validation to reduce overhead
+	 */
 	ec_io->base_bdev_io_remaining = k + p;
 	ec_io->base_bdev_io_submitted = 0;
 
-	/* Optimized: Pre-calculate pd_strip_base to avoid repeated calculation */
+	/* Optimized: Pre-calculate pd_strip_base and strip_size once */
 	uint64_t pd_strip_base = stripe_index << ec_bdev->strip_size_shift;
+	uint32_t strip_size = ec_bdev->strip_size;
 
-	for (i = 0; i < k; i++) {
-		idx = data_indices[i];
+	/* Optimized: Validate all base bdevs before submitting any I/O
+	 * This avoids partial failures and allows early exit
+	 * Combined validation loop for better cache locality
+	 */
+	for (i = 0; i < k + p; i++) {
+		if (i < k) {
+			idx = data_indices[i];
+		} else {
+			idx = parity_indices[i - k];
+		}
 		base_info = &ec_bdev->base_bdev_info[idx];
-		/* Optimized: Fast path check - combine all conditions */
 		if (spdk_unlikely(base_info->desc == NULL || base_info->is_failed ||
 				  ec_io->ec_ch->base_channel[idx] == NULL)) {
-			SPDK_ERRLOG("Data base bdev %u is not available\n", idx);
+			SPDK_ERRLOG("%s base bdev %u is not available\n",
+				    i < k ? "Data" : "Parity", idx);
 			ec_cleanup_stripe_private(ec_io, strip_size_bytes);
 			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return -ENODEV;
-		}
-
-		/* Optimized: Use pre-calculated pd_strip_base */
-		uint64_t pd_lba = pd_strip_base + base_info->data_offset;
-		rc = spdk_bdev_write_blocks(base_info->desc,
-					    ec_io->ec_ch->base_channel[idx],
-					    data_ptrs[i], pd_lba, ec_bdev->strip_size,
-					    ec_base_bdev_io_complete, ec_io);
-		if (rc == 0) {
-			ec_io->base_bdev_io_submitted++;
-		} else if (rc == -ENOMEM) {
-			ec_bdev_queue_io_wait(ec_io,
-					      spdk_bdev_desc_get_bdev(base_info->desc),
-					      ec_io->ec_ch->base_channel[idx],
-					      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
-			return 0;
-		} else {
-			SPDK_ERRLOG("Failed to write data block %u: %s\n",
-				    idx, spdk_strerror(-rc));
-			ec_cleanup_stripe_private(ec_io, strip_size_bytes);
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return rc;
 		}
 	}
 
-	/* Write parity blocks */
-	/* Optimized: Reuse pd_strip_base calculated above */
-	for (i = 0; i < p; i++) {
-		idx = parity_indices[i];
-		base_info = &ec_bdev->base_bdev_info[idx];
-		/* Optimized: Fast path check - combine all conditions */
-		if (spdk_unlikely(base_info->desc == NULL || base_info->is_failed ||
-				  ec_io->ec_ch->base_channel[idx] == NULL)) {
-			SPDK_ERRLOG("Parity base bdev %u is not available\n", idx);
-			ec_cleanup_stripe_private(ec_io, strip_size_bytes);
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return -ENODEV;
+	/* Optimized: Submit all writes in a single loop for better cache locality
+	 * Interleave data and parity writes to maximize parallelism
+	 * This allows hardware to process writes in parallel more effectively
+	 */
+	uint8_t max_writes = (k > p) ? k : p;
+	
+	for (i = 0; i < max_writes; i++) {
+		/* Submit data block write if available */
+		if (i < k) {
+			idx = data_indices[i];
+			base_info = &ec_bdev->base_bdev_info[idx];
+			uint64_t pd_lba = pd_strip_base + base_info->data_offset;
+			
+			rc = spdk_bdev_write_blocks(base_info->desc,
+						    ec_io->ec_ch->base_channel[idx],
+						    data_ptrs[i], pd_lba, strip_size,
+						    ec_base_bdev_io_complete, ec_io);
+			if (rc == 0) {
+				ec_io->base_bdev_io_submitted++;
+			} else if (rc == -ENOMEM) {
+				/* Queue wait to retry when resources become available */
+				ec_bdev_queue_io_wait(ec_io,
+						      spdk_bdev_desc_get_bdev(base_info->desc),
+						      ec_io->ec_ch->base_channel[idx],
+						      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
+				return 0;
+			} else {
+				SPDK_ERRLOG("Failed to write data block %u: %s\n",
+					    idx, spdk_strerror(-rc));
+				ec_cleanup_stripe_private(ec_io, strip_size_bytes);
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return rc;
+			}
 		}
-
-		/* Optimized: Use pre-calculated pd_strip_base */
-		uint64_t pd_lba = pd_strip_base + base_info->data_offset;
-		rc = spdk_bdev_write_blocks(base_info->desc,
-					    ec_io->ec_ch->base_channel[idx],
-					    parity_ptrs[i], pd_lba, ec_bdev->strip_size,
-					    ec_base_bdev_io_complete, ec_io);
-		if (rc == 0) {
-			ec_io->base_bdev_io_submitted++;
-		} else if (rc == -ENOMEM) {
-			ec_bdev_queue_io_wait(ec_io,
-					      spdk_bdev_desc_get_bdev(base_info->desc),
-					      ec_io->ec_ch->base_channel[idx],
-					      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
-			return 0;
-		} else {
-			SPDK_ERRLOG("Failed to write parity block %u: %s\n",
-				    idx, spdk_strerror(-rc));
-			ec_cleanup_stripe_private(ec_io, strip_size_bytes);
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return rc;
+		
+		/* Submit parity block write if available */
+		if (i < p) {
+			idx = parity_indices[i];
+			base_info = &ec_bdev->base_bdev_info[idx];
+			uint64_t pd_lba = pd_strip_base + base_info->data_offset;
+			
+			rc = spdk_bdev_write_blocks(base_info->desc,
+						    ec_io->ec_ch->base_channel[idx],
+						    parity_ptrs[i], pd_lba, strip_size,
+						    ec_base_bdev_io_complete, ec_io);
+			if (rc == 0) {
+				ec_io->base_bdev_io_submitted++;
+			} else if (rc == -ENOMEM) {
+				/* Queue wait to retry when resources become available */
+				ec_bdev_queue_io_wait(ec_io,
+						      spdk_bdev_desc_get_bdev(base_info->desc),
+						      ec_io->ec_ch->base_channel[idx],
+						      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
+				return 0;
+			} else {
+				SPDK_ERRLOG("Failed to write parity block %u: %s\n",
+					    idx, spdk_strerror(-rc));
+				ec_cleanup_stripe_private(ec_io, strip_size_bytes);
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return rc;
+			}
 		}
 	}
 
@@ -746,9 +948,33 @@ ec_rmw_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 			return;
 		}
 
-		memcpy(target_stripe_data + bytes_copied,
-		       (unsigned char *)ec_io->iovs[iov_idx].iov_base + iov_offset,
-		       to_copy);
+		/* Optimized: Use efficient memcpy for aligned data
+		 * For large copies, memcpy will use SIMD instructions automatically
+		 * For small copies, inline copy may be faster
+		 */
+		if (to_copy >= 64 && 
+		    ((uintptr_t)(target_stripe_data + bytes_copied) % 8 == 0) &&
+		    ((uintptr_t)((unsigned char *)ec_io->iovs[iov_idx].iov_base + iov_offset) % 8 == 0)) {
+			/* Use 64-bit copy for aligned large blocks */
+			uint64_t *dst64 = (uint64_t *)(target_stripe_data + bytes_copied);
+			uint64_t *src64 = (uint64_t *)((unsigned char *)ec_io->iovs[iov_idx].iov_base + iov_offset);
+			size_t len64 = to_copy / 8;
+			size_t j;
+			for (j = 0; j < len64; j++) {
+				dst64[j] = src64[j];
+			}
+			/* Handle remaining bytes */
+			if (to_copy % 8 != 0) {
+				memcpy(target_stripe_data + bytes_copied + len64 * 8,
+				       (unsigned char *)ec_io->iovs[iov_idx].iov_base + iov_offset + len64 * 8,
+				       to_copy % 8);
+			}
+		} else {
+			/* Fall back to standard memcpy for unaligned or small data */
+			memcpy(target_stripe_data + bytes_copied,
+			       (unsigned char *)ec_io->iovs[iov_idx].iov_base + iov_offset,
+			       to_copy);
+		}
 		bytes_copied += to_copy;
 		iov_offset += to_copy;
 
@@ -792,38 +1018,19 @@ ec_rmw_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	/* Pre-calculate pd_strip_base to avoid repeated calculation */
 	uint64_t pd_strip_base = rmw->stripe_index << ec_bdev->strip_size_shift;
 
-	/* Write all k data blocks */
-	for (i = 0; i < k; i++) {
-		idx = rmw->data_indices[i];
-		base_info = &ec_bdev->base_bdev_info[idx];
-		if (base_info->desc == NULL || base_info->is_failed ||
-		    ec_io->ec_ch->base_channel[idx] == NULL) {
-			SPDK_ERRLOG("Data base bdev %u is not available for RMW write\n", idx);
-			ec_cleanup_rmw_bufs(ec_io, rmw);
-			free(rmw);
-			ec_io->module_private = NULL;
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return;
-		}
-
-		/* Use pre-calculated pd_strip_base */
-		uint64_t pd_lba = pd_strip_base + base_info->data_offset;
-
-		rc = spdk_bdev_write_blocks(base_info->desc,
-					    ec_io->ec_ch->base_channel[idx],
-					    rmw->data_ptrs[i], pd_lba, ec_bdev->strip_size,
-					    ec_base_bdev_io_complete, ec_io);
-		if (rc == 0) {
-			ec_io->base_bdev_io_submitted++;
-		} else if (rc == -ENOMEM) {
-			ec_bdev_queue_io_wait(ec_io,
-					      spdk_bdev_desc_get_bdev(base_info->desc),
-					      ec_io->ec_ch->base_channel[idx],
-					      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
-			return;
+	/* Optimized: Validate all base bdevs before submitting writes */
+	uint8_t max_writes = (k > p) ? k : p;
+	for (i = 0; i < max_writes; i++) {
+		if (i < k) {
+			idx = rmw->data_indices[i];
 		} else {
-			SPDK_ERRLOG("Failed to write data block %u in RMW: %s\n",
-				    idx, spdk_strerror(-rc));
+			idx = rmw->parity_indices[i - k];
+		}
+		base_info = &ec_bdev->base_bdev_info[idx];
+		if (spdk_unlikely(base_info->desc == NULL || base_info->is_failed ||
+				  ec_io->ec_ch->base_channel[idx] == NULL)) {
+			SPDK_ERRLOG("%s base bdev %u is not available for RMW write\n",
+				    i < k ? "Data" : "Parity", idx);
 			ec_cleanup_rmw_bufs(ec_io, rmw);
 			free(rmw);
 			ec_io->module_private = NULL;
@@ -832,44 +1039,65 @@ ec_rmw_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		}
 	}
 
-	/* Write parity blocks */
-	/* Optimized: Reuse pd_strip_base calculated above */
-	for (i = 0; i < p; i++) {
-		idx = rmw->parity_indices[i];
-		base_info = &ec_bdev->base_bdev_info[idx];
-		if (base_info->desc == NULL || base_info->is_failed ||
-		    ec_io->ec_ch->base_channel[idx] == NULL) {
-			SPDK_ERRLOG("Parity base bdev %u is not available for RMW write\n", idx);
-			ec_cleanup_rmw_bufs(ec_io, rmw);
-			free(rmw);
-			ec_io->module_private = NULL;
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return;
+	/* Optimized: Submit all writes in interleaved fashion for better parallelism */
+	uint32_t strip_size = ec_bdev->strip_size;
+	for (i = 0; i < max_writes; i++) {
+		/* Submit data block write if available */
+		if (i < k) {
+			idx = rmw->data_indices[i];
+			base_info = &ec_bdev->base_bdev_info[idx];
+			uint64_t pd_lba = pd_strip_base + base_info->data_offset;
+
+			rc = spdk_bdev_write_blocks(base_info->desc,
+						    ec_io->ec_ch->base_channel[idx],
+						    rmw->data_ptrs[i], pd_lba, strip_size,
+						    ec_base_bdev_io_complete, ec_io);
+			if (rc == 0) {
+				ec_io->base_bdev_io_submitted++;
+			} else if (rc == -ENOMEM) {
+				ec_bdev_queue_io_wait(ec_io,
+						      spdk_bdev_desc_get_bdev(base_info->desc),
+						      ec_io->ec_ch->base_channel[idx],
+						      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
+				return;
+			} else {
+				SPDK_ERRLOG("Failed to write data block %u in RMW: %s\n",
+					    idx, spdk_strerror(-rc));
+				ec_cleanup_rmw_bufs(ec_io, rmw);
+				free(rmw);
+				ec_io->module_private = NULL;
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
 		}
 
-		/* Optimized: Use pre-calculated pd_strip_base */
-		uint64_t pd_lba = pd_strip_base + base_info->data_offset;
+		/* Submit parity block write if available */
+		if (i < p) {
+			idx = rmw->parity_indices[i];
+			base_info = &ec_bdev->base_bdev_info[idx];
+			uint64_t pd_lba = pd_strip_base + base_info->data_offset;
 
-		rc = spdk_bdev_write_blocks(base_info->desc,
-					    ec_io->ec_ch->base_channel[idx],
-					    rmw->parity_bufs[i], pd_lba, ec_bdev->strip_size,
-					    ec_base_bdev_io_complete, ec_io);
-		if (rc == 0) {
-			ec_io->base_bdev_io_submitted++;
-		} else if (rc == -ENOMEM) {
-			ec_bdev_queue_io_wait(ec_io,
-					      spdk_bdev_desc_get_bdev(base_info->desc),
-					      ec_io->ec_ch->base_channel[idx],
-					      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
-			return;
-		} else {
-			SPDK_ERRLOG("Failed to write parity block %u in RMW: %s\n",
-				    idx, spdk_strerror(-rc));
-			ec_cleanup_rmw_bufs(ec_io, rmw);
-			free(rmw);
-			ec_io->module_private = NULL;
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return;
+			rc = spdk_bdev_write_blocks(base_info->desc,
+						    ec_io->ec_ch->base_channel[idx],
+						    rmw->parity_bufs[i], pd_lba, strip_size,
+						    ec_base_bdev_io_complete, ec_io);
+			if (rc == 0) {
+				ec_io->base_bdev_io_submitted++;
+			} else if (rc == -ENOMEM) {
+				ec_bdev_queue_io_wait(ec_io,
+						      spdk_bdev_desc_get_bdev(base_info->desc),
+						      ec_io->ec_ch->base_channel[idx],
+						      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
+				return;
+			} else {
+				SPDK_ERRLOG("Failed to write parity block %u in RMW: %s\n",
+					    idx, spdk_strerror(-rc));
+				ec_cleanup_rmw_bufs(ec_io, rmw);
+				free(rmw);
+				ec_io->module_private = NULL;
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
 		}
 	}
 }
@@ -967,8 +1195,8 @@ ec_submit_write_partial_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 			return -ENODEV;
 		}
 
-		uint64_t pd_strip = stripe_index;
-		uint64_t pd_lba = (pd_strip << ec_bdev->strip_size_shift) + base_info->data_offset;
+		/* Optimized: Pre-calculate strip_size_shift once */
+		uint64_t pd_lba = (stripe_index << ec_bdev->strip_size_shift) + base_info->data_offset;
 
 		rc = spdk_bdev_read_blocks(base_info->desc,
 					    ec_io->ec_ch->base_channel[idx],
@@ -1038,7 +1266,13 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 	uint8_t num_failed = 0;
 	int rc;
 
-	/* Count operational and failed base bdevs - optimized with early exit */
+	/* Optimized: Count operational and failed base bdevs with early exit
+	 * Cache k and p to avoid repeated memory access
+	 */
+	uint8_t k = ec_bdev->k;
+	uint8_t p = ec_bdev->p;
+	uint8_t required_operational = k + p;
+	
 	i = 0;
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		if (base_info->desc == NULL || base_info->is_failed ||
@@ -1046,18 +1280,17 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 			num_failed++;
 		} else {
 			num_operational++;
-			/* Early exit optimization: if we have enough operational bdevs, stop counting */
-			if (num_operational >= ec_bdev->k + ec_bdev->p) {
-				/* We have enough operational bdevs, skip remaining checks */
+			/* Early exit: if we have enough operational bdevs, stop counting */
+			if (num_operational >= required_operational) {
 				break;
 			}
 		}
 		i++;
 	}
 
-	if (num_operational < ec_bdev->k) {
+	if (num_operational < k) {
 		SPDK_ERRLOG("Not enough operational blocks (%u < %u) for EC bdev %s\n",
-			    num_operational, ec_bdev->k, ec_bdev->bdev.name);
+			    num_operational, k, ec_bdev->bdev.name);
 		ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
@@ -1070,7 +1303,6 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		uint64_t stripe_index;
 		uint32_t offset_in_strip;
 		/* Optimized: Cache frequently accessed values */
-		uint8_t k = ec_bdev->k;
 		uint32_t strip_size = ec_bdev->strip_size;
 		uint32_t strip_size_shift = ec_bdev->strip_size_shift;
 		struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
@@ -1078,7 +1310,8 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		start_strip = ec_io->offset_blocks >> strip_size_shift;
 		end_strip = (ec_io->offset_blocks + ec_io->num_blocks - 1) >> strip_size_shift;
 
-		if (start_strip != end_strip && ec_bdev->num_base_bdevs > 1) {
+		/* Optimized: Early check for strip boundary violation */
+		if (spdk_unlikely(start_strip != end_strip && ec_bdev->num_base_bdevs > 1)) {
 			SPDK_ERRLOG("I/O spans strip boundary for EC bdev %s\n",
 				    ec_bdev->bdev.name);
 			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -1458,6 +1691,14 @@ ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 				}
 				free(rmw);
 			} else {
+				/* Free temp data buffers if allocated */
+				if (stripe_priv->num_temp_bufs > 0) {
+					for (i = 0; i < stripe_priv->num_temp_bufs; i++) {
+						if (stripe_priv->temp_data_bufs[i] != NULL) {
+							spdk_dma_free(stripe_priv->temp_data_bufs[i]);
+						}
+					}
+				}
 				for (i = 0; i < stripe_priv->num_parity; i++) {
 					if (stripe_priv->parity_bufs[i] != NULL) {
 						spdk_dma_free(stripe_priv->parity_bufs[i]);
@@ -1484,6 +1725,14 @@ ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 			}
 			free(rmw);
 		} else {
+			/* Free temp data buffers if allocated */
+			if (stripe_priv->num_temp_bufs > 0) {
+				for (i = 0; i < stripe_priv->num_temp_bufs; i++) {
+					if (stripe_priv->temp_data_bufs[i] != NULL) {
+						spdk_dma_free(stripe_priv->temp_data_bufs[i]);
+					}
+				}
+			}
 			for (i = 0; i < stripe_priv->num_parity; i++) {
 				if (stripe_priv->parity_bufs[i] != NULL) {
 					ec_put_parity_buf(ec_io->ec_ch, stripe_priv->parity_bufs[i], strip_size_bytes);

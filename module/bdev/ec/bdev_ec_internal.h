@@ -19,6 +19,9 @@ struct ec_stripe_private {
 	enum ec_private_type type;
 	unsigned char *parity_bufs[EC_MAX_P];
 	uint8_t num_parity;
+	/* Temporary buffers for cross-iov data (only used when need_temp_bufs is true) */
+	unsigned char *temp_data_bufs[EC_MAX_K];
+	uint8_t num_temp_bufs;  /* Number of temp buffers allocated (0 if not needed) */
 };
 
 /* RMW state enumeration */

@@ -1113,6 +1113,13 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
 	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", raid_bdev->num_base_bdevs_discovered);
 	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
 				     raid_bdev->num_base_bdevs_operational);
+	/* 输出总大小（块），单位与base_bdev的data_size一致
+	 * 只有在online状态或blockcnt已设置时才输出
+	 */
+	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE || raid_bdev->bdev.blockcnt > 0) {
+		spdk_json_write_named_uint64(w, "total_size_blocks", raid_bdev->bdev.blockcnt);
+		spdk_json_write_named_uint32(w, "blocklen", raid_bdev->bdev.blocklen);
+	}
 	if (raid_bdev->process) {
 		struct raid_bdev_process *process = raid_bdev->process;
 		uint64_t offset = process->window_offset;
