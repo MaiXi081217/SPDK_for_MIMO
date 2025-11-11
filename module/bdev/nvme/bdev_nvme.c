@@ -6498,6 +6498,155 @@ bdev_nvme_set_hotplug(bool enabled, uint64_t period_us, spdk_msg_fn cb, void *cb
 	return 0;
 }
 
+/* Context for getting wear level information */
+struct wear_level_ctx {
+	struct nvme_ctrlr *nvme_ctrlr;
+	struct nvme_ns *nvme_ns;
+	struct spdk_nvme_health_information_page *health_page;
+	int pending_count;
+	int completed_count;
+};
+
+/* Health log page completion callback */
+static void
+get_wear_level_health_log_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct wear_level_ctx *wear_ctx = (struct wear_level_ctx *)cb_arg;
+	struct nvme_ctrlr *nvme_ctrlr = wear_ctx->nvme_ctrlr;
+	struct nvme_ns *nvme_ns = wear_ctx->nvme_ns;
+	struct spdk_nvme_health_information_page *health_page = wear_ctx->health_page;
+	const struct spdk_nvme_ctrlr_data *cdata;
+	char buf[128];
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		NVME_CTRLR_WARNLOG(nvme_ctrlr, "Failed to get health log page for NSID %u: %s\n",
+				   nvme_ns ? nvme_ns->id : 0,
+				   spdk_nvme_cpl_get_status_string(&cpl->status));
+		goto done;
+	}
+
+	cdata = spdk_nvme_ctrlr_get_data(nvme_ctrlr->ctrlr);
+	snprintf(buf, sizeof(cdata->mn) + 1, "%s", cdata->mn);
+	spdk_str_trim(buf);
+
+	/* Check if temperature is valid (NVMe spec: 0xFFFF = invalid) */
+	int temp_celsius = -1;
+	if (health_page->temperature != 0xFFFF && health_page->temperature < 1000) {
+		temp_celsius = (int)health_page->temperature - 273;
+	}
+
+	/* Output wear level info for controller and all namespaces */
+	NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+			     "=== Wear Level Information ===\n");
+	if (temp_celsius >= 0) {
+		NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+				     "Controller: %s, Model: %s, "
+				     "Percentage Used: %u%%, Available Spare: %u%%, Temperature: %d°C\n",
+				     nvme_ctrlr->nbdev_ctrlr->name,
+				     buf,
+				     health_page->percentage_used,
+				     health_page->available_spare,
+				     temp_celsius);
+	} else {
+		NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+				     "Controller: %s, Model: %s, "
+				     "Percentage Used: %u%%, Available Spare: %u%%, Temperature: N/A\n",
+				     nvme_ctrlr->nbdev_ctrlr->name,
+				     buf,
+				     health_page->percentage_used,
+				     health_page->available_spare);
+	}
+
+	/* Output info for each namespace */
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	nvme_ns = nvme_ctrlr_get_first_active_ns(nvme_ctrlr);
+	while (nvme_ns != NULL) {
+		if (nvme_ns->bdev) {
+			NVME_CTRLR_NOTICELOG(nvme_ctrlr,
+					     "  NSID: %u, Bdev: %s, "
+					     "Percentage Used: %u%%, Available Spare: %u%%\n",
+					     nvme_ns->id,
+					     nvme_ns->bdev->disk.name,
+					     health_page->percentage_used,
+					     health_page->available_spare);
+		}
+		nvme_ns = nvme_ctrlr_get_next_active_ns(nvme_ctrlr, nvme_ns);
+	}
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+
+done:
+	spdk_free(health_page);
+	wear_ctx->completed_count++;
+	if (wear_ctx->completed_count >= wear_ctx->pending_count) {
+		free(wear_ctx);
+	}
+}
+
+/* Get wear level for all namespaces */
+static void
+get_all_wear_levels(struct nvme_ctrlr *nvme_ctrlr)
+{
+	struct spdk_nvme_ctrlr *ctrlr = nvme_ctrlr->ctrlr;
+	struct nvme_ns *nvme_ns;
+	struct spdk_nvme_health_information_page *health_page;
+	struct wear_level_ctx *wear_ctx;
+	int rc;
+	int ns_count = 0;
+
+	/* Count active namespaces */
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	nvme_ns = nvme_ctrlr_get_first_active_ns(nvme_ctrlr);
+	while (nvme_ns != NULL) {
+		ns_count++;
+		nvme_ns = nvme_ctrlr_get_next_active_ns(nvme_ctrlr, nvme_ns);
+	}
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+
+	if (ns_count == 0) {
+		return;
+	}
+
+	/* Allocate context */
+	wear_ctx = calloc(1, sizeof(*wear_ctx));
+	if (wear_ctx == NULL) {
+		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Failed to allocate wear level context\n");
+		return;
+	}
+
+	wear_ctx->nvme_ctrlr = nvme_ctrlr;
+	wear_ctx->pending_count = 1; /* Only one log page request */
+	wear_ctx->completed_count = 0;
+
+	/* Get health log page for controller (one log page for all namespaces) */
+	health_page = spdk_zmalloc(sizeof(*health_page), 0, NULL,
+				   SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (health_page == NULL) {
+		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Failed to allocate health page buffer\n");
+		free(wear_ctx);
+		return;
+	}
+
+	wear_ctx->health_page = health_page;
+	wear_ctx->nvme_ns = NULL; /* Controller-level health info */
+
+	/* Get health log page (global namespace tag for controller-level health) */
+	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr,
+					       SPDK_NVME_LOG_HEALTH_INFORMATION,
+					       SPDK_NVME_GLOBAL_NS_TAG,
+					       health_page,
+					       sizeof(*health_page),
+					       0,
+					       get_wear_level_health_log_cb,
+					       wear_ctx);
+	if (rc != 0) {
+		NVME_CTRLR_WARNLOG(nvme_ctrlr, "Failed to send get log page command: %s\n",
+				   spdk_strerror(-rc));
+		spdk_free(health_page);
+		free(wear_ctx);
+	}
+}
+
+
 static void
 nvme_ctrlr_populate_namespaces_done(struct nvme_ctrlr *nvme_ctrlr,
 				    struct nvme_async_probe_ctx *ctx)
@@ -6546,6 +6695,10 @@ nvme_ctrlr_populate_namespaces_done(struct nvme_ctrlr *nvme_ctrlr,
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
 	ctx->reported_bdevs = j;
+
+	/* Get wear level information for all namespaces */
+	get_all_wear_levels(nvme_ctrlr);
+
 	populate_namespaces_cb(ctx, 0);
 }
 
