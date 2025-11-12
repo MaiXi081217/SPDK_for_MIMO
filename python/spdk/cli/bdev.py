@@ -1656,3 +1656,14 @@ def add_parser(subparsers):
     p = subparsers.add_parser('bdev_ec_remove_base_bdev', help='Remove base bdev from existing EC bdev')
     p.add_argument('name', help='base bdev name')
     p.set_defaults(func=bdev_ec_remove_base_bdev)
+
+    def bdev_wipe_superblock(args):
+        if args.size > 0:
+            args.client.bdev_wipe_superblock(name=args.name, size=args.size)
+        else:
+            args.client.bdev_wipe_superblock(name=args.name)
+    
+    p = subparsers.add_parser('bdev_wipe_superblock', help='Wipe superblock area (first N bytes) of a bdev')
+    p.add_argument('-b', '--name', help='Name of the bdev', required=True)
+    p.add_argument('-s', '--size', help='Size in bytes to wipe (default: 1MB)', type=int, default=0)
+    p.set_defaults(func=bdev_wipe_superblock)

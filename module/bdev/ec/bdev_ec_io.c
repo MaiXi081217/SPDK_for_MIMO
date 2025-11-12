@@ -16,12 +16,19 @@
 /* Forward declaration for RMW read complete callback */
 static void ec_rmw_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 
+/* Forward declaration for decode read complete callback */
+static void ec_decode_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
+
 /* Forward declaration for write functions */
 static int ec_submit_write_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 				  uint8_t *data_indices, uint8_t *parity_indices);
 static int ec_submit_write_partial_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 					  uint64_t start_strip, uint32_t offset_in_strip,
 					  uint8_t *data_indices, uint8_t *parity_indices);
+
+/* Forward declaration for decode read function */
+static int ec_submit_decode_read(struct ec_bdev_io *ec_io, uint64_t stripe_index,
+				 uint32_t strip_idx_in_stripe, uint32_t offset_in_strip);
 
 /*
  * Get parity buffer from pool or allocate new one
@@ -119,7 +126,7 @@ ec_put_parity_buf(struct ec_bdev_io_channel *ec_ch, unsigned char *buf, uint32_t
 /*
  * Get RMW stripe buffer from pool or allocate new one
  */
-static unsigned char *
+unsigned char *
 ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size)
 {
 	struct ec_parity_buf_entry *entry;
@@ -178,7 +185,7 @@ ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev,
 /*
  * Return RMW stripe buffer to pool or free it
  */
-static void
+void
 ec_put_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, unsigned char *buf, uint32_t buf_size)
 {
 	struct ec_parity_buf_entry *entry;
@@ -381,56 +388,6 @@ ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
  * returns:
  * 0 on success, non-zero on failure
  */
-/* Forward declaration - this function is used for decode path (not yet implemented) */
-static int __attribute__((unused))
-ec_map_base_bdev_to_frag_indices(struct ec_bdev *ec_bdev, uint64_t stripe_index,
-				 uint8_t *base_bdev_indices, uint8_t *frag_indices,
-				 uint8_t num_failed)
-{
-	uint8_t data_indices[EC_MAX_K];
-	uint8_t parity_indices[EC_MAX_P];
-	uint8_t i, j;
-	int rc;
-
-	/* Get data and parity indices for this stripe */
-	rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
-	if (rc != 0) {
-		return rc;
-	}
-
-	/* Map each failed base_bdev index to its logical fragment index
-	 * Optimize: build lookup table for O(1) lookup instead of O(k+p) search
-	 * Note: base_bdev indices are uint8_t (max 255), and array size is 510,
-	 * so no explicit bounds check needed for uint8_t values
-	 */
-	uint8_t base_to_frag_map[EC_MAX_K + EC_MAX_P];
-	memset(base_to_frag_map, 0xFF, sizeof(base_to_frag_map));  /* 0xFF = invalid */
-	
-	/* Build lookup table: map base_bdev index -> fragment index */
-	for (j = 0; j < ec_bdev->k; j++) {
-		/* data_indices[j] is uint8_t (max 255), always < array size (510) */
-		base_to_frag_map[data_indices[j]] = j;  /* Data fragment: 0 to k-1 */
-	}
-	for (j = 0; j < ec_bdev->p; j++) {
-		/* parity_indices[j] is uint8_t (max 255), always < array size (510) */
-		base_to_frag_map[parity_indices[j]] = ec_bdev->k + j;  /* Parity fragment: k to m-1 */
-	}
-
-	/* Map failed base bdevs using lookup table */
-	for (i = 0; i < num_failed; i++) {
-		uint8_t base_idx = base_bdev_indices[i];
-		/* base_idx is uint8_t (max 255), always < array size (510), so safe to index */
-		uint8_t frag_idx = base_to_frag_map[base_idx];
-		if (frag_idx == 0xFF) {
-			/* Base bdev index not found in data or parity indices */
-			return -EINVAL;
-		}
-		frag_indices[i] = frag_idx;
-	}
-
-	return 0;
-}
-
 /*
  * Full stripe write - optimal path
  */
@@ -834,8 +791,14 @@ ec_rmw_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	struct ec_bdev_io *ec_io = cb_arg;
 	struct ec_rmw_private *rmw;
 	struct ec_bdev *ec_bdev;
+	struct spdk_bdev *failed_bdev = NULL;
 	uint8_t i;
 	int rc;
+
+	/* Save bdev pointer before freeing I/O */
+	if (bdev_io != NULL) {
+		failed_bdev = bdev_io->bdev;
+	}
 
 	spdk_bdev_free_io(bdev_io);
 
@@ -855,6 +818,23 @@ ec_rmw_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	if (!success) {
 		SPDK_ERRLOG("RMW read failed for EC bdev %s\n", ec_bdev->bdev.name);
+		/* Find the base_info for this failed read and mark it as failed */
+		if (failed_bdev != NULL) {
+			struct ec_base_bdev_info *failed_base_info = NULL;
+			EC_FOR_EACH_BASE_BDEV(ec_bdev, failed_base_info) {
+				if (failed_base_info->desc != NULL &&
+				    spdk_bdev_desc_get_bdev(failed_base_info->desc) == failed_bdev) {
+					if (!failed_base_info->is_failed) {
+						SPDK_WARNLOG("RMW read failed on base bdev '%s' (slot %u) of EC bdev '%s', marking as failed\n",
+							     failed_base_info->name ? failed_base_info->name : "unknown",
+							     (uint8_t)(failed_base_info - ec_bdev->base_bdev_info),
+							     ec_bdev->bdev.name);
+						ec_bdev_fail_base_bdev(failed_base_info);
+					}
+					break;
+				}
+			}
+		}
 		ec_cleanup_rmw_bufs(ec_io, rmw);
 		free(rmw);
 		ec_io->module_private = NULL;
@@ -1254,6 +1234,434 @@ ec_submit_write_partial_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 }
 
 /*
+ * Clean up decode buffers
+ */
+static void
+ec_cleanup_decode_bufs(struct ec_bdev_io *ec_io, struct ec_decode_private *decode)
+{
+	struct ec_bdev *ec_bdev;
+	uint32_t strip_size_bytes;
+
+	if (decode == NULL || ec_io == NULL || ec_io->ec_ch == NULL) {
+		return;
+	}
+
+	ec_bdev = ec_io->ec_bdev;
+	if (ec_bdev == NULL) {
+		return;
+	}
+
+	strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+
+	if (decode->stripe_buf != NULL) {
+		ec_put_rmw_stripe_buf(ec_io->ec_ch, decode->stripe_buf,
+				      strip_size_bytes * (ec_bdev->k + ec_bdev->p));
+	}
+
+	if (decode->recover_buf != NULL) {
+		spdk_dma_free(decode->recover_buf);
+	}
+}
+
+/*
+ * Decode read complete callback
+ */
+static void
+ec_decode_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_bdev_io *ec_io = cb_arg;
+	struct ec_decode_private *decode;
+	struct ec_bdev *ec_bdev;
+	struct spdk_bdev *failed_bdev = NULL;
+	uint8_t i;
+	int rc;
+
+	/* Save bdev pointer before freeing I/O */
+	if (bdev_io != NULL) {
+		failed_bdev = bdev_io->bdev;
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (ec_io == NULL || ec_io->module_private == NULL) {
+		SPDK_ERRLOG("Invalid ec_io or module_private in decode read complete\n");
+		return;
+	}
+
+	decode = ec_io->module_private;
+	ec_bdev = ec_io->ec_bdev;
+
+	if (decode->type != EC_PRIVATE_TYPE_DECODE) {
+		SPDK_ERRLOG("Invalid decode context type\n");
+		ec_cleanup_decode_bufs(ec_io, decode);
+		free(decode);
+		ec_io->module_private = NULL;
+		ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (!success) {
+		SPDK_ERRLOG("Decode read failed for EC bdev %s\n", ec_bdev->bdev.name);
+		/* Find the base_info for this failed read and mark it as failed */
+		if (failed_bdev != NULL) {
+			struct ec_base_bdev_info *failed_base_info = NULL;
+			EC_FOR_EACH_BASE_BDEV(ec_bdev, failed_base_info) {
+				if (failed_base_info->desc != NULL &&
+				    spdk_bdev_desc_get_bdev(failed_base_info->desc) == failed_bdev) {
+					if (!failed_base_info->is_failed) {
+						SPDK_WARNLOG("Decode read failed on base bdev '%s' (slot %u) of EC bdev '%s', marking as failed\n",
+							     failed_base_info->name ? failed_base_info->name : "unknown",
+							     (uint8_t)(failed_base_info - ec_bdev->base_bdev_info),
+							     ec_bdev->bdev.name);
+						ec_bdev_fail_base_bdev(failed_base_info);
+					}
+					break;
+				}
+			}
+		}
+		ec_cleanup_decode_bufs(ec_io, decode);
+		free(decode);
+		ec_io->module_private = NULL;
+		ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	decode->reads_completed++;
+
+	/* Check if all reads completed */
+	if (decode->reads_completed >= decode->reads_expected) {
+		/* All reads completed - proceed with decoding */
+		decode->state = EC_DECODE_STATE_DECODING;
+
+		uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+		unsigned char *recover_ptrs[EC_MAX_P];
+
+		/* Find which failed fragment we need to recover */
+		uint8_t target_frag_idx = decode->strip_idx_in_stripe;
+		bool need_recover = false;
+		for (i = 0; i < decode->num_failed; i++) {
+			if (decode->failed_indices[i] == target_frag_idx) {
+				need_recover = true;
+				recover_ptrs[0] = decode->recover_buf;
+				break;
+			}
+		}
+
+		if (!need_recover) {
+			/* Target fragment is available, just copy from stripe buffer
+			 * Find which data pointer contains the target fragment */
+			uint8_t target_ptr_idx = 0xFF;
+			uint8_t k = ec_bdev->k;
+			for (i = 0; i < k; i++) {
+				uint8_t base_idx = decode->available_indices[i];
+				if (decode->frag_map[base_idx] == target_frag_idx) {
+					target_ptr_idx = i;
+					break;
+				}
+			}
+			if (target_ptr_idx == 0xFF) {
+				SPDK_ERRLOG("Failed to find target fragment in available blocks\n");
+				ec_cleanup_decode_bufs(ec_io, decode);
+				free(decode);
+				ec_io->module_private = NULL;
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
+
+			/* Copy data from stripe buffer to iovs */
+			uint32_t block_size = ec_bdev->bdev.blocklen;
+			uint32_t offset_bytes = decode->offset_in_strip * block_size;
+			uint32_t num_bytes = decode->num_blocks_to_read * block_size;
+			unsigned char *src = decode->data_ptrs[target_ptr_idx] + offset_bytes;
+
+			size_t bytes_copied = 0;
+			int iov_idx = 0;
+			size_t iov_offset = 0;
+
+			for (iov_idx = 0; iov_idx < ec_io->iovcnt && bytes_copied < num_bytes; iov_idx++) {
+				if (ec_io->iovs[iov_idx].iov_base == NULL) {
+					SPDK_ERRLOG("iov_base is NULL for iov index %d\n", iov_idx);
+					ec_cleanup_decode_bufs(ec_io, decode);
+					free(decode);
+					ec_io->module_private = NULL;
+					ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+					return;
+				}
+
+				size_t remaining_in_iov = ec_io->iovs[iov_idx].iov_len - iov_offset;
+				size_t remaining_to_copy = num_bytes - bytes_copied;
+				size_t to_copy = spdk_min(remaining_in_iov, remaining_to_copy);
+
+				memcpy((unsigned char *)ec_io->iovs[iov_idx].iov_base + iov_offset,
+				       src + bytes_copied, to_copy);
+				bytes_copied += to_copy;
+				iov_offset += to_copy;
+
+				if (iov_offset >= ec_io->iovs[iov_idx].iov_len) {
+					iov_offset = 0;
+				}
+			}
+
+			if (bytes_copied < num_bytes) {
+				SPDK_ERRLOG("Not enough space in iovs for decode copy\n");
+				ec_cleanup_decode_bufs(ec_io, decode);
+				free(decode);
+				ec_io->module_private = NULL;
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
+
+			/* Success - clean up and complete */
+			ec_cleanup_decode_bufs(ec_io, decode);
+			free(decode);
+			ec_io->module_private = NULL;
+			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+			return;
+		}
+
+		/* Need to decode - prepare recovery pointers */
+		recover_ptrs[0] = decode->recover_buf;
+
+		/* Decode the failed fragment */
+		rc = ec_decode_stripe(ec_bdev, decode->data_ptrs, recover_ptrs,
+				      decode->failed_indices, decode->num_failed, strip_size_bytes);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to decode stripe: %s\n", spdk_strerror(-rc));
+			ec_cleanup_decode_bufs(ec_io, decode);
+			free(decode);
+			ec_io->module_private = NULL;
+			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		/* Copy recovered data to iovs */
+		decode->state = EC_DECODE_STATE_COPYING;
+		uint32_t block_size = ec_bdev->bdev.blocklen;
+		uint32_t offset_bytes = decode->offset_in_strip * block_size;
+		uint32_t num_bytes = decode->num_blocks_to_read * block_size;
+		unsigned char *src = decode->recover_buf + offset_bytes;
+
+		size_t bytes_copied = 0;
+		int iov_idx = 0;
+		size_t iov_offset = 0;
+
+		for (iov_idx = 0; iov_idx < ec_io->iovcnt && bytes_copied < num_bytes; iov_idx++) {
+			if (ec_io->iovs[iov_idx].iov_base == NULL) {
+				SPDK_ERRLOG("iov_base is NULL for iov index %d\n", iov_idx);
+				ec_cleanup_decode_bufs(ec_io, decode);
+				free(decode);
+				ec_io->module_private = NULL;
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
+
+			size_t remaining_in_iov = ec_io->iovs[iov_idx].iov_len - iov_offset;
+			size_t remaining_to_copy = num_bytes - bytes_copied;
+			size_t to_copy = spdk_min(remaining_in_iov, remaining_to_copy);
+
+			memcpy((unsigned char *)ec_io->iovs[iov_idx].iov_base + iov_offset,
+			       src + bytes_copied, to_copy);
+			bytes_copied += to_copy;
+			iov_offset += to_copy;
+
+			if (iov_offset >= ec_io->iovs[iov_idx].iov_len) {
+				iov_offset = 0;
+			}
+		}
+
+		if (bytes_copied < num_bytes) {
+			SPDK_ERRLOG("Not enough space in iovs for decode copy\n");
+			ec_cleanup_decode_bufs(ec_io, decode);
+			free(decode);
+			ec_io->module_private = NULL;
+			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		/* Success - clean up and complete */
+		ec_cleanup_decode_bufs(ec_io, decode);
+		free(decode);
+		ec_io->module_private = NULL;
+		ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	} else {
+		/* Still waiting for more reads to complete */
+		return;
+	}
+}
+
+/*
+ * Submit decode read - read from k available blocks and decode to recover failed data
+ */
+static int
+ec_submit_decode_read(struct ec_bdev_io *ec_io, uint64_t stripe_index,
+		     uint32_t strip_idx_in_stripe, uint32_t offset_in_strip)
+{
+	struct ec_bdev *ec_bdev = ec_io->ec_bdev;
+	uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+	uint8_t k = ec_bdev->k;
+	uint8_t p = ec_bdev->p;
+	uint8_t m = k + p;
+	struct ec_decode_private *decode;
+	struct ec_base_bdev_info *base_info;
+	uint8_t data_indices[EC_MAX_K];
+	uint8_t parity_indices[EC_MAX_P];
+	uint8_t failed_base_indices[EC_MAX_P] __attribute__((unused));
+	uint8_t failed_frag_indices[EC_MAX_P];
+	uint8_t i, idx;
+	uint8_t num_failed = 0;
+	uint8_t num_available = 0;
+	int rc;
+
+	/* Get data and parity indices for this stripe */
+	rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to select base bdevs for decode\n");
+		return rc;
+	}
+
+	/* Allocate decode context first */
+	decode = malloc(sizeof(*decode));
+	if (decode == NULL) {
+		SPDK_ERRLOG("Failed to allocate decode context\n");
+		return -ENOMEM;
+	}
+
+	/* Find failed base bdevs and build fragment mapping */
+	uint8_t frag_map[EC_MAX_K + EC_MAX_P];
+	uint8_t available_indices[EC_MAX_K + EC_MAX_P];
+	memset(frag_map, 0xFF, sizeof(frag_map));
+	for (i = 0; i < k; i++) {
+		idx = data_indices[i];
+		frag_map[idx] = i;  /* Data fragment: 0 to k-1 */
+		base_info = &ec_bdev->base_bdev_info[idx];
+		if (base_info->desc == NULL || base_info->is_failed ||
+		    ec_io->ec_ch->base_channel[idx] == NULL) {
+			failed_base_indices[num_failed] = idx;
+			failed_frag_indices[num_failed] = i;
+			num_failed++;
+		} else {
+			available_indices[num_available++] = idx;
+		}
+	}
+	for (i = 0; i < p; i++) {
+		idx = parity_indices[i];
+		frag_map[idx] = k + i;  /* Parity fragment: k to m-1 */
+		base_info = &ec_bdev->base_bdev_info[idx];
+		if (base_info->desc == NULL || base_info->is_failed ||
+		    ec_io->ec_ch->base_channel[idx] == NULL) {
+			failed_base_indices[num_failed] = idx;
+			failed_frag_indices[num_failed] = k + i;
+			num_failed++;
+		} else {
+			available_indices[num_available++] = idx;
+		}
+	}
+
+	if (num_available < k) {
+		SPDK_ERRLOG("Not enough available blocks (%u < %u) for decode\n",
+			    num_available, k);
+		free(decode);
+		return -ENODEV;
+	}
+
+	if (num_failed == 0) {
+		SPDK_ERRLOG("No failed blocks to decode\n");
+		free(decode);
+		return -EINVAL;
+	}
+
+	if (num_failed > p) {
+		SPDK_ERRLOG("Too many failed blocks (%u > %u) for decode\n", num_failed, p);
+		free(decode);
+		return -ENODEV;
+	}
+	decode->type = EC_PRIVATE_TYPE_DECODE;
+	decode->stripe_index = stripe_index;
+	decode->strip_idx_in_stripe = strip_idx_in_stripe;
+	decode->offset_in_strip = offset_in_strip;
+	decode->num_blocks_to_read = ec_io->num_blocks;
+	decode->num_failed = num_failed;
+	decode->num_available = num_available;
+	memcpy(decode->failed_indices, failed_frag_indices, num_failed);
+	memcpy(decode->frag_map, frag_map, sizeof(frag_map));
+	memcpy(decode->available_indices, available_indices, num_available);
+
+	/* Get stripe buffer */
+	decode->stripe_buf = ec_get_rmw_stripe_buf(ec_io->ec_ch, ec_bdev,
+						   strip_size_bytes * m);
+	if (decode->stripe_buf == NULL) {
+		SPDK_ERRLOG("Failed to allocate stripe buffer for decode\n");
+		free(decode);
+		return -ENOMEM;
+	}
+
+	/* Allocate recovery buffer */
+	decode->recover_buf = spdk_dma_malloc(strip_size_bytes, ec_bdev->buf_alignment, NULL);
+	if (decode->recover_buf == NULL) {
+		SPDK_ERRLOG("Failed to allocate recovery buffer\n");
+		ec_put_rmw_stripe_buf(ec_io->ec_ch, decode->stripe_buf, strip_size_bytes * m);
+		free(decode);
+		return -ENOMEM;
+	}
+
+	/* Prepare data pointers - use first k available blocks */
+	for (i = 0; i < k; i++) {
+		decode->data_ptrs[i] = decode->stripe_buf + i * strip_size_bytes;
+	}
+
+	decode->state = EC_DECODE_STATE_READING;
+	decode->reads_completed = 0;
+	decode->reads_expected = k;
+	ec_io->module_private = decode;
+
+	/* Read k available blocks in parallel */
+	for (i = 0; i < k; i++) {
+		idx = decode->available_indices[i];
+		base_info = &ec_bdev->base_bdev_info[idx];
+
+		uint64_t pd_lba = (stripe_index << ec_bdev->strip_size_shift) + base_info->data_offset;
+
+		rc = spdk_bdev_read_blocks(base_info->desc,
+					   ec_io->ec_ch->base_channel[idx],
+					   decode->data_ptrs[i], pd_lba, ec_bdev->strip_size,
+					   ec_decode_read_complete, ec_io);
+		if (rc == 0) {
+			/* Read submitted successfully */
+		} else if (rc == -ENOMEM) {
+			if (i > 0) {
+				/* Some reads already submitted - mark as failed */
+				decode->reads_expected = decode->reads_completed;
+				return 0;
+			} else {
+				/* No reads submitted yet - safe to free and queue wait */
+				ec_cleanup_decode_bufs(ec_io, decode);
+				free(decode);
+				ec_io->module_private = NULL;
+				ec_bdev_queue_io_wait(ec_io,
+						      spdk_bdev_desc_get_bdev(base_info->desc),
+						      ec_io->ec_ch->base_channel[idx],
+						      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
+				return 0;
+			}
+		} else {
+			SPDK_ERRLOG("Failed to read data block %u for decode: %s\n",
+				    idx, spdk_strerror(-rc));
+			if (i > 0) {
+				decode->reads_expected = decode->reads_completed;
+			} else {
+				ec_cleanup_decode_bufs(ec_io, decode);
+				free(decode);
+				ec_io->module_private = NULL;
+			}
+			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+/*
  * Main I/O submission function
  */
 void
@@ -1460,10 +1868,43 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		offset_in_strip = ec_io->offset_blocks & (ec_bdev->strip_size - 1);
 
 		if (num_failed > 0 && num_failed <= ec_bdev->p) {
-			SPDK_WARNLOG("Decode path not yet implemented for EC bdev %s\n",
-				     ec_bdev->bdev.name);
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return;
+			/* Use decode path to recover from failed blocks */
+			rc = ec_submit_decode_read(ec_io, stripe_index, strip_idx_in_stripe, offset_in_strip);
+			if (rc == 0) {
+				return;
+			} else if (rc == -ENOMEM) {
+				/* Buffer allocation failed - queue I/O wait */
+				struct ec_base_bdev_info *wait_base_info = NULL;
+				struct spdk_io_channel *wait_channel = NULL;
+				uint8_t wait_idx;
+				
+				wait_idx = 0;
+				EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+					if (base_info->desc != NULL && !base_info->is_failed &&
+					    ec_io->ec_ch->base_channel[wait_idx] != NULL) {
+						wait_base_info = base_info;
+						wait_channel = ec_io->ec_ch->base_channel[wait_idx];
+						break;
+					}
+					wait_idx++;
+				}
+				
+				if (wait_base_info != NULL && wait_channel != NULL) {
+					ec_bdev_queue_io_wait(ec_io,
+							      spdk_bdev_desc_get_bdev(wait_base_info->desc),
+							      wait_channel,
+							      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
+					return;
+				} else {
+					SPDK_ERRLOG("No available base bdev for I/O wait in decode path\n");
+					ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+					return;
+				}
+			} else {
+				SPDK_ERRLOG("Failed to submit decode read: %s\n", spdk_strerror(-rc));
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
 		}
 
 		uint8_t data_indices[EC_MAX_K];
@@ -1647,20 +2088,31 @@ ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 		return;
 	}
 
-	if (success && ec_bdev->extension_if != NULL &&
-	    ec_bdev->extension_if->notify_io_complete != NULL) {
-		EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
-			if (base_info->desc != NULL &&
-			    spdk_bdev_desc_get_bdev(base_info->desc) == bdev_io->bdev) {
-				ext_if = ec_bdev->extension_if;
-				ext_if->notify_io_complete(ext_if, ec_bdev, base_info,
-							   ec_io->offset_blocks,
-							   ec_io->num_blocks,
-							   ec_io->type == SPDK_BDEV_IO_TYPE_WRITE,
-							   ext_if->ctx);
-				break;
-			}
+	/* Find the base_info for this I/O */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->desc != NULL &&
+		    spdk_bdev_desc_get_bdev(base_info->desc) == bdev_io->bdev) {
+			break;
 		}
+	}
+
+	/* If I/O failed, mark the base bdev as failed */
+	if (!success && base_info != NULL && !base_info->is_failed) {
+		SPDK_WARNLOG("I/O failed on base bdev '%s' (slot %u) of EC bdev '%s', marking as failed\n",
+			     base_info->name ? base_info->name : "unknown",
+			     (uint8_t)(base_info - ec_bdev->base_bdev_info),
+			     ec_bdev->bdev.name);
+		ec_bdev_fail_base_bdev(base_info);
+	}
+
+	if (success && ec_bdev->extension_if != NULL &&
+	    ec_bdev->extension_if->notify_io_complete != NULL && base_info != NULL) {
+		ext_if = ec_bdev->extension_if;
+		ext_if->notify_io_complete(ext_if, ec_bdev, base_info,
+					   ec_io->offset_blocks,
+					   ec_io->num_blocks,
+					   ec_io->type == SPDK_BDEV_IO_TYPE_WRITE,
+					   ext_if->ctx);
 	}
 
 	spdk_bdev_free_io(bdev_io);

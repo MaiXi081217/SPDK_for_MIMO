@@ -7,6 +7,7 @@
 #include "bdev_ec_internal.h"
 #include "spdk/log.h"
 #include "spdk/env.h"
+#include "spdk/string.h"
 #include <isa-l/erasure_code.h>
 #include <isa-l/gf_vect_mul.h>
 #include <string.h>
@@ -511,6 +512,109 @@ ec_bdev_cleanup_tables(struct ec_bdev *ec_bdev)
 
 	free(mp->invert_matrix);
 	mp->invert_matrix = NULL;
+}
+
+/*
+ * brief:
+ * ec_decode_stripe decodes/recover failed fragments using ISA-L
+ * params:
+ * ec_bdev - pointer to EC bdev
+ * data_ptrs - array of pointers to available data blocks (k pointers)
+ * recover_ptrs - array of pointers to recovery output buffers (nerrs pointers)
+ * frag_err_list - list of failed fragment indices (logical fragment indices 0 to m-1)
+ * nerrs - number of erasures
+ * len - length of each block in bytes
+ * returns:
+ * 0 on success, non-zero on failure
+ */
+int
+ec_decode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
+		 unsigned char **recover_ptrs, uint8_t *frag_err_list, int nerrs, size_t len)
+{
+	struct ec_bdev_module_private *mp;
+	uint8_t k, p;
+	uint8_t i;
+	unsigned char *decode_tbls = NULL;
+	int rc;
+
+	/* Validate input parameters */
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("ec_bdev is NULL\n");
+		return -EINVAL;
+	}
+
+	if (data_ptrs == NULL || recover_ptrs == NULL || frag_err_list == NULL) {
+		SPDK_ERRLOG("EC bdev %s: data_ptrs, recover_ptrs or frag_err_list is NULL\n",
+			    ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	mp = ec_bdev->module_private;
+	if (mp == NULL || mp->encode_matrix == NULL) {
+		SPDK_ERRLOG("EC bdev %s: module_private or encode_matrix is NULL\n",
+			    ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	k = ec_bdev->k;
+	p = ec_bdev->p;
+
+	if (nerrs == 0 || nerrs > p) {
+		SPDK_ERRLOG("EC bdev %s: invalid nerrs %d (must be 1-%u)\n",
+			    ec_bdev->bdev.name, nerrs, p);
+		return -EINVAL;
+	}
+
+	if (len == 0) {
+		SPDK_ERRLOG("EC bdev %s: decoding length is zero\n", ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	/* Verify all data pointers are non-NULL */
+	for (i = 0; i < k; i++) {
+		if (data_ptrs[i] == NULL) {
+			SPDK_ERRLOG("EC bdev %s: data_ptrs[%u] is NULL\n", ec_bdev->bdev.name, i);
+			return -EINVAL;
+		}
+	}
+
+	/* Verify all recovery pointers are non-NULL */
+	for (i = 0; i < nerrs; i++) {
+		if (recover_ptrs[i] == NULL) {
+			SPDK_ERRLOG("EC bdev %s: recover_ptrs[%u] is NULL\n", ec_bdev->bdev.name, i);
+			return -EINVAL;
+		}
+	}
+
+	/* Generate decode matrix */
+	rc = ec_bdev_gen_decode_matrix(ec_bdev, frag_err_list, nerrs);
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: failed to generate decode matrix: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-rc));
+		return rc;
+	}
+
+	/* Allocate decode tables */
+	decode_tbls = malloc(32 * k * nerrs);
+	if (decode_tbls == NULL) {
+		SPDK_ERRLOG("EC bdev %s: failed to allocate decode tables\n", ec_bdev->bdev.name);
+		return -ENOMEM;
+	}
+
+	/* Initialize decode tables from decode matrix */
+	ec_init_tables(k, nerrs, mp->decode_matrix, decode_tbls);
+
+	/* Use ISA-L to decode/recover failed fragments
+	 * ec_encode_data can be used for decoding by providing decode matrix
+	 * data_ptrs: k available source blocks
+	 * recover_ptrs: nerrs output buffers for recovered blocks
+	 */
+	ec_encode_data(len, k, nerrs, decode_tbls, data_ptrs, recover_ptrs);
+
+	/* Free decode tables */
+	free(decode_tbls);
+
+	return 0;
 }
 
 

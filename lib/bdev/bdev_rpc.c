@@ -17,6 +17,7 @@
 #include "spdk/log.h"
 
 #include "bdev_internal.h"
+#include "spdk/thread.h"
 
 #define SPDK_BDEV_HISTOGRAM_DEFAULT_MIN_VALUE_NS (1000)
 #define SPDK_BDEV_HISTOGRAM_DEFAULT_MAX_VALUE_NS (120000000000)
@@ -1202,3 +1203,231 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_get_histogram", rpc_bdev_get_histogram, SPDK_RPC_RUNTIME)
+
+/*
+ * Context for wiping bdev superblock
+ */
+struct rpc_bdev_wipe_sb_ctx {
+	struct spdk_bdev_desc *desc;
+	struct spdk_io_channel *ch;
+	struct spdk_jsonrpc_request *request;
+	void *zero_buf;
+	uint32_t wipe_size;
+};
+
+/*
+ * Default superblock size for wiping (1MB, same as EC_BDEV_MIN_DATA_OFFSET_SIZE)
+ */
+#define BDEV_WIPE_SB_DEFAULT_SIZE (1024 * 1024)
+
+/*
+ * Callback for superblock wipe I/O completion
+ */
+static void
+rpc_bdev_wipe_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct rpc_bdev_wipe_sb_ctx *ctx = cb_arg;
+	struct spdk_json_write_ctx *w;
+	struct spdk_bdev *bdev;
+	int status = 0;
+
+	/* Save bdev pointer before freeing I/O */
+	bdev = bdev_io->bdev;
+
+	if (!success) {
+		SPDK_WARNLOG("Failed to wipe superblock on bdev %s\n", bdev->name);
+		status = -EIO;
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	/* Free the zero buffer */
+	if (ctx->zero_buf != NULL) {
+		spdk_dma_free(ctx->zero_buf);
+	}
+
+	/* Close bdev descriptor and channel */
+	if (ctx->ch != NULL) {
+		spdk_put_io_channel(ctx->ch);
+	}
+	if (ctx->desc != NULL) {
+		spdk_bdev_close(ctx->desc);
+	}
+
+	/* Send response */
+	if (status == 0) {
+		w = spdk_jsonrpc_begin_result(ctx->request);
+		spdk_json_write_bool(w, true);
+		spdk_jsonrpc_end_result(ctx->request, w);
+	} else {
+		spdk_jsonrpc_send_error_response(ctx->request, status, spdk_strerror(-status));
+	}
+
+	free(ctx);
+}
+
+/*
+ * RPC structure for bdev_wipe_superblock
+ */
+struct rpc_bdev_wipe_superblock {
+	char *name;
+	uint32_t size;
+};
+
+static void
+free_rpc_bdev_wipe_superblock(struct rpc_bdev_wipe_superblock *req)
+{
+	free(req->name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_wipe_superblock_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_wipe_superblock, name), spdk_json_decode_string},
+	{"size", offsetof(struct rpc_bdev_wipe_superblock, size), spdk_json_decode_uint32, true},
+};
+
+/*
+ * RPC handler for bdev_wipe_superblock
+ * This command wipes the superblock area (first N bytes) of a bdev.
+ * It can be used to clear EC bdev superblocks or any other metadata stored
+ * at the beginning of a bdev.
+ */
+static void
+rpc_bdev_wipe_superblock(struct spdk_jsonrpc_request *request,
+			const struct spdk_json_val *params)
+{
+	struct rpc_bdev_wipe_superblock req = {};
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *ch = NULL;
+	struct rpc_bdev_wipe_sb_ctx *ctx = NULL;
+	void *zero_buf = NULL;
+	uint32_t wipe_size;
+	uint64_t align;
+	int rc;
+
+	/* Parse JSON parameters */
+	if (spdk_json_decode_object(params, rpc_bdev_wipe_superblock_decoders,
+				    SPDK_COUNTOF(rpc_bdev_wipe_superblock_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		goto cleanup;
+	}
+
+	if (req.name == NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Missing required parameter: name");
+		goto cleanup;
+	}
+
+	/* Get bdev */
+	bdev = spdk_bdev_get_by_name(req.name);
+	if (bdev == NULL) {
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Bdev '%s' not found", req.name);
+		goto cleanup;
+	}
+
+	/* Set default wipe size if not specified */
+	wipe_size = req.size > 0 ? req.size : BDEV_WIPE_SB_DEFAULT_SIZE;
+
+	/* Validate wipe size */
+	if (wipe_size > spdk_bdev_get_num_blocks(bdev) * spdk_bdev_get_block_size(bdev)) {
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Wipe size %u exceeds bdev size", wipe_size);
+		goto cleanup;
+	}
+
+	/* Open bdev */
+	rc = spdk_bdev_open_ext(req.name, true, dummy_bdev_event_cb, NULL, &desc);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, rc, "Failed to open bdev '%s': %s",
+						     req.name, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	/* Get I/O channel */
+	ch = spdk_bdev_get_io_channel(desc);
+	if (ch == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+
+	/* Get alignment requirement */
+	align = spdk_bdev_get_buf_align(bdev);
+	if (align == 0) {
+		align = 0x1000; /* Default 4KB alignment */
+	}
+
+	/* Allocate context */
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+
+	/* Align wipe size to block size */
+	wipe_size = SPDK_ALIGN_CEIL(wipe_size, spdk_bdev_get_block_size(bdev));
+
+	/* Allocate zero buffer */
+	zero_buf = spdk_dma_malloc(wipe_size, align, NULL);
+	if (zero_buf == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+
+	memset(zero_buf, 0, wipe_size);
+
+	/* Initialize context */
+	ctx->desc = desc;
+	ctx->ch = ch;
+	ctx->request = request;
+	ctx->zero_buf = zero_buf;
+	ctx->wipe_size = wipe_size;
+
+	/* Write zeros to superblock area - convert bytes to blocks */
+	uint64_t offset_blocks = 0;
+	uint64_t num_blocks = wipe_size / spdk_bdev_get_block_size(bdev);
+	rc = spdk_bdev_write_blocks(desc, ch, zero_buf, offset_blocks, num_blocks,
+				    rpc_bdev_wipe_sb_cb, ctx);
+	if (rc != 0) {
+		if (rc == -ENOMEM) {
+			/* I/O queue full - cannot wipe superblock immediately */
+			SPDK_WARNLOG("I/O queue full, cannot wipe superblock immediately\n");
+			spdk_jsonrpc_send_error_response(request, -ENOMEM,
+							 "I/O queue full, please retry");
+		} else {
+			SPDK_WARNLOG("Failed to submit superblock wipe I/O: %s\n", spdk_strerror(-rc));
+			spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		}
+		/* Cleanup will be done in callback or here */
+		spdk_dma_free(zero_buf);
+		free(ctx);
+		spdk_put_io_channel(ch);
+		spdk_bdev_close(desc);
+		goto cleanup;
+	}
+
+	/* Buffer and context will be freed in callback */
+	zero_buf = NULL;
+	ctx = NULL;
+	ch = NULL;
+	desc = NULL;
+
+cleanup:
+	free_rpc_bdev_wipe_superblock(&req);
+	if (desc != NULL) {
+		spdk_bdev_close(desc);
+	}
+	if (ch != NULL) {
+		spdk_put_io_channel(ch);
+	}
+	if (zero_buf != NULL) {
+		spdk_dma_free(zero_buf);
+	}
+	if (ctx != NULL) {
+		free(ctx);
+	}
+}
+
+SPDK_RPC_REGISTER("bdev_wipe_superblock", rpc_bdev_wipe_superblock, SPDK_RPC_RUNTIME)

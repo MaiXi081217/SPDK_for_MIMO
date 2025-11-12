@@ -4,12 +4,19 @@
 #include "spdk/bdev.h"
 #include "spdk/util.h"
 #include "spdk/string.h"
+#include "spdk/crc32.h"
 #include "spdk/log.h"
 #include "spdk/env.h"
 #include "spdk/thread.h"
 #include "spdk/json.h"
 #include "spdk/likely.h"
 #include "spdk/queue.h"
+#include "spdk/vmd.h"
+#include "spdk/nvme.h"
+
+/* Forward declarations for NVMe bdev functions - use weak linking if available */
+extern struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev) __attribute__((weak));
+extern struct spdk_pci_device *spdk_nvme_ctrlr_get_pci_device(struct spdk_nvme_ctrlr *ctrlr) __attribute__((weak));
 
 #define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
 
@@ -2253,8 +2260,35 @@ ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 }
 
 /*
+ * Callback after wiping superblock - continue with removal
+ */
+static void
+ec_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
+{
+	struct ec_base_bdev_info *base_info = ctx;
+	ec_base_bdev_cb cb_fn = base_info->remove_cb;
+	void *cb_ctx = base_info->remove_cb_ctx;
+
+	if (status != 0) {
+		/* Wipe failed, but continue with removal anyway */
+		SPDK_WARNLOG("Failed to wipe superblock on base bdev '%s', continuing with removal\n",
+			     base_info->name ? base_info->name : "unknown");
+	}
+
+	/* Now free the base bdev resources */
+	ec_bdev_free_base_bdev_resource(base_info);
+
+	/* Always call callback */
+	if (cb_fn) {
+		cb_fn(cb_ctx, 0);
+	}
+}
+
+/*
  * brief:
  * ec_bdev_remove_base_bdev removes a base bdev from EC bdev
+ * This function will attempt to wipe the superblock on the base bdev before removal.
+ * If wipe fails (e.g., disk is already failed), removal will continue anyway.
  * params:
  * base_bdev - pointer to base bdev
  * cb_fn - callback function
@@ -2276,9 +2310,27 @@ ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, voi
 	base_info->remove_cb = cb_fn;
 	base_info->remove_cb_ctx = cb_ctx;
 
+	/* Try to wipe superblock first (if disk is failed, this might fail, which is OK) */
+	if (base_info->desc != NULL && base_info->app_thread_ch != NULL) {
+		int rc = ec_bdev_wipe_single_base_bdev_superblock(base_info,
+								   ec_bdev_remove_base_bdev_after_wipe,
+								   base_info);
+		if (rc == 0) {
+			/* Wipe started successfully, callback will continue with removal */
+			return 0;
+		} else {
+			/* Wipe failed to start, continue with removal anyway */
+			SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s', continuing with removal\n",
+				     base_info->name ? base_info->name : "unknown");
+		}
+	} else {
+		SPDK_DEBUGLOG(bdev_ec, "Cannot wipe superblock - base bdev desc or channel is NULL\n");
+	}
+
+	/* Wipe not possible or failed - proceed with removal directly */
 	ec_bdev_free_base_bdev_resource(base_info);
 
-	/* Always call callback, even if free_base_bdev_resource had issues */
+	/* Always call callback */
 	if (cb_fn) {
 		cb_fn(cb_ctx, 0);
 	}
@@ -2286,6 +2338,306 @@ ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, voi
 	return 0;
 }
 
+/*
+ * Callback for when superblock write completes after marking base bdev as failed
+ * Note: We don't remove the base bdev here - it will be removed manually by the user
+ * via RPC call when they are ready to replace the disk.
+ */
+static void
+ec_bdev_fail_base_bdev_write_sb_cb(int status, struct ec_bdev *ec_bdev, void *ctx)
+{
+	struct ec_base_bdev_info *base_info = ctx;
+
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to write EC bdev '%s' superblock after marking base bdev as failed: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-status));
+		/* Superblock write failed, but base bdev is already marked as failed */
+	}
+
+	/* Don't remove the base bdev automatically - wait for user to manually remove it
+	 * via RPC call. The base bdev is marked as failed and will be excluded from I/O operations.
+	 * User should:
+	 * 1. Physically replace the failed disk
+	 * 2. Use RPC 'bdev_ec_remove_base_bdev' to remove the failed disk (this will try to wipe superblock)
+	 * 3. Use RPC 'bdev_ec_add_base_bdev' to add the new disk
+	 * 4. Rebuild will automatically start when the new disk is added
+	 */
+	SPDK_NOTICELOG("Base bdev '%s' marked as FAILED in superblock. Use RPC to remove it when ready.\n",
+		       base_info->name ? base_info->name : "unknown");
+}
+
+/*
+ * Set LED state for a base bdev (if it's an NVMe device behind VMD)
+ * This function attempts to set the LED to REBUILD state to indicate
+ * that the disk is healthy and should be used for rebuild.
+ */
+static void
+ec_bdev_set_base_bdev_led(struct ec_base_bdev_info *base_info, enum spdk_vmd_led_state led_state)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_nvme_ctrlr *ctrlr;
+	struct spdk_pci_device *pci_device;
+	const char *module_name;
+	int rc;
+
+	if (base_info == NULL || base_info->desc == NULL) {
+		return;
+	}
+
+	bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+	if (bdev == NULL) {
+		return;
+	}
+
+	/* Check if this is an NVMe bdev by module name */
+	module_name = spdk_bdev_get_module_name(bdev);
+	if (module_name == NULL || strcmp(module_name, "nvme") != 0) {
+		/* Not an NVMe bdev, skip LED control */
+		return;
+	}
+
+	/* Check if bdev_nvme_get_ctrlr function is available (weak symbol) */
+	if (bdev_nvme_get_ctrlr == NULL) {
+		/* NVMe bdev module not linked, skip LED control */
+		SPDK_DEBUGLOG(bdev_ec, "bdev_nvme_get_ctrlr not available, skipping LED control for '%s'\n",
+			      base_info->name ? base_info->name : "unknown");
+		return;
+	}
+
+	/* Get NVMe controller from bdev */
+	ctrlr = bdev_nvme_get_ctrlr(bdev);
+	if (ctrlr == NULL) {
+		/* Not an NVMe bdev or controller not available, skip LED control */
+		return;
+	}
+
+	/* Check if spdk_nvme_ctrlr_get_pci_device function is available */
+	if (spdk_nvme_ctrlr_get_pci_device == NULL) {
+		/* Function not available, skip LED control */
+		SPDK_DEBUGLOG(bdev_ec, "spdk_nvme_ctrlr_get_pci_device not available, skipping LED control for '%s'\n",
+			      base_info->name ? base_info->name : "unknown");
+		return;
+	}
+
+	/* Get PCI device from NVMe controller */
+	pci_device = spdk_nvme_ctrlr_get_pci_device(ctrlr);
+	if (pci_device == NULL) {
+		/* Not a PCIe-attached NVMe device, skip LED control */
+		return;
+	}
+
+	/* Set LED state (only works for devices behind VMD) */
+	rc = spdk_vmd_set_led_state(pci_device, led_state);
+	if (rc != 0) {
+		/* LED control failed - device might not be behind VMD, which is OK */
+		SPDK_DEBUGLOG(bdev_ec, "Failed to set LED state for base bdev '%s': %s (device may not be behind VMD)\n",
+			      base_info->name ? base_info->name : "unknown", spdk_strerror(-rc));
+	} else {
+		SPDK_NOTICELOG("Set LED state to %d for base bdev '%s'\n",
+			       led_state, base_info->name ? base_info->name : "unknown");
+	}
+}
+
+/*
+ * Get PCIe BDF address string for a base bdev
+ * Returns 0 on success, -1 on failure (not a PCIe device or function not available)
+ */
+static int
+ec_bdev_get_pcie_bdf(struct ec_base_bdev_info *base_info, char *bdf_str, size_t bdf_str_size)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_nvme_ctrlr *ctrlr;
+	struct spdk_pci_device *pci_device;
+	struct spdk_pci_addr pci_addr;
+	const char *module_name;
+	int rc;
+
+	if (base_info == NULL || base_info->desc == NULL || bdf_str == NULL || bdf_str_size == 0) {
+		return -1;
+	}
+
+	bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+	if (bdev == NULL) {
+		return -1;
+	}
+
+	/* Check if this is an NVMe bdev by module name */
+	module_name = spdk_bdev_get_module_name(bdev);
+	if (module_name == NULL || strcmp(module_name, "nvme") != 0) {
+		/* Not an NVMe bdev */
+		return -1;
+	}
+
+	/* Check if bdev_nvme_get_ctrlr function is available (weak symbol) */
+	if (bdev_nvme_get_ctrlr == NULL) {
+		/* NVMe bdev module not linked */
+		return -1;
+	}
+
+	/* Get NVMe controller from bdev */
+	ctrlr = bdev_nvme_get_ctrlr(bdev);
+	if (ctrlr == NULL) {
+		/* Not an NVMe bdev or controller not available */
+		return -1;
+	}
+
+	/* Check if spdk_nvme_ctrlr_get_pci_device function is available */
+	if (spdk_nvme_ctrlr_get_pci_device == NULL) {
+		/* Function not available */
+		return -1;
+	}
+
+	/* Get PCI device from NVMe controller */
+	pci_device = spdk_nvme_ctrlr_get_pci_device(ctrlr);
+	if (pci_device == NULL) {
+		/* Not a PCIe-attached NVMe device */
+		return -1;
+	}
+
+	/* Get PCI address */
+	pci_addr = spdk_pci_device_get_addr(pci_device);
+	
+	/* Format PCI address as BDF string */
+	rc = spdk_pci_addr_fmt(bdf_str, bdf_str_size, &pci_addr);
+	if (rc != 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Set LED state for all healthy base bdevs in an EC bdev
+ * This is called when a disk fails to make healthy disks blink
+ * Also called when rebuild completes to turn off LEDs
+ */
+void
+ec_bdev_set_healthy_disks_led(struct ec_bdev *ec_bdev, enum spdk_vmd_led_state led_state)
+{
+	struct ec_base_bdev_info *base_info;
+
+	if (ec_bdev == NULL) {
+		return;
+	}
+
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		/* Only set LED for healthy (non-failed) base bdevs */
+		if (base_info->is_configured && !base_info->is_failed &&
+		    base_info->desc != NULL) {
+			ec_bdev_set_base_bdev_led(base_info, led_state);
+		}
+	}
+}
+
+/*
+ * Internal function to fail a base bdev (called from app thread)
+ */
+static void
+_ec_bdev_fail_base_bdev(void *ctx)
+{
+	struct ec_base_bdev_info *base_info = ctx;
+	struct ec_bdev *ec_bdev;
+	uint8_t slot;
+	uint8_t i;
+	char pcie_bdf[32] = "N/A";
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in fail_base_bdev\n");
+		return;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("ec_bdev is NULL in fail_base_bdev\n");
+		return;
+	}
+
+	if (base_info->is_failed) {
+		/* Already marked as failed, skip */
+		return;
+	}
+
+	base_info->is_failed = true;
+	slot = (uint8_t)(base_info - ec_bdev->base_bdev_info);
+
+	/* Try to get PCIe BDF address for the failed disk */
+	if (ec_bdev_get_pcie_bdf(base_info, pcie_bdf, sizeof(pcie_bdf)) == 0) {
+		SPDK_ERRLOG("===========================================================\n");
+		SPDK_ERRLOG("CRITICAL: Base bdev FAILED in slot %u ('%s') of EC bdev '%s'\n",
+			       slot, base_info->name ? base_info->name : "unknown", ec_bdev->bdev.name);
+		SPDK_ERRLOG("FAILED DISK PCIe LOCATION: %s\n", pcie_bdf);
+		SPDK_ERRLOG("ACTION REQUIRED: Please replace the failed disk at PCIe %s\n", pcie_bdf);
+		SPDK_ERRLOG("After replacing, use RPC 'bdev_ec_add_base_bdev' to add the new disk\n");
+		SPDK_ERRLOG("The EC bdev is now in degraded mode - data is still accessible\n");
+		SPDK_ERRLOG("but redundancy is reduced. Replace the disk as soon as possible.\n");
+		SPDK_ERRLOG("Healthy disks will have their LEDs blinking to indicate they are operational.\n");
+		SPDK_ERRLOG("===========================================================\n");
+	} else {
+		/* PCIe BDF not available (not a PCIe device or NVMe module not linked) */
+		SPDK_ERRLOG("===========================================================\n");
+		SPDK_ERRLOG("CRITICAL: Base bdev FAILED in slot %u ('%s') of EC bdev '%s'\n",
+			       slot, base_info->name ? base_info->name : "unknown", ec_bdev->bdev.name);
+		SPDK_ERRLOG("ACTION REQUIRED: Please replace the failed disk\n");
+		SPDK_ERRLOG("After replacing, use RPC 'bdev_ec_add_base_bdev' to add the new disk\n");
+		SPDK_ERRLOG("The EC bdev is now in degraded mode - data is still accessible\n");
+		SPDK_ERRLOG("but redundancy is reduced. Replace the disk as soon as possible.\n");
+		SPDK_ERRLOG("Healthy disks will have their LEDs blinking to indicate they are operational.\n");
+		SPDK_ERRLOG("===========================================================\n");
+	}
+
+	/* Set LED state for healthy disks to REBUILD (blinking) to indicate they are operational */
+	ec_bdev_set_healthy_disks_led(ec_bdev, SPDK_VMD_LED_STATE_REBUILD);
+
+	/* Update superblock if it exists */
+	if (ec_bdev->sb != NULL) {
+		struct ec_bdev_superblock *sb = ec_bdev->sb;
+
+		/* Find the slot in superblock and update its state to FAILED */
+		for (i = 0; i < sb->base_bdevs_size; i++) {
+			if (sb->base_bdevs[i].slot == slot) {
+				if (sb->base_bdevs[i].state == EC_SB_BASE_BDEV_CONFIGURED) {
+					sb->base_bdevs[i].state = EC_SB_BASE_BDEV_FAILED;
+					/* Increment sequence number to indicate superblock update */
+					sb->seq_number++;
+					/* Update CRC */
+					sb->crc = 0;
+					sb->crc = spdk_crc32c_update(sb, sb->length, 0);
+					/* Write superblock asynchronously - but don't remove the base bdev yet */
+					ec_bdev_write_superblock(ec_bdev, ec_bdev_fail_base_bdev_write_sb_cb, base_info);
+					return;
+				}
+				break;
+			}
+		}
+	}
+
+	/* No superblock or slot not found - mark as failed but don't remove */
+	SPDK_WARNLOG("No superblock found for failed base bdev, marking as failed but keeping in EC bdev\n");
+}
+
+/*
+ * brief:
+ * ec_bdev_fail_base_bdev marks a base bdev as failed and removes it from EC bdev
+ * This function should be called when I/O operations fail on a base bdev.
+ * It will update the superblock to mark the base bdev as FAILED and remove it.
+ * When a new disk is inserted, the examine mechanism will automatically detect
+ * the FAILED state and trigger rebuild.
+ * params:
+ * base_info - pointer to base bdev info
+ * returns:
+ * none
+ */
+void
+ec_bdev_fail_base_bdev(struct ec_base_bdev_info *base_info)
+{
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_fail_base_bdev\n");
+		return;
+	}
+
+	/* Execute on app thread to ensure thread safety */
+	spdk_thread_exec_msg(spdk_thread_get_app_thread(), _ec_bdev_fail_base_bdev, base_info);
+}
 
 /*
  * brief:
@@ -2467,6 +2819,138 @@ ec_bdev_configure_base_bdev(struct ec_base_bdev_info *base_info, bool existing,
 	/* Continue configuration */
 	ec_bdev_configure_cont(ec_bdev);
 
+	/* Check if this base bdev needs rebuild. Rebuild is needed when:
+	 * 1. EC bdev is ONLINE (fully operational)
+	 * 2. Superblock is enabled
+	 * 3. One of the following conditions is true:
+	 *    a) Slot was previously MISSING or FAILED (replacement disk)
+	 *    b) New disk's UUID doesn't match expected UUID (wrong disk)
+	 *    c) New disk has no superblock or superblock belongs to other EC (new/foreign disk)
+	 */
+	if (ec_bdev->state == EC_BDEV_STATE_ONLINE && ec_bdev->sb != NULL) {
+		uint8_t slot_idx = (uint8_t)(base_info - ec_bdev->base_bdev_info);
+		bool needs_rebuild = false;
+		const char *rebuild_reason = NULL;
+		uint8_t i;
+		
+		/* Find this slot in superblock */
+		const struct ec_bdev_sb_base_bdev *sb_base = NULL;
+		for (i = 0; i < ec_bdev->sb->base_bdevs_size; i++) {
+			if (ec_bdev->sb->base_bdevs[i].slot == slot_idx) {
+				sb_base = &ec_bdev->sb->base_bdevs[i];
+				break;
+			}
+		}
+		
+		if (sb_base != NULL) {
+			/* IMPORTANT: Check if slot is already CONFIGURED in EC bdev's superblock.
+			 * If it's CONFIGURED, it means rebuild has already completed, and this
+			 * might be an old disk with stale superblock that was re-inserted.
+			 * In this case, we should NOT trigger rebuild again.
+			 */
+			if (sb_base->state == EC_SB_BASE_BDEV_CONFIGURED) {
+				/* Slot is already CONFIGURED - rebuild has completed.
+				 * Check if this is the same disk (UUID matches) or a different disk.
+				 */
+				if (!spdk_uuid_is_null(&sb_base->uuid) &&
+				    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) == 0) {
+					/* Same disk - this is the disk that was rebuilt.
+					 * No need to rebuild again, just update its superblock if needed.
+					 */
+					SPDK_NOTICELOG("Base bdev %s (slot %u) is already CONFIGURED in EC bdev %s superblock. "
+						       "This appears to be the same disk that was rebuilt. Skipping rebuild.\n",
+						       base_info->name, slot_idx, ec_bdev->bdev.name);
+					needs_rebuild = false;
+				} else {
+					/* Different disk - this is a replacement disk, but slot is already CONFIGURED.
+					 * This shouldn't happen in normal flow, but if it does, we should rebuild
+					 * to ensure data consistency.
+					 */
+					SPDK_WARNLOG("Base bdev %s (slot %u) UUID doesn't match expected UUID in EC bdev %s, "
+						     "but slot is CONFIGURED. This might be an old disk re-inserted. "
+						     "Will rebuild to ensure data consistency.\n",
+						     base_info->name, slot_idx, ec_bdev->bdev.name);
+					needs_rebuild = true;
+					rebuild_reason = "UUID mismatch with CONFIGURED slot (old disk re-inserted?)";
+				}
+			} else {
+				/* Slot is MISSING or FAILED - check if this is a replacement disk */
+				if (sb_base->state == EC_SB_BASE_BDEV_MISSING ||
+				    sb_base->state == EC_SB_BASE_BDEV_FAILED) {
+					/* Check if UUID matches - if it matches, this is the old failed disk re-inserted */
+					if (!spdk_uuid_is_null(&sb_base->uuid) &&
+					    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) == 0) {
+					/* Same UUID - this is the old failed disk re-inserted.
+					 * Since rebuild has completed (we're in ONLINE state), we should
+					 * NOT rebuild again. Instead, we should update the superblock to CONFIGURED.
+					 */
+					SPDK_WARNLOG("Base bdev %s (slot %u) of EC bdev %s with UUID matching FAILED/MISSING slot "
+						     "re-inserted, but rebuild has already completed. "
+						     "This is likely an old disk with stale superblock. "
+						     "Updating superblock to CONFIGURED state.\n",
+						     base_info->name, slot_idx, ec_bdev->bdev.name);
+					/* Update superblock to CONFIGURED - modify EC bdev's superblock directly */
+					ec_bdev->sb->base_bdevs[i].state = EC_SB_BASE_BDEV_CONFIGURED;
+					ec_bdev->sb->seq_number++;
+					ec_bdev->sb->crc = 0;
+					ec_bdev->sb->crc = spdk_crc32c_update(ec_bdev->sb, ec_bdev->sb->length, 0);
+					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+					needs_rebuild = false;
+					} else {
+						/* Different UUID - this is a replacement disk */
+						needs_rebuild = true;
+						rebuild_reason = "slot was previously MISSING/FAILED (replacement disk)";
+					}
+				}
+				
+				/* Check if UUID doesn't match expected UUID (wrong disk or new disk) */
+				if (!needs_rebuild && !spdk_uuid_is_null(&sb_base->uuid) &&
+				    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) != 0) {
+					needs_rebuild = true;
+					rebuild_reason = "UUID mismatch (new disk or wrong disk)";
+				}
+				
+				/* If UUID is null in base_info, this is a new disk without superblock */
+				if (!needs_rebuild && spdk_uuid_is_null(&base_info->uuid)) {
+					needs_rebuild = true;
+					rebuild_reason = "new disk without superblock";
+				}
+			}
+		} else {
+			/* Slot not found in superblock - this shouldn't happen, but treat as needs rebuild */
+			needs_rebuild = true;
+			rebuild_reason = "slot not found in superblock";
+		}
+		
+		/* Additional check: if base_info->uuid was set from examine but doesn't match
+		 * the expected UUID in superblock, we need rebuild */
+		if (!needs_rebuild && sb_base != NULL && !spdk_uuid_is_null(&sb_base->uuid)) {
+			if (spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) != 0) {
+				needs_rebuild = true;
+				rebuild_reason = "UUID mismatch with superblock";
+			}
+		}
+		
+		/* If this is a new disk (no superblock), we need to write superblock and rebuild */
+		if (!needs_rebuild && spdk_uuid_is_null(&base_info->uuid)) {
+			needs_rebuild = true;
+			rebuild_reason = "new disk - needs superblock write and rebuild";
+		}
+		
+		if (needs_rebuild && !ec_bdev_is_rebuilding(ec_bdev)) {
+			/* Start rebuild for this base bdev */
+			SPDK_NOTICELOG("Starting automatic rebuild for base bdev %s (slot %u) on EC bdev %s: %s\n",
+				       base_info->name, slot_idx, ec_bdev->bdev.name,
+				       rebuild_reason ? rebuild_reason : "unknown reason");
+			rc = ec_bdev_start_rebuild(ec_bdev, base_info, NULL, NULL);
+			if (rc != 0) {
+				SPDK_WARNLOG("Failed to start rebuild for base bdev %s: %s\n",
+					     base_info->name, spdk_strerror(-rc));
+				/* Don't fail configuration if rebuild start fails */
+			}
+		}
+	}
+
 	if (cb_fn) {
 		cb_fn(cb_ctx, 0);
 	}
@@ -2615,15 +3099,17 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 
 	SPDK_DEBUGLOG(bdev_ec, "examine_cont called for bdev %s, sb=%p\n", bdev->name, sb);
 	if (sb == NULL) {
-		SPDK_DEBUGLOG(bdev_ec, "No superblock found on bdev %s\n", bdev->name);
+		SPDK_DEBUGLOG(bdev_ec, "No superblock found on bdev %s - this is a new disk\n", bdev->name);
+		/* No superblock - this is a new disk. User must manually add it to EC bdev
+		 * using RPC 'bdev_ec_add_base_bdev'. We don't auto-match to FAILED/MISSING slots. */
 		/* Try examine_no_sb for EC bdevs without superblock */
 		ec_bdev_examine_no_sb(bdev);
-        if (cb_fn) {
-            cb_fn(cb_ctx, 0);
-        } else {
-            /* Ensure examine_done is always called */
-            ec_bdev_examine_done_cb(bdev, 0);
-        }
+		if (cb_fn) {
+			cb_fn(cb_ctx, 0);
+		} else {
+			/* Ensure examine_done is always called */
+			ec_bdev_examine_done_cb(bdev, 0);
+		}
 		return;
 	}
 
@@ -2692,7 +3178,10 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	}
 
 	if (i == sb->base_bdevs_size) {
-		SPDK_DEBUGLOG(bdev_ec, "EC superblock does not contain this bdev's uuid\n");
+		/* This bdev's UUID is not in the superblock - it's a new/foreign disk
+		 * User must manually add it to EC bdev using RPC 'bdev_ec_add_base_bdev' */
+		SPDK_DEBUGLOG(bdev_ec, "EC superblock does not contain this bdev's uuid - "
+			      "this is a new disk, user must manually add it\n");
 		rc = -EINVAL;
 		goto out;
 	}
@@ -2770,20 +3259,49 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	if (ec_bdev->state == EC_BDEV_STATE_ONLINE) {
 		assert(sb_base_bdev->slot < ec_bdev->num_base_bdevs);
 		base_info = &ec_bdev->base_bdev_info[sb_base_bdev->slot];
-		assert(base_info->is_configured == false);
-		assert(sb_base_bdev->state == EC_SB_BASE_BDEV_MISSING ||
-		       sb_base_bdev->state == EC_SB_BASE_BDEV_FAILED);
-		assert(spdk_uuid_is_null(&base_info->uuid));
-		spdk_uuid_copy(&base_info->uuid, &sb_base_bdev->uuid);
-		/* is_data_block is kept for superblock compatibility but not used */
-		base_info->is_data_block = sb_base_bdev->is_data_block;
-		SPDK_NOTICELOG("Re-adding bdev %s to EC bdev %s.\n", bdev->name, ec_bdev->bdev.name);
-		rc = ec_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to configure bdev %s as base bdev of EC %s: %s\n",
-				    bdev->name, ec_bdev->bdev.name, spdk_strerror(-rc));
+		
+		/* Check if this slot is already occupied by another disk */
+		if (base_info->is_configured || base_info->name != NULL) {
+			/* EC bdev is already fully configured, this disk cannot be added */
+			/* This can happen if superblock state is CONFIGURED but slot is occupied */
+			SPDK_NOTICELOG("===========================================================\n");
+			SPDK_NOTICELOG("NVMe bdev '%s' belongs to EC bdev '%s' (slot %u), but EC bdev is already fully configured.\n",
+				       bdev->name, ec_bdev->bdev.name, sb_base_bdev->slot);
+			SPDK_NOTICELOG("This disk cannot be added to the EC bdev as all slots are occupied.\n");
+			SPDK_NOTICELOG("If you don't need this disk for the EC bdev, please clear its superblock\n");
+			SPDK_NOTICELOG("using RPC 'bdev_wipe_superblock' to make it available for other use.\n");
+			SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", bdev->name);
+			SPDK_NOTICELOG("===========================================================\n");
+			rc = 0; /* Don't treat as error, just inform user */
+			goto out;
 		}
-		goto out;
+		
+		/* Slot is not occupied, check superblock state */
+		if (sb_base_bdev->state == EC_SB_BASE_BDEV_MISSING ||
+		    sb_base_bdev->state == EC_SB_BASE_BDEV_FAILED) {
+			/* Re-adding a MISSING or FAILED disk */
+			assert(base_info->is_configured == false);
+			assert(spdk_uuid_is_null(&base_info->uuid));
+			spdk_uuid_copy(&base_info->uuid, &sb_base_bdev->uuid);
+			/* is_data_block is kept for superblock compatibility but not used */
+			base_info->is_data_block = sb_base_bdev->is_data_block;
+			SPDK_NOTICELOG("Re-adding bdev %s to EC bdev %s.\n", bdev->name, ec_bdev->bdev.name);
+			rc = ec_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
+			if (rc != 0) {
+				SPDK_ERRLOG("Failed to configure bdev %s as base bdev of EC %s: %s\n",
+					    bdev->name, ec_bdev->bdev.name, spdk_strerror(-rc));
+			}
+			goto out;
+		} else if (sb_base_bdev->state == EC_SB_BASE_BDEV_CONFIGURED) {
+			/* Superblock says CONFIGURED, but slot is not occupied - this is unexpected.
+			 * Continue to normal processing path below to handle it. */
+		} else {
+			/* Unknown state */
+			SPDK_WARNLOG("Unknown superblock state %u for bdev %s in EC bdev %s\n",
+				     sb_base_bdev->state, bdev->name, ec_bdev->bdev.name);
+			rc = -EINVAL;
+			goto out;
+		}
 	}
 
 	if (sb_base_bdev->state != EC_SB_BASE_BDEV_CONFIGURED) {
@@ -2791,6 +3309,28 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 			       bdev->name, ec_bdev->bdev.name);
 		rc = -EINVAL;
 		goto out;
+	}
+
+	/* At this point, ec_bdev->state != EC_BDEV_STATE_ONLINE or
+	 * ec_bdev->state == EC_BDEV_STATE_ONLINE but slot is not occupied and state is CONFIGURED.
+	 * Check if EC bdev is ONLINE and the slot is already occupied by another disk */
+	if (ec_bdev->state == EC_BDEV_STATE_ONLINE) {
+		assert(sb_base_bdev->slot < ec_bdev->num_base_bdevs);
+		base_info = &ec_bdev->base_bdev_info[sb_base_bdev->slot];
+		
+		if (base_info->is_configured || base_info->name != NULL) {
+			/* EC bdev is already fully configured, this disk cannot be added */
+			SPDK_NOTICELOG("===========================================================\n");
+			SPDK_NOTICELOG("NVMe bdev '%s' belongs to EC bdev '%s' (slot %u), but EC bdev is already fully configured.\n",
+				       bdev->name, ec_bdev->bdev.name, sb_base_bdev->slot);
+			SPDK_NOTICELOG("This disk cannot be added to the EC bdev as all slots are occupied.\n");
+			SPDK_NOTICELOG("If you don't need this disk for the EC bdev, please clear its superblock\n");
+			SPDK_NOTICELOG("using RPC 'bdev_wipe_superblock' to make it available for other use.\n");
+			SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", bdev->name);
+			SPDK_NOTICELOG("===========================================================\n");
+			rc = 0; /* Don't treat as error, just inform user */
+			goto out;
+		}
 	}
 
 	base_info = NULL;
