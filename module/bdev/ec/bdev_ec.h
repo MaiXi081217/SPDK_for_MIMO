@@ -420,6 +420,7 @@ enum ec_bdev_sb_base_bdev_state {
 	EC_SB_BASE_BDEV_CONFIGURED	= 1,
 	EC_SB_BASE_BDEV_FAILED	= 2,
 	EC_SB_BASE_BDEV_SPARE		= 3,
+	EC_SB_BASE_BDEV_REBUILDING	= 4,	/* Rebuild in progress but not completed */
 };
 
 struct ec_bdev_sb_base_bdev {
@@ -506,6 +507,11 @@ int ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info
 					     ec_base_bdev_cb cb, void *cb_ctx);
 int ec_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 				      ec_bdev_load_sb_cb cb, void *cb_ctx);
+bool ec_bdev_sb_update_base_bdev_state(struct ec_bdev *ec_bdev, uint8_t slot,
+					enum ec_bdev_sb_base_bdev_state new_state);
+const struct ec_bdev_sb_base_bdev *ec_bdev_sb_find_base_bdev_by_slot(struct ec_bdev *ec_bdev, uint8_t slot);
+const struct ec_bdev_sb_base_bdev *ec_bdev_sb_find_base_bdev_by_uuid(const struct ec_bdev_superblock *sb,
+								      const struct spdk_uuid *uuid);
 
 /* Lifecycle helpers */
 void ec_bdev_free(struct ec_bdev *ec_bdev);
