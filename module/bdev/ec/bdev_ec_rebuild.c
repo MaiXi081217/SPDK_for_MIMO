@@ -12,13 +12,10 @@
 #include "spdk/util.h"
 #include "spdk/thread.h"
 #include "spdk/vmd.h"
+#include "spdk/crc32.h"
 #include <string.h>
 
-/* Forward declaration for superblock functions */
-extern void ec_bdev_write_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb, void *cb_ctx);
-
-/* Forward declaration for LED control */
-extern void ec_bdev_set_healthy_disks_led(struct ec_bdev *ec_bdev, enum spdk_vmd_led_state led_state);
+/* Forward declarations are now in bdev_ec.h and bdev_ec_internal.h */
 
 /* Forward declarations */
 static void ec_rebuild_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
@@ -81,6 +78,13 @@ ec_rebuild_stripe_write_complete(struct spdk_bdev_io *bdev_io, bool success, voi
 	if (!success) {
 		SPDK_ERRLOG("Rebuild write failed for stripe %lu on EC bdev %s\n",
 			    rebuild_ctx->current_stripe, ec_bdev->bdev.name);
+		
+		/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+						       EC_SB_BASE_BDEV_FAILED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
+		
 		if (rebuild_ctx->rebuild_done_cb) {
 			rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, -EIO);
 		}
@@ -100,18 +104,9 @@ ec_rebuild_stripe_write_complete(struct spdk_bdev_io *bdev_io, bool success, voi
 			       rebuild_ctx->target_slot, ec_bdev->bdev.name);
 
 		/* Update superblock to mark base bdev as configured */
-		if (ec_bdev->sb != NULL) {
-			uint8_t i;
-			for (i = 0; i < ec_bdev->sb->base_bdevs_size; i++) {
-				if (ec_bdev->sb->base_bdevs[i].slot == rebuild_ctx->target_slot) {
-					ec_bdev->sb->base_bdevs[i].state = EC_SB_BASE_BDEV_CONFIGURED;
-					/* Increment sequence number to indicate superblock update */
-					ec_bdev->sb->seq_number++;
-					/* Write superblock asynchronously */
-					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
-					break;
-				}
-			}
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+						       EC_SB_BASE_BDEV_CONFIGURED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
 		}
 
 		/* Turn off LED for all healthy disks (rebuild completed, no need to blink anymore) */
@@ -164,6 +159,13 @@ ec_rebuild_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success, void
 	if (!success) {
 		SPDK_ERRLOG("Rebuild read failed for stripe %lu on EC bdev %s\n",
 			    rebuild_ctx->current_stripe, ec_bdev->bdev.name);
+		
+		/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+						       EC_SB_BASE_BDEV_FAILED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
+		
 		if (rebuild_ctx->rebuild_done_cb) {
 			rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, -EIO);
 		}
@@ -189,6 +191,13 @@ ec_rebuild_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success, void
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to decode stripe %lu during rebuild: %s\n",
 				    rebuild_ctx->current_stripe, spdk_strerror(-rc));
+			
+			/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+			if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+							       EC_SB_BASE_BDEV_FAILED)) {
+				ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+			}
+			
 			if (rebuild_ctx->rebuild_done_cb) {
 				rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, rc);
 			}
@@ -220,6 +229,13 @@ ec_rebuild_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success, void
 			} else {
 				SPDK_ERRLOG("Failed to write stripe %lu during rebuild: %s\n",
 					    rebuild_ctx->current_stripe, spdk_strerror(-rc));
+				
+				/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+				if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+								       EC_SB_BASE_BDEV_FAILED)) {
+					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+				}
+				
 				if (rebuild_ctx->rebuild_done_cb) {
 					rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, rc);
 				}
@@ -276,6 +292,25 @@ ec_rebuild_next_stripe(void *ctx)
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to select base bdevs for rebuild stripe %lu\n",
 			    rebuild_ctx->current_stripe);
+		
+		/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+		if (ec_bdev->sb != NULL) {
+			uint8_t i;
+			for (i = 0; i < ec_bdev->sb->base_bdevs_size; i++) {
+				if (ec_bdev->sb->base_bdevs[i].slot == rebuild_ctx->target_slot) {
+					ec_bdev->sb->base_bdevs[i].state = EC_SB_BASE_BDEV_FAILED;
+					/* Increment sequence number to indicate superblock update */
+					ec_bdev->sb->seq_number++;
+					/* Update CRC */
+					ec_bdev->sb->crc = 0;
+					ec_bdev->sb->crc = spdk_crc32c_update(ec_bdev->sb, ec_bdev->sb->length, 0);
+					/* Write superblock asynchronously */
+					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+					break;
+				}
+			}
+		}
+		
 		if (rebuild_ctx->rebuild_done_cb) {
 			rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, rc);
 		}
@@ -319,6 +354,13 @@ ec_rebuild_next_stripe(void *ctx)
 	if (num_available < k) {
 		SPDK_ERRLOG("Not enough available blocks (%u < %u) for rebuild stripe %lu\n",
 			    num_available, k, rebuild_ctx->current_stripe);
+		
+		/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+						       EC_SB_BASE_BDEV_FAILED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
+		
 		if (rebuild_ctx->rebuild_done_cb) {
 			rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, -ENODEV);
 		}
@@ -363,6 +405,13 @@ ec_rebuild_next_stripe(void *ctx)
 			} else {
 				SPDK_ERRLOG("Failed to read block %u for rebuild stripe %lu: %s\n",
 					    idx, rebuild_ctx->current_stripe, spdk_strerror(-rc));
+				
+				/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+				if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+								       EC_SB_BASE_BDEV_FAILED)) {
+					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+				}
+				
 				if (rebuild_ctx->rebuild_done_cb) {
 					rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, rc);
 				}
@@ -415,6 +464,12 @@ ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_
 		}
 	}
 
+	/* Update superblock to mark base bdev as REBUILDING before starting rebuild */
+	if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+					       EC_SB_BASE_BDEV_REBUILDING)) {
+		ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+	}
+
 	/* Calculate total stripes */
 	uint64_t total_strips = ec_bdev->bdev.blockcnt / ec_bdev->strip_size;
 	rebuild_ctx->total_stripes = total_strips / ec_bdev->k;
@@ -428,6 +483,11 @@ ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_
 	rebuild_ctx->rebuild_ch = spdk_get_io_channel(&ec_bdev->bdev);
 	if (rebuild_ctx->rebuild_ch == NULL) {
 		SPDK_ERRLOG("Failed to get I/O channel for rebuild\n");
+		/* Revert superblock state from REBUILDING to FAILED */
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+						       EC_SB_BASE_BDEV_FAILED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
 		free(rebuild_ctx);
 		return -ENOMEM;
 	}
@@ -439,6 +499,11 @@ ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_
 						       strip_size_bytes * ec_bdev->k);
 	if (rebuild_ctx->stripe_buf == NULL) {
 		SPDK_ERRLOG("Failed to allocate stripe buffer for rebuild\n");
+		/* Revert superblock state from REBUILDING to FAILED */
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+						       EC_SB_BASE_BDEV_FAILED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
 		spdk_put_io_channel(rebuild_ctx->rebuild_ch);
 		free(rebuild_ctx);
 		return -ENOMEM;
@@ -447,6 +512,11 @@ ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_
 	rebuild_ctx->recover_buf = spdk_dma_malloc(strip_size_bytes, ec_bdev->buf_alignment, NULL);
 	if (rebuild_ctx->recover_buf == NULL) {
 		SPDK_ERRLOG("Failed to allocate recovery buffer for rebuild\n");
+		/* Revert superblock state from REBUILDING to FAILED */
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
+						       EC_SB_BASE_BDEV_FAILED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
 		ec_put_rmw_stripe_buf(ec_ch, rebuild_ctx->stripe_buf,
 				      strip_size_bytes * ec_bdev->k);
 		spdk_put_io_channel(rebuild_ctx->rebuild_ch);
@@ -482,6 +552,15 @@ ec_bdev_stop_rebuild(struct ec_bdev *ec_bdev)
 	}
 
 	SPDK_NOTICELOG("Stopping rebuild for EC bdev %s\n", ec_bdev->bdev.name);
+	
+	/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+	if (ec_bdev->rebuild_ctx != NULL) {
+		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, ec_bdev->rebuild_ctx->target_slot,
+						      EC_SB_BASE_BDEV_FAILED)) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
+	}
+	
 	ec_bdev->rebuild_ctx->paused = true;
 
 	if (ec_bdev->rebuild_ctx->rebuild_done_cb) {

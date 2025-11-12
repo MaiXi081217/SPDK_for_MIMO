@@ -158,6 +158,81 @@ ec_bdev_sb_update_crc(struct ec_bdev_superblock *sb)
 	sb->crc = spdk_crc32c_update(sb, sb->length, 0);
 }
 
+/*
+ * Update superblock base bdev state for a specific slot
+ * This helper function reduces code duplication across the codebase
+ */
+bool
+ec_bdev_sb_update_base_bdev_state(struct ec_bdev *ec_bdev, uint8_t slot,
+				   enum ec_bdev_sb_base_bdev_state new_state)
+{
+	struct ec_bdev_superblock *sb;
+	uint8_t i;
+
+	if (ec_bdev == NULL || ec_bdev->sb == NULL) {
+		return false;
+	}
+
+	sb = ec_bdev->sb;
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		if (sb->base_bdevs[i].slot == slot) {
+			sb->base_bdevs[i].state = new_state;
+			sb->seq_number++;
+			ec_bdev_sb_update_crc(sb);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Find superblock base bdev entry by slot number
+ * Returns pointer to the entry if found, NULL otherwise
+ */
+const struct ec_bdev_sb_base_bdev *
+ec_bdev_sb_find_base_bdev_by_slot(struct ec_bdev *ec_bdev, uint8_t slot)
+{
+	struct ec_bdev_superblock *sb;
+	uint8_t i;
+
+	if (ec_bdev == NULL || ec_bdev->sb == NULL) {
+		return NULL;
+	}
+
+	sb = ec_bdev->sb;
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		if (sb->base_bdevs[i].slot == slot) {
+			return &sb->base_bdevs[i];
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * Find superblock base bdev entry by UUID
+ * Returns pointer to the entry if found, NULL otherwise
+ */
+const struct ec_bdev_sb_base_bdev *
+ec_bdev_sb_find_base_bdev_by_uuid(const struct ec_bdev_superblock *sb,
+				   const struct spdk_uuid *uuid)
+{
+	uint8_t i;
+
+	if (sb == NULL || uuid == NULL) {
+		return NULL;
+	}
+
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		if (spdk_uuid_compare(&sb->base_bdevs[i].uuid, uuid) == 0) {
+			return &sb->base_bdevs[i];
+		}
+	}
+
+	return NULL;
+}
+
 static bool
 ec_bdev_sb_check_crc(struct ec_bdev_superblock *sb)
 {

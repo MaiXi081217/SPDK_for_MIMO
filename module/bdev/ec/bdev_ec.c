@@ -58,6 +58,7 @@ static int ec_start(struct ec_bdev *ec_bdev);
 static void ec_stop(struct ec_bdev *ec_bdev);
 static struct ec_bdev *ec_bdev_find_by_uuid(const struct spdk_uuid *uuid);
 static struct ec_base_bdev_info *ec_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
+static const char *ec_rebuild_state_to_str(enum ec_rebuild_state state);
 static int ec_bdev_create_from_sb(const struct ec_bdev_superblock *sb, struct ec_bdev **ec_bdev_out);
 static int ec_bdev_configure_base_bdev(struct ec_base_bdev_info *base_info, bool existing,
 				       ec_base_bdev_cb cb_fn, void *cb_ctx);
@@ -430,6 +431,28 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", ec_bdev->num_base_bdevs_discovered);
 	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
 				     ec_bdev->num_base_bdevs_operational);
+
+	/* Output rebuild progress if rebuild is in progress */
+	if (ec_bdev->rebuild_ctx != NULL && !ec_bdev->rebuild_ctx->paused) {
+		struct ec_rebuild_context *rebuild_ctx = ec_bdev->rebuild_ctx;
+		double percent = 0.0;
+
+		if (rebuild_ctx->total_stripes > 0) {
+			percent = (double)rebuild_ctx->current_stripe * 100.0 /
+				  (double)rebuild_ctx->total_stripes;
+		}
+
+		spdk_json_write_named_object_begin(w, "rebuild");
+		spdk_json_write_named_string(w, "target", rebuild_ctx->target_base_info->name);
+		spdk_json_write_named_uint8(w, "target_slot", rebuild_ctx->target_slot);
+		spdk_json_write_named_object_begin(w, "progress");
+		spdk_json_write_named_uint64(w, "current_stripe", rebuild_ctx->current_stripe);
+		spdk_json_write_named_uint64(w, "total_stripes", rebuild_ctx->total_stripes);
+		spdk_json_write_named_double(w, "percent", percent);
+		spdk_json_write_named_string(w, "state", ec_rebuild_state_to_str(rebuild_ctx->state));
+		spdk_json_write_object_end(w);
+		spdk_json_write_object_end(w);
+	}
 
 	spdk_json_write_name(w, "base_bdevs_list");
 	spdk_json_write_array_begin(w);
@@ -1177,6 +1200,26 @@ ec_bdev_state_to_str(enum ec_bdev_state state)
 	}
 
 	return g_ec_state_names[state];
+}
+
+/*
+ * Rebuild state names for EC bdev
+ */
+static const char *g_ec_rebuild_state_names[] = {
+	[EC_REBUILD_STATE_IDLE]		= "idle",
+	[EC_REBUILD_STATE_READING]	= "reading",
+	[EC_REBUILD_STATE_DECODING]	= "decoding",
+	[EC_REBUILD_STATE_WRITING]	= "writing"
+};
+
+const char *
+ec_rebuild_state_to_str(enum ec_rebuild_state state)
+{
+	if (state > EC_REBUILD_STATE_WRITING) {
+		return "unknown";
+	}
+
+	return g_ec_rebuild_state_names[state];
 }
 
 /*
@@ -2538,7 +2581,6 @@ _ec_bdev_fail_base_bdev(void *ctx)
 	struct ec_base_bdev_info *base_info = ctx;
 	struct ec_bdev *ec_bdev;
 	uint8_t slot;
-	uint8_t i;
 	char pcie_bdf[32] = "N/A";
 
 	if (base_info == NULL) {
@@ -2589,24 +2631,20 @@ _ec_bdev_fail_base_bdev(void *ctx)
 	ec_bdev_set_healthy_disks_led(ec_bdev, SPDK_VMD_LED_STATE_REBUILD);
 
 	/* Update superblock if it exists */
+	/* Find the slot in superblock and update its state to FAILED if it's CONFIGURED or REBUILDING */
 	if (ec_bdev->sb != NULL) {
-		struct ec_bdev_superblock *sb = ec_bdev->sb;
+		const struct ec_bdev_sb_base_bdev *sb_base = ec_bdev_sb_find_base_bdev_by_slot(ec_bdev, slot);
 
-		/* Find the slot in superblock and update its state to FAILED */
-		for (i = 0; i < sb->base_bdevs_size; i++) {
-			if (sb->base_bdevs[i].slot == slot) {
-				if (sb->base_bdevs[i].state == EC_SB_BASE_BDEV_CONFIGURED) {
-					sb->base_bdevs[i].state = EC_SB_BASE_BDEV_FAILED;
-					/* Increment sequence number to indicate superblock update */
-					sb->seq_number++;
-					/* Update CRC */
-					sb->crc = 0;
-					sb->crc = spdk_crc32c_update(sb, sb->length, 0);
+		if (sb_base != NULL) {
+			/* Update state to FAILED if it's CONFIGURED or REBUILDING */
+			if (sb_base->state == EC_SB_BASE_BDEV_CONFIGURED ||
+			    sb_base->state == EC_SB_BASE_BDEV_REBUILDING) {
+				if (ec_bdev_sb_update_base_bdev_state(ec_bdev, slot,
+								       EC_SB_BASE_BDEV_FAILED)) {
 					/* Write superblock asynchronously - but don't remove the base bdev yet */
 					ec_bdev_write_superblock(ec_bdev, ec_bdev_fail_base_bdev_write_sb_cb, base_info);
-					return;
 				}
-				break;
+				return;
 			}
 		}
 	}
@@ -2831,16 +2869,9 @@ ec_bdev_configure_base_bdev(struct ec_base_bdev_info *base_info, bool existing,
 		uint8_t slot_idx = (uint8_t)(base_info - ec_bdev->base_bdev_info);
 		bool needs_rebuild = false;
 		const char *rebuild_reason = NULL;
-		uint8_t i;
 		
 		/* Find this slot in superblock */
-		const struct ec_bdev_sb_base_bdev *sb_base = NULL;
-		for (i = 0; i < ec_bdev->sb->base_bdevs_size; i++) {
-			if (ec_bdev->sb->base_bdevs[i].slot == slot_idx) {
-				sb_base = &ec_bdev->sb->base_bdevs[i];
-				break;
-			}
-		}
+		const struct ec_bdev_sb_base_bdev *sb_base = ec_bdev_sb_find_base_bdev_by_slot(ec_bdev, slot_idx);
 		
 		if (sb_base != NULL) {
 			/* IMPORTANT: Check if slot is already CONFIGURED in EC bdev's superblock.
@@ -2874,32 +2905,40 @@ ec_bdev_configure_base_bdev(struct ec_base_bdev_info *base_info, bool existing,
 					rebuild_reason = "UUID mismatch with CONFIGURED slot (old disk re-inserted?)";
 				}
 			} else {
-				/* Slot is MISSING or FAILED - check if this is a replacement disk */
+				/* Slot is MISSING, FAILED, or REBUILDING - check if this is a replacement disk */
 				if (sb_base->state == EC_SB_BASE_BDEV_MISSING ||
-				    sb_base->state == EC_SB_BASE_BDEV_FAILED) {
-					/* Check if UUID matches - if it matches, this is the old failed disk re-inserted */
-					if (!spdk_uuid_is_null(&sb_base->uuid) &&
-					    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) == 0) {
-					/* Same UUID - this is the old failed disk re-inserted.
-					 * Since rebuild has completed (we're in ONLINE state), we should
-					 * NOT rebuild again. Instead, we should update the superblock to CONFIGURED.
+				    sb_base->state == EC_SB_BASE_BDEV_FAILED ||
+				    sb_base->state == EC_SB_BASE_BDEV_REBUILDING) {
+					/* REBUILDING state means rebuild was in progress but not completed.
+					 * We should always rebuild in this case, regardless of UUID.
 					 */
-					SPDK_WARNLOG("Base bdev %s (slot %u) of EC bdev %s with UUID matching FAILED/MISSING slot "
-						     "re-inserted, but rebuild has already completed. "
-						     "This is likely an old disk with stale superblock. "
-						     "Updating superblock to CONFIGURED state.\n",
-						     base_info->name, slot_idx, ec_bdev->bdev.name);
-					/* Update superblock to CONFIGURED - modify EC bdev's superblock directly */
-					ec_bdev->sb->base_bdevs[i].state = EC_SB_BASE_BDEV_CONFIGURED;
-					ec_bdev->sb->seq_number++;
-					ec_bdev->sb->crc = 0;
-					ec_bdev->sb->crc = spdk_crc32c_update(ec_bdev->sb, ec_bdev->sb->length, 0);
-					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
-					needs_rebuild = false;
-					} else {
-						/* Different UUID - this is a replacement disk */
+					if (sb_base->state == EC_SB_BASE_BDEV_REBUILDING) {
 						needs_rebuild = true;
-						rebuild_reason = "slot was previously MISSING/FAILED (replacement disk)";
+						rebuild_reason = "previous rebuild was not completed (REBUILDING state)";
+					} else {
+						/* Check if UUID matches - if it matches, this is the old failed disk re-inserted */
+						if (!spdk_uuid_is_null(&sb_base->uuid) &&
+						    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) == 0) {
+						/* Same UUID - this is the old failed disk re-inserted.
+						 * Since rebuild has completed (we're in ONLINE state), we should
+						 * NOT rebuild again. Instead, we should update the superblock to CONFIGURED.
+						 */
+						SPDK_WARNLOG("Base bdev %s (slot %u) of EC bdev %s with UUID matching FAILED/MISSING slot "
+							     "re-inserted, but rebuild has already completed. "
+							     "This is likely an old disk with stale superblock. "
+							     "Updating superblock to CONFIGURED state.\n",
+							     base_info->name, slot_idx, ec_bdev->bdev.name);
+						/* Update superblock to CONFIGURED */
+						if (ec_bdev_sb_update_base_bdev_state(ec_bdev, slot_idx,
+								       EC_SB_BASE_BDEV_CONFIGURED)) {
+							ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+						}
+						needs_rebuild = false;
+						} else {
+							/* Different UUID - this is a replacement disk */
+							needs_rebuild = true;
+							rebuild_reason = "slot was previously MISSING/FAILED (replacement disk)";
+						}
 					}
 				}
 				
@@ -3094,7 +3133,6 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	const struct ec_bdev_sb_base_bdev *sb_base_bdev = NULL;
 	struct ec_bdev *ec_bdev;
 	struct ec_base_bdev_info *base_info, *iter;
-	uint8_t i;
 	int rc = 0;
 
 	SPDK_DEBUGLOG(bdev_ec, "examine_cont called for bdev %s, sb=%p\n", bdev->name, sb);
@@ -3167,17 +3205,9 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	}
 
 	/* Find the base bdev in superblock */
-	for (i = 0; i < sb->base_bdevs_size; i++) {
-		sb_base_bdev = &sb->base_bdevs[i];
+	sb_base_bdev = ec_bdev_sb_find_base_bdev_by_uuid(sb, spdk_bdev_get_uuid(bdev));
 
-		assert(spdk_uuid_is_null(&sb_base_bdev->uuid) == false);
-
-		if (spdk_uuid_compare(&sb_base_bdev->uuid, spdk_bdev_get_uuid(bdev)) == 0) {
-			break;
-		}
-	}
-
-	if (i == sb->base_bdevs_size) {
+	if (sb_base_bdev == NULL) {
 		/* This bdev's UUID is not in the superblock - it's a new/foreign disk
 		 * User must manually add it to EC bdev using RPC 'bdev_ec_add_base_bdev' */
 		SPDK_DEBUGLOG(bdev_ec, "EC superblock does not contain this bdev's uuid - "
@@ -3278,14 +3308,20 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 		
 		/* Slot is not occupied, check superblock state */
 		if (sb_base_bdev->state == EC_SB_BASE_BDEV_MISSING ||
-		    sb_base_bdev->state == EC_SB_BASE_BDEV_FAILED) {
-			/* Re-adding a MISSING or FAILED disk */
+		    sb_base_bdev->state == EC_SB_BASE_BDEV_FAILED ||
+		    sb_base_bdev->state == EC_SB_BASE_BDEV_REBUILDING) {
+			/* Re-adding a MISSING, FAILED, or REBUILDING disk */
 			assert(base_info->is_configured == false);
 			assert(spdk_uuid_is_null(&base_info->uuid));
 			spdk_uuid_copy(&base_info->uuid, &sb_base_bdev->uuid);
 			/* is_data_block is kept for superblock compatibility but not used */
 			base_info->is_data_block = sb_base_bdev->is_data_block;
-			SPDK_NOTICELOG("Re-adding bdev %s to EC bdev %s.\n", bdev->name, ec_bdev->bdev.name);
+			if (sb_base_bdev->state == EC_SB_BASE_BDEV_REBUILDING) {
+				SPDK_NOTICELOG("Re-adding bdev %s to EC bdev %s (previous rebuild was not completed).\n",
+					       bdev->name, ec_bdev->bdev.name);
+			} else {
+				SPDK_NOTICELOG("Re-adding bdev %s to EC bdev %s.\n", bdev->name, ec_bdev->bdev.name);
+			}
 			rc = ec_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
 			if (rc != 0) {
 				SPDK_ERRLOG("Failed to configure bdev %s as base bdev of EC %s: %s\n",
