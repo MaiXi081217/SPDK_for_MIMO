@@ -223,6 +223,9 @@ struct ec_bdev {
 
 	/* Flag to track if alignment warning has been logged (to avoid log spam) */
 	bool				alignment_warned;
+
+	/* Rebuild state and context */
+	struct ec_rebuild_context	*rebuild_ctx;
 };
 
 #define EC_FOR_EACH_BASE_BDEV(e, i) \
@@ -397,6 +400,7 @@ const char *ec_bdev_state_to_str(enum ec_bdev_state state);
 void ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w);
 void ec_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
 int ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, void *cb_ctx);
+void ec_bdev_fail_base_bdev(struct ec_base_bdev_info *base_info);
 int ec_bdev_gen_decode_matrix(struct ec_bdev *ec_bdev, uint8_t *frag_err_list, int nerrs);
 
 /* Extension interface functions */
@@ -498,6 +502,8 @@ void ec_bdev_write_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb,
 			       void *cb_ctx);
 void ec_bdev_wipe_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb,
 			     void *cb_ctx);
+int ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
+					     ec_base_bdev_cb cb, void *cb_ctx);
 int ec_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 				      ec_bdev_load_sb_cb cb, void *cb_ctx);
 
