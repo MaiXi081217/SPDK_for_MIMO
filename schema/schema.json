@@ -4952,7 +4952,7 @@
           "name": "raid_level",
           "type": "string",
           "required": true,
-          "description": "RAID level"
+          "description": "RAID level (raid0, raid1, raid10/10, concat)"
         },
         {
           "name": "base_bdevs",

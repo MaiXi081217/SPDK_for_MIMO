@@ -1321,7 +1321,8 @@ static struct {
 	{ "raid5f", RAID5F },
 	{ "5f", RAID5F },
 	{ "concat", CONCAT },
-	{ }
+	{ "raid10", RAID10 },
+	{ "10", RAID10 },
 };
 
 const char *g_raid_state_names[] = {
@@ -2256,6 +2257,60 @@ raid_bdev_process_base_bdev_remove(struct raid_bdev_process *process,
 	return 0;
 }
 
+/* Forward declaration */
+static int _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
+				       raid_base_bdev_cb cb_fn, void *cb_ctx);
+
+/*
+ * Callback after wiping superblock - continue with removal
+ */
+static void
+raid_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
+{
+	struct raid_base_bdev_info *base_info = ctx;
+	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	raid_base_bdev_cb cb_fn = base_info->remove_cb;
+	void *cb_ctx = base_info->remove_cb_ctx;
+	int ret;
+
+	if (status != 0) {
+		/* Wipe failed, but continue with removal anyway */
+		SPDK_WARNLOG("Failed to wipe superblock on base bdev '%s', continuing with removal\n",
+			     base_info->name ? base_info->name : "unknown");
+	}
+
+	if (raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
+		raid_bdev_free_base_bdev_resource(base_info);
+		base_info->remove_scheduled = false;
+		if (raid_bdev->num_base_bdevs_discovered == 0 &&
+		    raid_bdev->state == RAID_BDEV_STATE_OFFLINE) {
+			raid_bdev_cleanup_and_free(raid_bdev);
+		}
+		if (cb_fn != NULL) {
+			cb_fn(cb_ctx, 0);
+		}
+		return;
+	}
+
+	if (raid_bdev->min_base_bdevs_operational == raid_bdev->num_base_bdevs) {
+		raid_bdev->num_base_bdevs_operational--;
+		raid_bdev_deconfigure(raid_bdev, cb_fn, cb_ctx);
+		return;
+	}
+	if (raid_bdev->process != NULL) {
+		ret = raid_bdev_process_base_bdev_remove(raid_bdev->process, base_info);
+	} else {
+		ret = raid_bdev_remove_base_bdev_quiesce(base_info);
+	}
+
+	if (ret != 0) {
+		base_info->remove_scheduled = false;
+		if (cb_fn != NULL) {
+			cb_fn(cb_ctx, ret);
+		}
+	}
+}
+
 static int
 _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 			    raid_base_bdev_cb cb_fn, void *cb_ctx)
@@ -2273,39 +2328,43 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 
 	assert(base_info->desc);
 	base_info->remove_scheduled = true;
+	base_info->remove_cb = cb_fn;
+	base_info->remove_cb_ctx = cb_ctx;
+
+	/* Try to wipe superblock first (if disk is failed, this might fail, which is OK) */
+	if (base_info->desc != NULL && base_info->app_thread_ch != NULL) {
+		int rc = raid_bdev_wipe_single_base_bdev_superblock(base_info,
+								     raid_bdev_remove_base_bdev_after_wipe,
+								     base_info);
+		if (rc == 0) {
+			return 0;
+		}
+		/* Wipe failed - callback already called. Don't clear remove_scheduled/remove_cb/remove_cb_ctx. */
+		SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s', removal handled by wipe callback\n",
+			     base_info->name ? base_info->name : "unknown");
+		return rc;
+	}
+	SPDK_DEBUGLOG(bdev_raid, "Cannot wipe superblock - base bdev desc or channel is NULL\n");
 
 	if (raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
-		/*
-		 * As raid bdev is not registered yet or already unregistered,
-		 * so cleanup should be done here itself.
-		 *
-		 * Removing a base bdev at this stage does not change the number of operational
-		 * base bdevs, only the number of discovered base bdevs.
-		 */
 		raid_bdev_free_base_bdev_resource(base_info);
 		base_info->remove_scheduled = false;
 		if (raid_bdev->num_base_bdevs_discovered == 0 &&
 		    raid_bdev->state == RAID_BDEV_STATE_OFFLINE) {
-			/* There is no base bdev for this raid, so free the raid device. */
 			raid_bdev_cleanup_and_free(raid_bdev);
 		}
 		if (cb_fn != NULL) {
 			cb_fn(cb_ctx, 0);
 		}
 	} else if (raid_bdev->min_base_bdevs_operational == raid_bdev->num_base_bdevs) {
-		/* This raid bdev does not tolerate removing a base bdev. */
 		raid_bdev->num_base_bdevs_operational--;
 		raid_bdev_deconfigure(raid_bdev, cb_fn, cb_ctx);
 	} else {
-		base_info->remove_cb = cb_fn;
-		base_info->remove_cb_ctx = cb_ctx;
-
 		if (raid_bdev->process != NULL) {
 			ret = raid_bdev_process_base_bdev_remove(raid_bdev->process, base_info);
 		} else {
 			ret = raid_bdev_remove_base_bdev_quiesce(base_info);
 		}
-
 		if (ret != 0) {
 			base_info->remove_scheduled = false;
 		}
@@ -3353,6 +3412,10 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
 	spdk_for_each_channel_continue(i, 0);
 }
 
+/* Forward declarations for helper functions */
+static const struct raid_bdev_sb_base_bdev *
+raid_bdev_sb_find_base_bdev_by_slot(const struct raid_bdev *raid_bdev, uint8_t slot);
+
 static void
 raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 {
@@ -3369,6 +3432,46 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 		/* To assure is_process_target is set before is_configured when checked in raid_bdev_create_cb() */
 		spdk_for_each_channel(raid_bdev, raid_bdev_ch_sync, base_info, _raid_bdev_configure_base_bdev_cont);
 		return;
+	}
+
+	/* For RAID10: Check if this slot is already occupied (scenario 4: old disk re-inserted after rebuild) */
+	if (raid_bdev->level == RAID10 && raid_bdev->state == RAID_BDEV_STATE_ONLINE && raid_bdev->sb != NULL) {
+		uint8_t slot_idx = raid_bdev_base_bdev_slot(base_info);
+
+		/* Check if slot is already occupied by another disk */
+		if (base_info->is_configured || base_info->name != NULL) {
+			/* Slot is already occupied - this disk cannot be added */
+			const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot_idx);
+			const char *uuid_match_info = "";
+
+			if (sb_base != NULL && sb_base->state == RAID_SB_BASE_BDEV_CONFIGURED) {
+				/* Check if UUID matches - if it matches, this is the old disk re-inserted */
+				if (!spdk_uuid_is_null(&sb_base->uuid) &&
+				    !spdk_uuid_is_null(&base_info->uuid) &&
+				    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) == 0) {
+					uuid_match_info = " (UUID matches - this is the old disk that was replaced)";
+				} else {
+					uuid_match_info = " (UUID mismatch - different disk)";
+				}
+			}
+
+			SPDK_NOTICELOG("===========================================================\n");
+			SPDK_NOTICELOG("Base bdev '%s' (slot %u) cannot be added to RAID bdev '%s' because the slot is already occupied.%s\n",
+				       base_info->name, slot_idx, raid_bdev->bdev.name, uuid_match_info);
+			SPDK_NOTICELOG("The RAID bdev is already fully configured with another disk in this slot.\n");
+			SPDK_NOTICELOG("If you don't need this disk for the RAID bdev, please clear its superblock\n");
+			SPDK_NOTICELOG("using RPC 'bdev_wipe_superblock' to make it available for other use.\n");
+			SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", base_info->name);
+			SPDK_NOTICELOG("===========================================================\n");
+
+			raid_bdev_free_base_bdev_resource(base_info);
+			if (base_info->configure_cb) {
+				configure_cb = base_info->configure_cb;
+				base_info->configure_cb = NULL;
+				configure_cb(base_info->configure_cb_ctx, -EEXIST);
+			}
+			return;
+		}
 	}
 
 	base_info->is_configured = true;
@@ -3404,6 +3507,120 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 		rc = 0;
 	}
 
+	/* For RAID10: Check if this base bdev needs rebuild after configuration */
+	if (raid_bdev->level == RAID10 && raid_bdev->state == RAID_BDEV_STATE_ONLINE && raid_bdev->sb != NULL) {
+		uint8_t slot_idx = raid_bdev_base_bdev_slot(base_info);
+		bool needs_rebuild = false;
+		const char *rebuild_reason = NULL;
+
+		/* Find this slot in superblock */
+		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot_idx);
+
+		if (sb_base != NULL) {
+			/* Check if slot is already CONFIGURED in RAID bdev's superblock.
+			 * If it's CONFIGURED, it means rebuild has already completed, and this
+			 * might be an old disk with stale superblock that was re-inserted.
+			 * In this case, we should NOT trigger rebuild again.
+			 */
+			if (sb_base->state == RAID_SB_BASE_BDEV_CONFIGURED) {
+				/* Slot is already CONFIGURED - rebuild has completed.
+				 * Check if this is the same disk (UUID matches) or a different disk.
+				 */
+				if (!spdk_uuid_is_null(&sb_base->uuid) &&
+				    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) == 0) {
+					/* Same disk - this is the disk that was rebuilt.
+					 * No need to rebuild again, just update its superblock if needed.
+					 */
+					SPDK_NOTICELOG("Base bdev %s (slot %u) is already CONFIGURED in RAID bdev %s superblock. "
+						       "This appears to be the same disk that was rebuilt. Skipping rebuild.\n",
+						       base_info->name, slot_idx, raid_bdev->bdev.name);
+					needs_rebuild = false;
+				} else {
+					/* Different disk - this is a replacement disk, but slot is already CONFIGURED.
+					 * This shouldn't happen in normal flow, but if it does, we should rebuild
+					 * to ensure data consistency.
+					 */
+					SPDK_WARNLOG("Base bdev %s (slot %u) UUID doesn't match expected UUID in RAID bdev %s, "
+						     "but slot is CONFIGURED. This might be an old disk re-inserted. "
+						     "Will rebuild to ensure data consistency.\n",
+						     base_info->name, slot_idx, raid_bdev->bdev.name);
+					needs_rebuild = true;
+					rebuild_reason = "UUID mismatch with CONFIGURED slot (old disk re-inserted?)";
+				}
+			} else {
+				/* Slot is MISSING or FAILED - check if this is a replacement disk */
+				if (sb_base->state == RAID_SB_BASE_BDEV_MISSING ||
+				    sb_base->state == RAID_SB_BASE_BDEV_FAILED) {
+					/* Check if UUID matches - if it matches, this is the old failed disk re-inserted */
+					if (!spdk_uuid_is_null(&sb_base->uuid) &&
+					    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) == 0) {
+						/* Same UUID - this is the old failed disk that was repaired and re-inserted.
+						 * We should ALWAYS rebuild in this case because:
+						 * 1. The disk may have been repaired, but its data may be stale
+						 * 2. Even if the system is in degraded mode, we need to rebuild to restore redundancy
+						 * 3. Even if another disk was used to rebuild, the original disk's data is outdated
+						 */
+						needs_rebuild = true;
+						rebuild_reason = "old failed disk re-inserted after repair (UUID matches)";
+					} else {
+						/* Different UUID - this is a replacement disk */
+						needs_rebuild = true;
+						rebuild_reason = "slot was previously MISSING/FAILED (replacement disk)";
+					}
+				}
+
+				/* Check if UUID doesn't match expected UUID (wrong disk or new disk) */
+				if (!needs_rebuild && !spdk_uuid_is_null(&sb_base->uuid) &&
+				    spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) != 0) {
+					needs_rebuild = true;
+					rebuild_reason = "UUID mismatch (new disk or wrong disk)";
+				}
+
+				/* If UUID is null in base_info, this is a new disk without superblock */
+				if (!needs_rebuild && spdk_uuid_is_null(&base_info->uuid)) {
+					needs_rebuild = true;
+					rebuild_reason = "new disk without superblock";
+				}
+			}
+		} else {
+			/* Slot not found in superblock - this shouldn't happen, but treat as needs rebuild */
+			needs_rebuild = true;
+			rebuild_reason = "slot not found in superblock";
+		}
+
+		/* Additional check: if base_info->uuid was set from examine but doesn't match
+		 * the expected UUID in superblock, we need rebuild */
+		if (!needs_rebuild && sb_base != NULL && !spdk_uuid_is_null(&sb_base->uuid)) {
+			if (spdk_uuid_compare(&base_info->uuid, &sb_base->uuid) != 0) {
+				needs_rebuild = true;
+				rebuild_reason = "UUID mismatch with superblock";
+			}
+		}
+
+		/* If this is a new disk (no superblock), we need to write superblock and rebuild */
+		if (!needs_rebuild && spdk_uuid_is_null(&base_info->uuid)) {
+			needs_rebuild = true;
+			rebuild_reason = "new disk - needs superblock write and rebuild";
+		}
+
+		if (needs_rebuild && raid_bdev->process == NULL) {
+			/* Start rebuild for this base bdev */
+			SPDK_NOTICELOG("Starting automatic rebuild for base bdev %s (slot %u) on RAID bdev %s: %s\n",
+				       base_info->name, slot_idx, raid_bdev->bdev.name,
+				       rebuild_reason ? rebuild_reason : "unknown reason");
+			base_info->is_process_target = true;
+			raid_bdev->num_base_bdevs_operational++;
+			rc = raid_bdev_start_rebuild(base_info);
+			if (rc != 0) {
+				SPDK_WARNLOG("Failed to start rebuild for base bdev %s: %s\n",
+					     base_info->name, spdk_strerror(-rc));
+				/* Don't fail configuration if rebuild start fails */
+				base_info->is_process_target = false;
+				raid_bdev->num_base_bdevs_operational--;
+			}
+		}
+	}
+
 	if (configure_cb != NULL) {
 		configure_cb(base_info->configure_cb_ctx, rc);
 	}
@@ -3412,25 +3629,107 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 static void raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bdev,
 				 raid_base_bdev_cb cb_fn, void *cb_ctx);
 
+/* Helper function to find base bdev in superblock by UUID */
+static const struct raid_bdev_sb_base_bdev *
+raid_bdev_sb_find_base_bdev_by_uuid(const struct raid_bdev_superblock *sb,
+				     const struct spdk_uuid *uuid)
+{
+	uint8_t i;
+
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		const struct raid_bdev_sb_base_bdev *sb_base = &sb->base_bdevs[i];
+		if (spdk_uuid_compare(&sb_base->uuid, uuid) == 0) {
+			return sb_base;
+		}
+	}
+	return NULL;
+}
+
+/* Helper function to find base bdev in superblock by slot */
+static const struct raid_bdev_sb_base_bdev *
+raid_bdev_sb_find_base_bdev_by_slot(const struct raid_bdev *raid_bdev, uint8_t slot)
+{
+	const struct raid_bdev_superblock *sb = raid_bdev->sb;
+	uint8_t i;
+
+	if (sb == NULL) {
+		return NULL;
+	}
+
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		const struct raid_bdev_sb_base_bdev *sb_base = &sb->base_bdevs[i];
+		if (sb_base->slot == slot) {
+			return sb_base;
+		}
+	}
+	return NULL;
+}
+
 static void
 raid_bdev_configure_base_bdev_check_sb_cb(const struct raid_bdev_superblock *sb, int status,
 		void *ctx)
 {
 	struct raid_base_bdev_info *base_info = ctx;
+	struct raid_bdev *raid_bdev = base_info->raid_bdev;
 	raid_base_bdev_cb configure_cb = base_info->configure_cb;
+	struct spdk_bdev *bdev;
 
 	switch (status) {
 	case 0:
 		/* valid superblock found */
 		base_info->configure_cb = NULL;
-		if (spdk_uuid_compare(&base_info->raid_bdev->bdev.uuid, &sb->uuid) == 0) {
-			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
-
-			raid_bdev_free_base_bdev_resource(base_info);
-			raid_bdev_examine_sb(sb, bdev, configure_cb, base_info->configure_cb_ctx);
-			return;
+		if (spdk_uuid_compare(&raid_bdev->bdev.uuid, &sb->uuid) == 0) {
+			/* Superblock UUID matches - for RAID10, continue with configuration directly
+			 * Don't call examine_sb because this is manual add, not auto-examine.
+			 * Manual add should use configure_cont which has strict validation
+			 * (slot occupancy check, rebuild decision, etc.)
+			 */
+			if (raid_bdev->level == RAID10) {
+				bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+				raid_bdev_free_base_bdev_resource(base_info);
+				/* Set UUID from superblock if not already set */
+				if (spdk_uuid_is_null(&base_info->uuid)) {
+					const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_uuid(sb, spdk_bdev_get_uuid(bdev));
+					if (sb_base != NULL) {
+						spdk_uuid_copy(&base_info->uuid, &sb_base->uuid);
+					}
+				}
+				/* Continue with configuration using configure_cont for strict validation */
+				raid_bdev_configure_base_bdev_cont(base_info);
+				return;
+			} else {
+				/* For other RAID levels, use existing logic */
+				bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+				raid_bdev_free_base_bdev_resource(base_info);
+				raid_bdev_examine_sb(sb, bdev, configure_cb, base_info->configure_cb_ctx);
+				return;
+			}
 		}
-		SPDK_ERRLOG("Superblock of a different raid bdev found on bdev %s\n", base_info->name);
+		/* Superblock UUID mismatch - this disk belongs to a different RAID group */
+		if (raid_bdev->level == RAID10) {
+			/* Enhanced error message for RAID10 (scenario 5) */
+			char target_uuid_str[SPDK_UUID_STRING_LEN];
+			char found_uuid_str[SPDK_UUID_STRING_LEN];
+
+			spdk_uuid_fmt_lower(target_uuid_str, sizeof(target_uuid_str),
+					    &raid_bdev->bdev.uuid);
+			spdk_uuid_fmt_lower(found_uuid_str, sizeof(found_uuid_str), &sb->uuid);
+
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("ERROR: Base bdev '%s' has a superblock from a different RAID group.\n",
+				    base_info->name);
+			SPDK_ERRLOG("Target RAID bdev UUID: %s\n", target_uuid_str);
+			SPDK_ERRLOG("Found superblock UUID: %s (RAID bdev: %s)\n",
+				    found_uuid_str, sb->name);
+			SPDK_ERRLOG("This disk cannot be added to RAID bdev '%s'.\n",
+				    raid_bdev->bdev.name);
+			SPDK_ERRLOG("ACTION REQUIRED: Please clear the superblock on this disk\n");
+			SPDK_ERRLOG("using RPC 'bdev_wipe_superblock' before adding it to the RAID group.\n");
+			SPDK_ERRLOG("Example: bdev_wipe_superblock -b %s\n", base_info->name);
+			SPDK_ERRLOG("===========================================================\n");
+		} else {
+			SPDK_ERRLOG("Superblock of a different raid bdev found on bdev %s\n", base_info->name);
+		}
 		status = -EEXIST;
 		raid_bdev_free_base_bdev_resource(base_info);
 		break;
@@ -3949,20 +4248,65 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
 	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
 		assert(sb_base_bdev->slot < raid_bdev->num_base_bdevs);
 		base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
-		assert(base_info->is_configured == false);
-		assert(sb_base_bdev->state == RAID_SB_BASE_BDEV_MISSING ||
-		       sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED);
-		assert(spdk_uuid_is_null(&base_info->uuid));
-		spdk_uuid_copy(&base_info->uuid, &sb_base_bdev->uuid);
-		SPDK_NOTICELOG("Re-adding bdev %s to raid bdev %s.\n", bdev->name, raid_bdev->bdev.name);
-		rc = raid_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to configure bdev %s as base bdev of raid %s: %s\n",
-				    bdev->name, raid_bdev->bdev.name, spdk_strerror(-rc));
+
+		/* For RAID10: Check if this slot is already occupied by another disk
+		 * This is a safety check in examine path: if slot is already occupied,
+		 * we don't auto-replace it to avoid accidental data loss.
+		 * User should manually remove the existing disk first if replacement is intended.
+		 */
+		if (raid_bdev->level == RAID10) {
+			if (base_info->is_configured || base_info->name != NULL) {
+				/* RAID bdev is already fully configured, this disk cannot be added */
+				/* This can happen if superblock state is CONFIGURED but slot is occupied */
+				SPDK_NOTICELOG("===========================================================\n");
+				SPDK_NOTICELOG("NVMe bdev '%s' belongs to RAID bdev '%s' (slot %u), but RAID bdev is already fully configured.\n",
+					       bdev->name, raid_bdev->bdev.name, sb_base_bdev->slot);
+				SPDK_NOTICELOG("This disk cannot be automatically added to the RAID bdev as the slot is already occupied.\n");
+				SPDK_NOTICELOG("If you want to replace the existing disk, please:\n");
+				SPDK_NOTICELOG("1. Remove the existing disk using RPC 'bdev_raid_remove_base_bdev'\n");
+				SPDK_NOTICELOG("2. Then this disk will be automatically added on next examine\n");
+				SPDK_NOTICELOG("If you don't need this disk for the RAID bdev, please clear its superblock\n");
+				SPDK_NOTICELOG("using RPC 'bdev_wipe_superblock' to make it available for other use.\n");
+				SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", bdev->name);
+				SPDK_NOTICELOG("===========================================================\n");
+				rc = 0; /* Don't treat as error, just inform user */
+				goto out;
+			}
+		}
+
+		/* Slot is not occupied, check superblock state
+		 * This is the auto-recovery path: if slot is FAILED/MISSING,
+		 * we automatically configure and rebuild the disk.
+		 */
+		if (sb_base_bdev->state == RAID_SB_BASE_BDEV_MISSING ||
+		    sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED) {
+			/* Auto-recovering a MISSING or FAILED disk */
+			assert(base_info->is_configured == false);
+			assert(spdk_uuid_is_null(&base_info->uuid));
+			spdk_uuid_copy(&base_info->uuid, &sb_base_bdev->uuid);
+			SPDK_NOTICELOG("Auto-recovering bdev %s to RAID bdev %s (slot was %s).\n",
+				       bdev->name, raid_bdev->bdev.name,
+				       sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED ? "FAILED" : "MISSING");
+			/* Use existing=true to indicate this is from examine (auto-recovery) */
+			rc = raid_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
+			if (rc != 0) {
+				SPDK_ERRLOG("Failed to configure bdev %s as base bdev of raid %s: %s\n",
+					    bdev->name, raid_bdev->bdev.name, spdk_strerror(-rc));
+				goto out;
+			}
+			/* If rc == 0, raid_bdev_configure_base_bdev will call the callback asynchronously */
+			return;
+		} else if (sb_base_bdev->state == RAID_SB_BASE_BDEV_CONFIGURED) {
+			/* Superblock says CONFIGURED, but slot is not occupied - this is unexpected.
+			 * Continue to normal processing path below to handle it.
+			 */
+		} else {
+			/* Unknown state */
+			SPDK_WARNLOG("Unknown superblock state %u for bdev %s in RAID bdev %s\n",
+				     sb_base_bdev->state, bdev->name, raid_bdev->bdev.name);
+			rc = -EINVAL;
 			goto out;
 		}
-		/* If rc == 0, raid_bdev_configure_base_bdev will call the callback asynchronously */
-		return;
 	}
 
 	if (sb_base_bdev->state != RAID_SB_BASE_BDEV_CONFIGURED) {
