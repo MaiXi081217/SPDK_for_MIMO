@@ -17,6 +17,7 @@ enum raid_level {
 	RAID1			= 1,
 	RAID5F			= 95, /* 0x5f */
 	CONCAT			= 99,
+	RAID10			= 101, 
 };
 
 /*
@@ -559,6 +560,9 @@ void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_
 /* Wipe the superblock on all base bdevs belonging to the specified raid bdev. */
 void raid_bdev_wipe_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb,
 				void *cb_ctx);
+/* Wipe the superblock on a single base bdev (used when removing a base bdev). */
+int raid_bdev_wipe_single_base_bdev_superblock(struct raid_base_bdev_info *base_info,
+						raid_base_bdev_cb cb, void *cb_ctx);
 int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 					raid_bdev_load_sb_cb cb, void *cb_ctx);
 

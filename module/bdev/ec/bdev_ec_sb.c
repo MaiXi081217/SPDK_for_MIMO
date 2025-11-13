@@ -762,7 +762,6 @@ ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
 
 	ec_bdev = base_info->ec_bdev;
 	if (ec_bdev == NULL || ec_bdev->sb_io_buf_size == 0) {
-		/* No superblock to wipe */
 		if (cb != NULL) {
 			cb(cb_ctx, 0);
 		}
@@ -807,27 +806,18 @@ ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
 			     ctx->zero_buf, 0, ec_bdev->sb_io_buf_size,
 			     ec_bdev_wipe_single_base_bdev_sb_cb, ctx);
 	if (rc != 0) {
-		if (rc == -ENOMEM) {
-			/* I/O queue full - cannot wipe superblock immediately */
-			SPDK_WARNLOG("I/O queue full, cannot wipe superblock immediately\n");
-			spdk_dma_free(ctx->zero_buf);
-			free(ctx);
-			if (cb != NULL) {
-				cb(cb_ctx, -ENOMEM);
-			}
-			return -ENOMEM;
-		}
-
-		SPDK_WARNLOG("Failed to submit superblock wipe I/O: %s\n", spdk_strerror(-rc));
 		spdk_dma_free(ctx->zero_buf);
 		free(ctx);
+		if (rc == -ENOMEM) {
+			SPDK_WARNLOG("I/O queue full, cannot wipe superblock immediately\n");
+		} else {
+			SPDK_WARNLOG("Failed to submit superblock wipe I/O: %s\n", spdk_strerror(-rc));
+		}
 		if (cb != NULL) {
 			cb(cb_ctx, rc);
 		}
 		return rc;
 	}
-
-	/* Buffer will be freed in callback */
 	return 0;
 }
 

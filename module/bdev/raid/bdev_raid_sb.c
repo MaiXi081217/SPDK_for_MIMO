@@ -523,4 +523,123 @@ err:
 	cb(rc, raid_bdev, cb_ctx);
 }
 
+/*
+ * Context for wiping single base bdev superblock
+ */
+struct raid_bdev_wipe_single_sb_ctx {
+	struct raid_base_bdev_info *base_info;
+	void *zero_buf;
+	raid_base_bdev_cb cb;
+	void *cb_ctx;
+};
+
+/*
+ * Callback for wiping single base bdev superblock
+ */
+static void
+raid_bdev_wipe_single_base_bdev_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct raid_bdev_wipe_single_sb_ctx *ctx = cb_arg;
+	int status = 0;
+
+	if (!success) {
+		/* Don't treat wipe failure as critical - disk might already be bad */
+		SPDK_WARNLOG("Failed to wipe superblock on bdev %s (this is OK if disk is already failed)\n",
+			     bdev_io->bdev->name);
+		status = -EIO;
+		/* Continue anyway - wipe failure is not critical */
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	/* Free the zero buffer */
+	if (ctx->zero_buf != NULL) {
+		spdk_dma_free(ctx->zero_buf);
+	}
+
+	/* Call user callback */
+	if (ctx->cb != NULL) {
+		ctx->cb(ctx->cb_ctx, status);
+	}
+
+	free(ctx);
+}
+
+/*
+ * Wipe superblock on a single base bdev
+ * This is used when removing a base bdev
+ */
+int
+raid_bdev_wipe_single_base_bdev_superblock(struct raid_base_bdev_info *base_info,
+					    raid_base_bdev_cb cb, void *cb_ctx)
+{
+	struct raid_bdev *raid_bdev;
+	struct raid_bdev_wipe_single_sb_ctx *ctx;
+	int rc;
+
+	if (base_info == NULL) {
+		return -EINVAL;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL || raid_bdev->sb_io_buf_size == 0) {
+		if (cb != NULL) {
+			cb(cb_ctx, 0);
+		}
+		return 0;
+	}
+
+	if (base_info->desc == NULL || base_info->app_thread_ch == NULL) {
+		SPDK_WARNLOG("Cannot wipe superblock - base bdev desc or channel is NULL\n");
+		if (cb != NULL) {
+			cb(cb_ctx, -ENODEV);
+		}
+		return -ENODEV;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		if (cb != NULL) {
+			cb(cb_ctx, -ENOMEM);
+		}
+		return -ENOMEM;
+	}
+
+	ctx->base_info = base_info;
+	ctx->cb = cb;
+	ctx->cb_ctx = cb_ctx;
+
+	/* Allocate zero buffer for wiping */
+	ctx->zero_buf = spdk_dma_malloc(raid_bdev->sb_io_buf_size, 0x1000, NULL);
+	if (ctx->zero_buf == NULL) {
+		SPDK_ERRLOG("Failed to allocate buffer for wiping superblock\n");
+		free(ctx);
+		if (cb != NULL) {
+			cb(cb_ctx, -ENOMEM);
+		}
+		return -ENOMEM;
+	}
+
+	memset(ctx->zero_buf, 0, raid_bdev->sb_io_buf_size);
+
+	/* Write zeros to superblock area */
+	rc = spdk_bdev_write(base_info->desc, base_info->app_thread_ch,
+			    ctx->zero_buf, 0, raid_bdev->sb_io_buf_size,
+			    raid_bdev_wipe_single_base_bdev_sb_cb, ctx);
+	if (rc != 0) {
+		spdk_dma_free(ctx->zero_buf);
+		free(ctx);
+		if (rc == -ENOMEM) {
+			SPDK_WARNLOG("I/O queue full, cannot wipe superblock immediately\n");
+		} else {
+			SPDK_WARNLOG("Failed to submit superblock wipe I/O: %s\n", spdk_strerror(-rc));
+		}
+		if (cb != NULL) {
+			cb(cb_ctx, rc);
+		}
+		return rc;
+	}
+	return 0;
+}
+
 SPDK_LOG_REGISTER_COMPONENT(bdev_raid_sb)
