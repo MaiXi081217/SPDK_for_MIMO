@@ -3282,176 +3282,6 @@ ec_bdev_examine_cont_wrapper(struct spdk_bdev *bdev, const struct ec_bdev_superb
 }
 
 /*
- * Helper: handle examine when no superblock is found on the base bdev.
- */
-static void
-ec_bdev_examine_handle_no_sb(struct spdk_bdev *bdev, ec_base_bdev_cb cb_fn, void *cb_ctx)
-{
-	SPDK_DEBUGLOG(bdev_ec, "No superblock found on bdev %s - this is a new disk\n", bdev->name);
-
-	/* No superblock - this is a new disk. User must manually add it to EC bdev
-	 * using RPC 'bdev_ec_add_base_bdev'. We don't auto-match to FAILED/MISSING slots.
-	 * This is intentional: examine only auto-recovers known disks (with superblock),
-	 * new disks require explicit user action to avoid accidental addition.
-	 */
-	ec_bdev_examine_no_sb(bdev);
-
-	if (cb_fn) {
-		cb_fn(cb_ctx, 0);
-	} else {
-		/* Ensure examine_done is always called */
-		ec_bdev_examine_done_cb(bdev, 0);
-	}
-}
-
-/*
- * Helper: validate superblock basic fields and find (or update) existing EC bdev.
- * On success:
- * - returns 0
- * - sets *pec_bdev to found EC bdev (or NULL if not found)
- * - may update *psb to point to ec_bdev->sb when seq_number is older
- */
-static int
-ec_bdev_examine_validate_sb_and_find_ec(const struct ec_bdev_superblock **psb,
-					struct spdk_bdev *bdev,
-					struct ec_bdev **pec_bdev)
-{
-	const struct ec_bdev_superblock *sb = *psb;
-	struct ec_bdev *ec_bdev;
-
-	if (sb->block_size != spdk_bdev_get_data_block_size(bdev)) {
-		SPDK_WARNLOG("Bdev %s block size (%u) does not match the value in superblock (%u)\n",
-			     bdev->name, sb->block_size, spdk_bdev_get_data_block_size(bdev));
-		return -EINVAL;
-	}
-
-	if (spdk_uuid_is_null(&sb->uuid)) {
-		SPDK_WARNLOG("NULL EC bdev UUID in superblock on bdev %s\n", bdev->name);
-		return -EINVAL;
-	}
-
-	ec_bdev = ec_bdev_find_by_uuid(&sb->uuid);
-	*pec_bdev = ec_bdev;
-
-	if (ec_bdev == NULL) {
-		return 0;
-	}
-
-	if (ec_bdev->sb == NULL) {
-		SPDK_WARNLOG("EC superblock is null\n");
-		return -EINVAL;
-	}
-
-	if (sb->seq_number > ec_bdev->sb->seq_number) {
-		SPDK_DEBUGLOG(bdev_ec,
-			      "EC superblock seq_number on bdev %s (%lu) greater than existing EC bdev %s (%lu)\n",
-			      bdev->name, sb->seq_number, ec_bdev->bdev.name, ec_bdev->sb->seq_number);
-
-		if (ec_bdev->state != EC_BDEV_STATE_CONFIGURING) {
-			SPDK_WARNLOG("Newer version of EC bdev %s superblock found on bdev %s but EC bdev is not in configuring state.\n",
-				     ec_bdev->bdev.name, bdev->name);
-			return -EBUSY;
-		}
-
-		/* remove and then recreate the EC bdev using the newer superblock - don't wipe superblock */
-		ec_bdev_delete(ec_bdev, false, NULL, NULL);
-		*pec_bdev = NULL;
-	} else if (sb->seq_number < ec_bdev->sb->seq_number) {
-		SPDK_DEBUGLOG(bdev_ec,
-			      "EC superblock seq_number on bdev %s (%lu) smaller than existing EC bdev %s (%lu)\n",
-			      bdev->name, sb->seq_number, ec_bdev->bdev.name, ec_bdev->sb->seq_number);
-		/* use the current EC bdev superblock */
-		*psb = ec_bdev->sb;
-	}
-
-	return 0;
-}
-
-/*
- * Helper: handle the case when EC bdev does not exist yet and needs to be
- * created from superblock. This function may update cb_fn/cb_ctx so that
- * ec_bdev_examine_cont continues to use ec_bdev_examine_others as callback.
- */
-static int
-ec_bdev_examine_handle_new_ec_bdev(const struct ec_bdev_superblock *sb,
-				   const struct ec_bdev_sb_base_bdev *sb_base_bdev,
-				   struct spdk_bdev *bdev,
-				   ec_base_bdev_cb *pcb_fn, void **pcb_ctx,
-				   struct ec_bdev **pec_bdev)
-{
-	struct ec_bdev_examine_others_ctx *ctx;
-	struct ec_bdev *ec_bdev;
-	struct ec_base_bdev_info *base_info;
-	int rc;
-
-	ctx = calloc(1, sizeof(*ctx));
-	if (ctx == NULL) {
-		return -ENOMEM;
-	}
-
-	rc = ec_bdev_create_from_sb(sb, &ec_bdev);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to create EC bdev %s: %s\n",
-			    sb->name, spdk_strerror(-rc));
-		free(ctx);
-		return rc;
-	}
-
-	/* after this base bdev is configured, examine other base bdevs that may be present */
-	spdk_uuid_copy(&ctx->ec_bdev_uuid, &sb->uuid);
-	ctx->cb_fn = *pcb_fn;
-	ctx->cb_ctx = *pcb_ctx;
-
-	*pcb_fn = ec_bdev_examine_others;
-	*pcb_ctx = ctx;
-	*pec_bdev = ec_bdev;
-
-	/* For newly created EC bdev from superblock, we need to configure the current base bdev.
-	 * Find the base_info for this bdev and set its name before configuring. */
-	assert(sb_base_bdev->slot < ec_bdev->num_base_bdevs);
-	base_info = &ec_bdev->base_bdev_info[sb_base_bdev->slot];
-
-	/* Set base_info->name if not set (from superblock creation, name is not set) */
-	if (base_info->name == NULL) {
-		base_info->name = strdup(spdk_bdev_get_name(bdev));
-		if (base_info->name == NULL) {
-			SPDK_ERRLOG("Failed to allocate name for base bdev %s\n",
-				    spdk_bdev_get_name(bdev));
-			free(ctx);
-			return -ENOMEM;
-		}
-	}
-
-	/* Configure this base bdev */
-	if (base_info->is_configured) {
-		SPDK_DEBUGLOG(bdev_ec, "Base bdev %s already configured for EC bdev %s\n",
-			      bdev->name, ec_bdev->bdev.name);
-		/* If EC bdev is not registered yet, trigger configure_cont to check if all
-		 * base bdevs are configured and register the EC bdev.
-		 * Only trigger if state is CONFIGURING to avoid duplicate calls. */
-		if (ec_bdev->state == EC_BDEV_STATE_CONFIGURING) {
-			struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
-			if (registered_bdev == NULL || registered_bdev != &ec_bdev->bdev) {
-				SPDK_DEBUGLOG(bdev_ec, "EC bdev %s not registered yet, triggering configure_cont\n",
-					      ec_bdev->bdev.name);
-				ec_bdev_configure_cont(ec_bdev);
-			}
-		}
-		return 0;
-	}
-
-	SPDK_DEBUGLOG(bdev_ec, "Configuring base bdev %s for EC bdev %s from superblock\n",
-		      bdev->name, ec_bdev->bdev.name);
-	rc = ec_bdev_configure_base_bdev(base_info, true, *pcb_fn, *pcb_ctx);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to configure bdev %s as base bdev of EC %s: %s\n",
-			    bdev->name, ec_bdev->bdev.name, spdk_strerror(-rc));
-	}
-
-	return rc;
-}
-
-/*
  * brief:
  * ec_bdev_examine_cont continues examine process
  * params:
@@ -3467,15 +3297,26 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 		   ec_base_bdev_cb cb_fn, void *cb_ctx)
 {
 	const struct ec_bdev_sb_base_bdev *sb_base_bdev = NULL;
-	struct ec_bdev *ec_bdev = NULL;
+	struct ec_bdev *ec_bdev;
 	struct ec_base_bdev_info *base_info, *iter;
-	const struct ec_bdev_superblock *cur_sb = sb;
 	int rc = 0;
 
 	SPDK_DEBUGLOG(bdev_ec, "examine_cont called for bdev %s, sb=%p\n", bdev->name, sb);
-
 	if (sb == NULL) {
-		ec_bdev_examine_handle_no_sb(bdev, cb_fn, cb_ctx);
+		SPDK_DEBUGLOG(bdev_ec, "No superblock found on bdev %s - this is a new disk\n", bdev->name);
+		/* No superblock - this is a new disk. User must manually add it to EC bdev
+		 * using RPC 'bdev_ec_add_base_bdev'. We don't auto-match to FAILED/MISSING slots.
+		 * This is intentional: examine only auto-recovers known disks (with superblock),
+		 * new disks require explicit user action to avoid accidental addition.
+		 */
+		/* Try examine_no_sb for EC bdevs without superblock */
+		ec_bdev_examine_no_sb(bdev);
+		if (cb_fn) {
+			cb_fn(cb_ctx, 0);
+		} else {
+			/* Ensure examine_done is always called */
+			ec_bdev_examine_done_cb(bdev, 0);
+		}
 		return;
 	}
 
@@ -3486,33 +3327,140 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 			      bdev->name, sb->name, uuid_str);
 	}
 
-	rc = ec_bdev_examine_validate_sb_and_find_ec(&cur_sb, bdev, &ec_bdev);
-	if (rc != 0) {
+	if (sb->block_size != spdk_bdev_get_data_block_size(bdev)) {
+		SPDK_WARNLOG("Bdev %s block size (%u) does not match the value in superblock (%u)\n",
+			     bdev->name, sb->block_size, spdk_bdev_get_data_block_size(bdev));
+		rc = -EINVAL;
 		goto out;
 	}
 
+	if (spdk_uuid_is_null(&sb->uuid)) {
+		SPDK_WARNLOG("NULL EC bdev UUID in superblock on bdev %s\n", bdev->name);
+		rc = -EINVAL;
+		goto out;
+	}
+
+	ec_bdev = ec_bdev_find_by_uuid(&sb->uuid);
+
+	if (ec_bdev) {
+		if (ec_bdev->sb == NULL) {
+			SPDK_WARNLOG("EC superblock is null\n");
+			rc = -EINVAL;
+			goto out;
+		}
+
+		if (sb->seq_number > ec_bdev->sb->seq_number) {
+			SPDK_DEBUGLOG(bdev_ec,
+				      "EC superblock seq_number on bdev %s (%lu) greater than existing EC bdev %s (%lu)\n",
+				      bdev->name, sb->seq_number, ec_bdev->bdev.name, ec_bdev->sb->seq_number);
+
+			if (ec_bdev->state != EC_BDEV_STATE_CONFIGURING) {
+				SPDK_WARNLOG("Newer version of EC bdev %s superblock found on bdev %s but EC bdev is not in configuring state.\n",
+					     ec_bdev->bdev.name, bdev->name);
+				rc = -EBUSY;
+				goto out;
+			}
+
+			/* remove and then recreate the EC bdev using the newer superblock - don't wipe superblock */
+			ec_bdev_delete(ec_bdev, false, NULL, NULL);
+			ec_bdev = NULL;
+		} else if (sb->seq_number < ec_bdev->sb->seq_number) {
+			SPDK_DEBUGLOG(bdev_ec,
+				      "EC superblock seq_number on bdev %s (%lu) smaller than existing EC bdev %s (%lu)\n",
+				      bdev->name, sb->seq_number, ec_bdev->bdev.name, ec_bdev->sb->seq_number);
+			/* use the current EC bdev superblock */
+			sb = ec_bdev->sb;
+		}
+	}
+
 	/* Find the base bdev in superblock */
-	sb_base_bdev = ec_bdev_sb_find_base_bdev_by_uuid(cur_sb, spdk_bdev_get_uuid(bdev));
+	sb_base_bdev = ec_bdev_sb_find_base_bdev_by_uuid(sb, spdk_bdev_get_uuid(bdev));
 
 	if (sb_base_bdev == NULL) {
-		/* This bdev's UUID is not in the superblock - it's a new/foreign disk */
+		/* This bdev's UUID is not in the superblock - it's a new/foreign disk
+		 * User must manually add it to EC bdev using RPC 'bdev_ec_add_base_bdev'
+		 * This is intentional: examine only auto-recovers known disks that are
+		 * already in the superblock, new disks require explicit user action. */
 		SPDK_DEBUGLOG(bdev_ec, "EC superblock does not contain this bdev's uuid - "
 			      "this is a new disk or foreign disk, user must manually add it\n");
 		rc = -EINVAL;
 		goto out;
 	}
 
-	/* If EC bdev does not exist yet, create it from superblock and configure this base bdev. */
 	if (!ec_bdev) {
-		rc = ec_bdev_examine_handle_new_ec_bdev(cur_sb, sb_base_bdev, bdev,
-							&cb_fn, &cb_ctx, &ec_bdev);
+		struct ec_bdev_examine_others_ctx *ctx;
+
+		ctx = calloc(1, sizeof(*ctx));
+		if (ctx == NULL) {
+			rc = -ENOMEM;
+			goto out;
+		}
+
+		rc = ec_bdev_create_from_sb(sb, &ec_bdev);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to create EC bdev %s: %s\n",
+				    sb->name, spdk_strerror(-rc));
+			free(ctx);
+			goto out;
+		}
+
+		/* after this base bdev is configured, examine other base bdevs that may be present */
+		spdk_uuid_copy(&ctx->ec_bdev_uuid, &sb->uuid);
+		ctx->cb_fn = cb_fn;
+		ctx->cb_ctx = cb_ctx;
+
+		cb_fn = ec_bdev_examine_others;
+		cb_ctx = ctx;
+
+		/* For newly created EC bdev from superblock, we need to configure the current base bdev.
+		 * Find the base_info for this bdev and set its name before configuring. */
+		assert(sb_base_bdev->slot < ec_bdev->num_base_bdevs);
+		base_info = &ec_bdev->base_bdev_info[sb_base_bdev->slot];
+		
+		/* Set base_info->name if not set (from superblock creation, name is not set) */
+		if (base_info->name == NULL) {
+			base_info->name = strdup(spdk_bdev_get_name(bdev));
+			if (base_info->name == NULL) {
+				SPDK_ERRLOG("Failed to allocate name for base bdev %s\n",
+					    spdk_bdev_get_name(bdev));
+				free(ctx);
+				rc = -ENOMEM;
+				goto out;
+			}
+		}
+		
+		/* Configure this base bdev */
+		if (base_info->is_configured) {
+			SPDK_DEBUGLOG(bdev_ec, "Base bdev %s already configured for EC bdev %s\n",
+				      bdev->name, ec_bdev->bdev.name);
+			/* If EC bdev is not registered yet, trigger configure_cont to check if all
+			 * base bdevs are configured and register the EC bdev.
+			 * Only trigger if state is CONFIGURING to avoid duplicate calls. */
+			if (ec_bdev->state == EC_BDEV_STATE_CONFIGURING) {
+				struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
+				if (registered_bdev == NULL || registered_bdev != &ec_bdev->bdev) {
+					SPDK_DEBUGLOG(bdev_ec, "EC bdev %s not registered yet, triggering configure_cont\n",
+						      ec_bdev->bdev.name);
+					ec_bdev_configure_cont(ec_bdev);
+				}
+			}
+			rc = 0;
+		} else {
+			SPDK_DEBUGLOG(bdev_ec, "Configuring base bdev %s for EC bdev %s from superblock\n",
+				      bdev->name, ec_bdev->bdev.name);
+			rc = ec_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
+			if (rc != 0) {
+				SPDK_ERRLOG("Failed to configure bdev %s as base bdev of EC %s: %s\n",
+					    bdev->name, ec_bdev->bdev.name, spdk_strerror(-rc));
+			}
+		}
 		goto out;
 	}
 
 	if (ec_bdev->state == EC_BDEV_STATE_ONLINE) {
 		assert(sb_base_bdev->slot < ec_bdev->num_base_bdevs);
 		base_info = &ec_bdev->base_bdev_info[sb_base_bdev->slot];
-
+		
 		/* Check if this slot is already occupied by another disk
 		 * This is a safety check in examine path: if slot is already occupied,
 		 * we don't auto-replace it to avoid accidental data loss.
@@ -3535,7 +3483,7 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 			rc = 0; /* Don't treat as error, just inform user */
 			goto out;
 		}
-
+		
 		/* Slot is not occupied, check superblock state
 		 * This is the auto-recovery path: if slot is FAILED/MISSING/REBUILDING,
 		 * we automatically configure and rebuild the disk.
@@ -3589,7 +3537,7 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	if (ec_bdev->state == EC_BDEV_STATE_ONLINE) {
 		assert(sb_base_bdev->slot < ec_bdev->num_base_bdevs);
 		base_info = &ec_bdev->base_bdev_info[sb_base_bdev->slot];
-
+		
 		if (base_info->is_configured || base_info->name != NULL) {
 			/* EC bdev is already fully configured, this disk cannot be added */
 			SPDK_NOTICELOG("===========================================================\n");
@@ -3644,13 +3592,13 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 	}
 
 out:
-	if (rc != 0) {
-		if (cb_fn) {
-			cb_fn(cb_ctx, rc);
-		} else {
-			ec_bdev_examine_done_cb(bdev, rc);
-		}
-	}
+    if (rc != 0) {
+        if (cb_fn) {
+            cb_fn(cb_ctx, rc);
+        } else {
+            ec_bdev_examine_done_cb(bdev, rc);
+        }
+    }
 }
 
 /* ec_bdev_examine_sb and ec_bdev_examine_no_sb merged into callers */
