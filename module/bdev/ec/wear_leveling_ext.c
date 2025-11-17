@@ -5,6 +5,7 @@
 
 #include "bdev_ec.h"
 #include "bdev_ec_internal.h"
+#include "wear_leveling_ext.h"
 #include "spdk/log.h"
 #include "spdk/bdev.h"
 #include "spdk/nvme.h"
@@ -1368,8 +1369,12 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 	uint8_t operational_count = 0;  /* 可用的base bdev数量 */
 	uint8_t wear_read_success_count = 0;  /* 成功读取磨损信息的数量 */
 	
-	/* 边界检查：确保不会超出数组范围 */
-	if (ec_bdev->num_base_bdevs > EC_MAX_K + EC_MAX_P) {
+	/* 边界检查：确保不会超出数组范围
+	 * 注意：num_base_bdevs 是 uint8_t，最大值是 255
+	 * EC_MAX_K + EC_MAX_P = 510，但实际不可能超过 255
+	 * 这里检查是否超过数组大小限制
+	 */
+	if ((unsigned int)ec_bdev->num_base_bdevs > EC_MAX_K + EC_MAX_P) {
 		SPDK_ERRLOG("EC bdev %s has too many base bdevs (%u > %u)\n",
 			    ec_bdev->bdev.name, ec_bdev->num_base_bdevs, EC_MAX_K + EC_MAX_P);
 		free(wl_ext);
