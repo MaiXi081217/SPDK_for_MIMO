@@ -6,6 +6,7 @@
 #include "spdk/rpc.h"
 #include "spdk/bdev.h"
 #include "bdev_ec.h"
+#include "wear_leveling_ext.h"
 #include "spdk/util.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
@@ -145,6 +146,9 @@ struct rpc_bdev_ec_create {
 
 	/* If set, information about EC bdev will be stored in superblock on each base bdev */
 	bool                                 superblock_enabled;
+
+	/* If set, wear leveling extension will be enabled for this EC bdev */
+	bool                                 wear_leveling_enabled;
 };
 
 /*
@@ -222,6 +226,7 @@ static const struct spdk_json_object_decoder rpc_bdev_ec_create_decoders[] = {
 	{"base_bdevs", offsetof(struct rpc_bdev_ec_create, base_bdevs), decode_ec_base_bdevs},
 	{"uuid", offsetof(struct rpc_bdev_ec_create, uuid), spdk_json_decode_uuid, true},
 	{"superblock", offsetof(struct rpc_bdev_ec_create, superblock_enabled), spdk_json_decode_bool, true},
+	{"wear_leveling", offsetof(struct rpc_bdev_ec_create, wear_leveling_enabled), spdk_json_decode_bool, true},
 };
 
 struct rpc_bdev_ec_create_ctx {
@@ -274,6 +279,19 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 
 	if (--ctx->remaining > 0) {
 		return;
+	}
+
+	/* All base bdevs have been added, check if we need to enable wear leveling */
+	if (ctx->status == 0 && ctx->req.wear_leveling_enabled) {
+		int rc = wear_leveling_ext_register(ctx->ec_bdev);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to register wear leveling extension for EC bdev %s: %s\n",
+				    ctx->req.name, spdk_strerror(-rc));
+			/* Continue anyway - wear leveling is optional */
+		} else {
+			SPDK_NOTICELOG("Wear leveling extension enabled for EC bdev %s\n",
+				       ctx->req.name);
+		}
 	}
 
 	if (ctx->status != 0) {
@@ -580,6 +598,9 @@ rpc_bdev_ec_delete(struct spdk_jsonrpc_request *request,
 	}
 
 	ctx->request = request;
+
+	/* Unregister wear leveling extension if it was enabled */
+	wear_leveling_ext_unregister(ec_bdev);
 
 	/* RPC delete command - wipe superblock */
 	ec_bdev_delete(ec_bdev, true, bdev_ec_delete_done, ctx);
