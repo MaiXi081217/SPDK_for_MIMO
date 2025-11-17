@@ -246,250 +246,216 @@ validate_health_page(struct spdk_nvme_health_information_page *health_page,
  * - 实现参考：xnvme_be_spdk_admin.c 和 lib/nvme/nvme.c
  */
 static int
+_get_nvme_ctrlr_for_health_check(struct spdk_bdev *bdev, struct spdk_nvme_ctrlr **ctrlr_out)
+{
+	const char *module_name;
+	struct spdk_nvme_ctrlr *ctrlr;
+
+	/* Check if it's an NVMe bdev */
+	module_name = spdk_bdev_get_module_name(bdev);
+	if (module_name == NULL || strcmp(module_name, "nvme") != 0) {
+		SPDK_DEBUGLOG(bdev_ec, "Bdev %s is not an NVMe device\n", spdk_bdev_get_name(bdev));
+		return -ENODEV;
+	}
+
+	/* Check if the bdev_nvme_get_ctrlr weak symbol is available */
+	if (bdev_nvme_get_ctrlr == NULL) {
+		SPDK_DEBUGLOG(bdev_ec, "bdev_nvme_get_ctrlr not available (bdev: %s)\n", spdk_bdev_get_name(bdev));
+		return -ENODEV;
+	}
+
+	/* Get the NVMe controller */
+	ctrlr = bdev_nvme_get_ctrlr(bdev);
+	if (ctrlr == NULL) {
+		SPDK_DEBUGLOG(bdev_ec, "Cannot get NVMe controller (bdev: %s)\n", spdk_bdev_get_name(bdev));
+		return -ENODEV;
+	}
+
+	/* Check if the controller is in a failed state */
+	if (spdk_nvme_ctrlr_is_failed(ctrlr)) {
+		SPDK_WARNLOG("NVMe controller is in failed state (bdev: %s)\n", spdk_bdev_get_name(bdev));
+		return -ENODEV;
+	}
+
+	*ctrlr_out = ctrlr;
+	return 0;
+}
+
+/*
+ * Helper to poll for health info command completion.
+ * This encapsulates the busy-wait loop.
+ */
+static int
+_poll_for_health_info_completion(struct spdk_nvme_ctrlr *ctrlr, struct sync_health_read_ctx *ctx,
+				 uint64_t timeout_us, const char *bdev_name)
+{
+	uint64_t poll_count = 0;
+	uint64_t ticks_per_usec = spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+	uint64_t poll_interval_tsc = (ticks_per_usec > 0) ? (10 * ticks_per_usec) : 1;
+	uint32_t max_poll_iterations = (timeout_us >= 10) ? (timeout_us / 10) * 2 : 100000;
+
+	if (max_poll_iterations > 1000000) {
+		max_poll_iterations = 1000000;
+	}
+	if (max_poll_iterations == 0) {
+		max_poll_iterations = 100000;
+	}
+
+	while (!ctx->completed) {
+		if (poll_count++ >= max_poll_iterations) {
+			SPDK_ERRLOG("Max poll iterations reached (bdev: %s, count: %lu), aborting\n",
+				    bdev_name, poll_count);
+			return -ETIMEDOUT;
+		}
+
+		if (spdk_get_ticks() >= ctx->timeout_tsc) {
+			SPDK_ERRLOG("Timeout waiting for health log page (bdev: %s, timeout: %lu us, poll_count: %lu)\n",
+				    bdev_name, timeout_us, poll_count);
+			return -ETIMEDOUT;
+		}
+
+		if (spdk_nvme_ctrlr_is_failed(ctrlr)) {
+			SPDK_WARNLOG("Controller failed during health log page read (bdev: %s, poll_count: %lu)\n",
+				     bdev_name, poll_count);
+			return -ENODEV;
+		}
+
+		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+
+		if (!ctx->completed) {
+			uint64_t next_poll_tsc = spdk_get_ticks() + poll_interval_tsc;
+			while (spdk_get_ticks() < next_poll_tsc && !ctx->completed) {
+				spdk_pause();
+			}
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Helper to process the result of the health info command.
+ * This validates the result and extracts the wear level.
+ */
+static int
+_process_health_info_result(struct sync_health_read_ctx *ctx, const char *bdev_name,
+			    uint8_t *wear_level)
+{
+	int rc;
+
+	if (spdk_nvme_cpl_is_error(&ctx->cpl)) {
+		SPDK_ERRLOG("Failed to get health log page (bdev: %s): %s (sct: %u, sc: %u)\n",
+			    bdev_name, spdk_nvme_cpl_get_status_string(&ctx->cpl.status),
+			    ctx->cpl.status.sct, ctx->cpl.status.sc);
+		return -EIO;
+	}
+
+	rc = validate_health_page(ctx->health_page, bdev_name);
+	if (rc != 0) {
+		SPDK_ERRLOG("Health page validation failed (bdev: %s)\n", bdev_name);
+		return -EIO;
+	}
+
+	/* Double check for robustness */
+	if (ctx->health_page->percentage_used > 100) {
+		SPDK_ERRLOG("Unexpected invalid percentage_used %u after validation (bdev: %s)\n",
+			    ctx->health_page->percentage_used, bdev_name);
+		return -EIO;
+	}
+
+	*wear_level = ctx->health_page->percentage_used;
+	return 0;
+}
+
+/* 从NVMe读取磨损等级（全面优化版本：稳定性、性能、鲁棒性）
+ *
+ * 优化点：
+ * 1. 移除pthread同步原语，使用volatile标志（适配SPDK轮询模式）
+ * 2. 使用SPDK时间函数，避免系统调用
+ * 3. 优化轮询逻辑，减少不必要的延迟
+ * 4. 使用ticks进行超时检查，更高效
+ * 5. 控制器状态检查，确保控制器可用
+ * 6. 数据有效性验证，处理各种异常情况
+ * 7. 完善的错误处理和资源管理
+ * 8. 与磨损分布功能完美契合（返回255表示无效值）
+ * 
+ * 返回值：
+ * 0 - 成功，wear_level 包含有效值（0-100）
+ * -EINVAL - 参数错误
+ * -ENODEV - 设备不可用或无法获取控制器
+ * -ETIMEDOUT - 超时
+ * -EIO - 命令执行失败或数据无效
+ * -ENOMEM - 内存分配失败
+ * 
+ * 注意：
+ * - 如果返回错误，wear_level 不会被修改
+ * - 如果数据无效（percentage_used > 100），返回 -EIO，wear_level 不会被修改
+ * - 这个函数可能很慢（需要NVMe命令），应该被缓存
+ * - 实现参考：xnvme_be_spdk_admin.c 和 lib/nvme/nvme.c
+ */
+static int
 get_nvme_wear_level_from_bdev(struct spdk_bdev *bdev, uint8_t *wear_level)
 {
-	struct spdk_nvme_ctrlr *ctrlr;
-	struct spdk_nvme_health_information_page *health_page;
+	struct spdk_nvme_ctrlr *ctrlr = NULL;
+	struct spdk_nvme_health_information_page *health_page = NULL;
 	struct sync_health_read_ctx ctx;
 	int rc;
 	uint64_t timeout_us = 1000000; /* 1秒超时 */
-	uint64_t ticks_per_usec;
-	uint64_t poll_interval_tsc;  /* 轮询间隔（ticks），约10微秒 */
-	const char *module_name;
 	const char *bdev_name;
-	uint32_t max_poll_iterations = 0;  /* 最大轮询次数（防止无限循环） */
-	uint32_t poll_count = 0;
-	
-	/* 参数检查 */
+
 	if (bdev == NULL || wear_level == NULL) {
 		return -EINVAL;
 	}
-	
+
 	bdev_name = spdk_bdev_get_name(bdev);
-	
-	/* 检查是否是NVMe bdev */
-	module_name = spdk_bdev_get_module_name(bdev);
-	if (module_name == NULL || strcmp(module_name, "nvme") != 0) {
-		/* 不是NVMe bdev，返回错误 */
-		SPDK_DEBUGLOG(bdev_ec, "Bdev %s is not an NVMe device\n", bdev_name);
-		return -ENODEV;
+
+	rc = _get_nvme_ctrlr_for_health_check(bdev, &ctrlr);
+	if (rc != 0) {
+		return rc;
 	}
-	
-	/* 检查 bdev_nvme_get_ctrlr 函数是否可用（弱符号） */
-	if (bdev_nvme_get_ctrlr == NULL) {
-		/* NVMe bdev 模块未链接，返回错误 */
-		SPDK_DEBUGLOG(bdev_ec, "bdev_nvme_get_ctrlr not available (bdev: %s)\n", bdev_name);
-		return -ENODEV;
-	}
-	
-	/* 获取NVMe控制器 */
-	ctrlr = bdev_nvme_get_ctrlr(bdev);
-	if (ctrlr == NULL) {
-		/* 无法获取控制器 */
-		SPDK_DEBUGLOG(bdev_ec, "Cannot get NVMe controller (bdev: %s)\n", bdev_name);
-		return -ENODEV;
-	}
-	
-	/* 检查控制器是否处于失败状态（鲁棒性：提前检测） */
-	if (spdk_nvme_ctrlr_is_failed(ctrlr)) {
-		SPDK_WARNLOG("NVMe controller is in failed state (bdev: %s)\n", bdev_name);
-		return -ENODEV;
-	}
-	
-	/* 计算时间相关常量（避免在循环中重复计算） */
-	ticks_per_usec = spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
-	if (ticks_per_usec == 0) {
-		ticks_per_usec = 1; /* 避免除零 */
-	}
-	
-	/* 轮询间隔：约10微秒（平衡延迟和CPU使用） */
-	poll_interval_tsc = (10 * ticks_per_usec);
-	if (poll_interval_tsc == 0) {
-		poll_interval_tsc = 1;
-	}
-	
-	/* 计算最大轮询次数（防止无限循环，即使超时检查失败）
-	 * 假设每次轮询间隔10微秒，1秒超时 = 100,000次轮询
-	 * 设置一个安全上限：200,000次
-	 * 注意：检查除法溢出和边界情况
-	 */
-	if (timeout_us >= 10) {
-		max_poll_iterations = (timeout_us / 10) * 2;
-		/* 防止溢出：如果结果太大，使用默认值 */
-		if (max_poll_iterations > 1000000) {
-			max_poll_iterations = 1000000; /* 最大1,000,000次 */
-		}
-	} else {
-		/* timeout_us < 10，使用默认值 */
-		max_poll_iterations = 100000; /* 默认值 */
-	}
-	
-	/* 确保 max_poll_iterations 不为0（防止无限循环） */
-	if (max_poll_iterations == 0) {
-		max_poll_iterations = 100000; /* 默认值 */
-	}
-	
-	/* 分配健康信息页缓冲区 */
+
 	health_page = spdk_zmalloc(sizeof(*health_page), 0, NULL,
 				   SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (health_page == NULL) {
 		SPDK_ERRLOG("Failed to allocate health page buffer (bdev: %s)\n", bdev_name);
 		return -ENOMEM;
 	}
-	
-	/* 初始化同步上下文（无锁设计） */
+
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.health_page = health_page;
 	ctx.completed = false;
-	
-	/* 计算超时时间戳（防止溢出） */
-	uint64_t timeout_ticks = timeout_us * ticks_per_usec;
-	uint64_t current_ticks = spdk_get_ticks();
-	if (timeout_ticks > UINT64_MAX - current_ticks) {
-		/* 溢出风险：使用最大可能值 */
-		ctx.timeout_tsc = UINT64_MAX;
-		SPDK_WARNLOG("Timeout calculation overflow (bdev: %s), using max value\n", bdev_name);
-	} else {
-		ctx.timeout_tsc = current_ticks + timeout_ticks;
+
+	uint64_t ticks_per_usec = spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+	if (ticks_per_usec == 0) {
+		ticks_per_usec = 1;
 	}
-	
-	/* 发送获取健康信息日志页命令 */
+	ctx.timeout_tsc = spdk_get_ticks() + timeout_us * ticks_per_usec;
+
 	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr,
-					       SPDK_NVME_LOG_HEALTH_INFORMATION,
-					       SPDK_NVME_GLOBAL_NS_TAG,
-					       health_page,
-					       sizeof(*health_page),
-					       0,
-					       sync_health_read_cb,
-					       &ctx);
+					      SPDK_NVME_LOG_HEALTH_INFORMATION,
+					      SPDK_NVME_GLOBAL_NS_TAG,
+					      health_page,
+					      sizeof(*health_page),
+					      0,
+					      sync_health_read_cb,
+					      &ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to send get log page command (bdev: %s): %s\n",
 			    bdev_name, spdk_strerror(-rc));
 		spdk_free(health_page);
 		return rc;
 	}
-	
-	/* 轮询直到完成或超时（优化：使用SPDK时间，避免系统调用） */
-	while (!ctx.completed) {
-		/* 安全检查：防止无限循环（即使超时检查失败） */
-		if (poll_count++ >= max_poll_iterations) {
-			SPDK_ERRLOG("Max poll iterations reached (bdev: %s, count: %u), aborting\n", 
-				    bdev_name, poll_count);
-			spdk_free(health_page);
-			return -ETIMEDOUT;
-		}
-		
-		/* 检查超时（使用ticks比较，避免除法） */
-		if (spdk_get_ticks() >= ctx.timeout_tsc) {
-			SPDK_ERRLOG("Timeout waiting for health log page (bdev: %s, timeout: %lu us, poll_count: %u)\n",
-				    bdev_name, timeout_us, poll_count);
-			spdk_free(health_page);
-			return -ETIMEDOUT;
-		}
-		
-		/* 再次检查控制器状态（鲁棒性：运行时状态可能变化） */
-		if (spdk_nvme_ctrlr_is_failed(ctrlr)) {
-			SPDK_WARNLOG("Controller failed during health log page read (bdev: %s, poll_count: %u)\n", 
-				     bdev_name, poll_count);
-			spdk_free(health_page);
-			return -ENODEV;
-		}
-		
-		/* 处理完成队列（SPDK需要轮询）
-		 * 注意：这个函数可能返回负数表示错误，但通常不会
-		 * 如果返回负数，可能是控制器错误，但我们继续轮询直到超时或完成
-		 */
-		rc = spdk_nvme_ctrlr_process_admin_completions(ctrlr);
-		if (rc < 0) {
-			/* 处理完成队列失败，可能是控制器错误
-			 * 记录警告，但继续轮询（可能只是临时故障）
-			 */
-			if (poll_count % 10000 == 0) {  /* 每10000次轮询记录一次，避免日志过多 */
-				SPDK_WARNLOG("Failed to process admin completions (bdev: %s, poll_count: %u): %s\n",
-					     bdev_name, poll_count, spdk_strerror(-rc));
-			}
-			/* 继续轮询，等待回调或超时 */
-		}
-		
-		/* 如果还没完成，短暂等待（使用SPDK延迟，避免系统调用）
-		 * 注意：在SPDK轮询模式中，这里实际上不需要延迟，
-		 * 但为了减少CPU占用，可以添加一个非常短的延迟
-		 * 这里使用CPU pause指令（如果可用）或最小延迟
-		 */
-		if (!ctx.completed) {
-			/* 使用SPDK的延迟函数（如果可用），否则使用CPU pause */
-			uint64_t current_tsc = spdk_get_ticks();
-			/* 检查 next_poll_tsc 溢出（防御性编程） */
-			uint64_t next_poll_tsc;
-			if (poll_interval_tsc > UINT64_MAX - current_tsc) {
-				/* 溢出风险：使用最大可能值 */
-				next_poll_tsc = UINT64_MAX;
-			} else {
-				next_poll_tsc = current_tsc + poll_interval_tsc;
-			}
-			
-			/* 忙等待直到轮询间隔（避免系统调用）
-			 * 优化：检查 completed 标志，如果已完成则立即退出
-			 */
-			while (spdk_get_ticks() < next_poll_tsc && !ctx.completed) {
-				spdk_pause();  /* CPU pause指令，降低功耗 */
-			}
-		}
-	}
-	
-	/* 检查命令是否成功 */
-	if (spdk_nvme_cpl_is_error(&ctx.cpl)) {
-		/* 命令执行失败，记录详细的错误信息
-		 * 包括状态码类型（sct）和状态码（sc），便于调试
-		 */
-		SPDK_ERRLOG("Failed to get health log page (bdev: %s): %s (sct: %u, sc: %u, poll_count: %u)\n",
-			    bdev_name,
-			    spdk_nvme_cpl_get_status_string(&ctx.cpl.status),
-			    ctx.cpl.status.sct,
-			    ctx.cpl.status.sc,
-			    poll_count);
-		spdk_free(health_page);
-		return -EIO;
-	}
-	
-	/* 验证健康信息页数据的有效性（鲁棒性：检测数据错误）
-	 * 这个验证确保返回的数据是有效的，与磨损分布功能完美契合
-	 */
-	rc = validate_health_page(health_page, bdev_name);
+
+	rc = _poll_for_health_info_completion(ctrlr, &ctx, timeout_us, bdev_name);
 	if (rc != 0) {
-		/* 数据无效，返回错误（wear_level 不会被修改）
-		 * 调用者应该将 wear_level 视为无效值（255）
-		 */
-		SPDK_ERRLOG("Health page validation failed (bdev: %s, poll_count: %u)\n",
-			    bdev_name, poll_count);
 		spdk_free(health_page);
-		return -EIO;
+		return rc;
 	}
-	
-	/* 提取磨损等级（percentage_used）
-	 * percentage_used 是 0-100 的值，表示SSD的磨损百分比
-	 * 注意：已经通过 validate_health_page 验证，所以这里可以直接使用
-	 * 
-	 * 与磨损分布功能完美契合：
-	 * - 0-100: 有效磨损值，直接使用
-	 * - 如果 validate_health_page 返回错误，这里不会执行
-	 * 
-	 * 双重检查：即使已经验证，再次确认值的范围（防御性编程）
-	 */
-	if (health_page->percentage_used > 100) {
-		/* 不应该发生（因为已经验证），但为了鲁棒性处理 */
-		SPDK_ERRLOG("Unexpected invalid percentage_used %u after validation (bdev: %s)\n",
-			    health_page->percentage_used, bdev_name);
-		spdk_free(health_page);
-		return -EIO;
-	}
-	
-	*wear_level = health_page->percentage_used;
-	
-	/* 清理资源（确保所有路径都正确释放） */
+
+	rc = _process_health_info_result(&ctx, bdev_name, wear_level);
+
 	spdk_free(health_page);
-	
-	return 0;
+	return rc;
 }
 
 /* 获取并缓存block size（避免重复查询）
@@ -889,6 +855,240 @@ get_wear_level_fast(struct wear_leveling_ext *wl_ext, uint8_t idx)
 	return wl_ext->wear_info[idx].wear_level;
 }
 
+/* Helper struct for collecting wear info from candidates */
+struct wear_collection_result {
+	uint32_t weights[EC_MAX_K];
+	uint8_t cached_wear[EC_MAX_K];
+	uint32_t total_weight;
+	uint8_t min_wear;
+	uint8_t max_wear;
+	bool any_needs_reread;
+	uint8_t valid_wear_count;
+};
+
+/*
+ * Collect and validate wear information for candidate data bdevs.
+ * Returns 0 on success, or a negative errno on failure.
+ *
+ * On failure, caller is expected to fall back to default selection.
+ */
+static int
+_collect_and_validate_wear_info(struct wear_leveling_ext *wl_ext,
+				struct ec_bdev *ec_bdev,
+				const uint8_t *candidates, uint8_t k,
+				struct wear_collection_result *result)
+{
+	uint8_t i;
+
+	result->min_wear = 255;
+	result->max_wear = 0;
+	result->any_needs_reread = false;
+	result->valid_wear_count = 0;
+	result->total_weight = 0;
+
+	for (i = 0; i < k; i++) {
+		uint8_t candidate_idx = candidates[i];
+		uint8_t wear;
+
+		if (!is_valid_bdev_idx(ec_bdev, candidate_idx)) {
+			/* Invalid index, caller will fall back to default selection. */
+			SPDK_WARNLOG("Invalid candidate index %u detected\n", candidate_idx);
+			return -ENODEV;
+		}
+
+		struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[candidate_idx];
+		bool is_operational = (base_info->desc != NULL && !base_info->is_failed);
+
+		wl_ext->wear_info[candidate_idx].is_operational = is_operational;
+
+		if (!is_operational) {
+			/* Non-operational bdev, caller will fall back to default selection. */
+			SPDK_WARNLOG("Non-operational base bdev %u detected\n", candidate_idx);
+			return -ENODEV;
+		}
+
+		/* Get wear level: if needs_reread is set, try to refresh first. */
+		if (wl_ext->wear_info[candidate_idx].needs_reread) {
+			uint8_t wear_level;
+			int rc = get_wear_level_with_prediction(wl_ext, candidate_idx, base_info, &wear_level);
+			if (rc == 0) {
+				wear = wear_level;
+			} else {
+				/* Fall back to cached wear if refresh failed. */
+				wear = get_wear_level_fast(wl_ext, candidate_idx);
+			}
+			result->any_needs_reread = true;
+		} else {
+			/* Use cached wear level. */
+			wear = get_wear_level_fast(wl_ext, candidate_idx);
+		}
+
+		result->cached_wear[i] = wear;
+
+		if (wear == 255 || wear > 100) {
+			/* Wear info unavailable or invalid for this bdev. */
+			SPDK_WARNLOG("Cannot get valid wear level from base bdev %u (wear=%u)\n",
+				     candidate_idx, wear);
+			return -EIO;
+		}
+
+		result->valid_wear_count++;
+		if (wear < result->min_wear) {
+			result->min_wear = wear;
+		}
+		if (wear > result->max_wear) {
+			result->max_wear = wear;
+		}
+
+		result->weights[i] = g_wear_weight_table[wear];
+		if (result->total_weight <= UINT32_MAX - result->weights[i]) {
+			result->total_weight += result->weights[i];
+		} else {
+			result->total_weight = UINT32_MAX;
+			SPDK_WARNLOG("total_weight overflow detected\n");
+		}
+	}
+
+	if (result->valid_wear_count == 0) {
+		SPDK_WARNLOG("Cannot get wear level from any candidate, no valid wear info\n");
+		return -EIO;
+	}
+
+	if (result->total_weight == 0) {
+		SPDK_ERRLOG("All candidate base bdevs have zero weight\n");
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+/*
+ * Perform deterministic weighted random selection of k data bdevs.
+ * The selection is based on the provided weights and cached wear levels.
+ */
+static int
+_perform_deterministic_weighted_selection(struct ec_bdev *ec_bdev,
+					  const uint8_t *candidates, uint8_t k,
+					  const struct wear_collection_result *wear_info,
+					  uint64_t stripe_index, uint8_t *data_indices)
+{
+	bool selected[EC_MAX_K] = {false};
+	uint8_t selected_count = 0;
+	uint32_t total_weight = wear_info->total_weight;
+	uint64_t seed64;
+	uint32_t seed;
+	uint8_t i, j;
+
+	if (k == 0 || k > EC_MAX_K) {
+		SPDK_ERRLOG("Invalid k value: %u (expected 1-%u)\n", k, EC_MAX_K);
+		return -EINVAL;
+	}
+
+	if (total_weight == 0) {
+		SPDK_ERRLOG("Total weight is zero, cannot perform weighted selection\n");
+		return -ENODEV;
+	}
+
+	/* Use stripe_index as deterministic seed. */
+	seed64 = stripe_index * 0x9e3779b97f4a7c15ULL;
+	seed64 = (seed64 >> 32) ^ seed64;
+	seed = (uint32_t)seed64;
+
+	for (i = 0; i < k; i++) {
+		/* Linear congruential generator (LCG) for deterministic pseudo-randomness. */
+		seed = seed * 1664525UL + 1013904223UL;
+
+		uint32_t random = (total_weight > 0) ?
+				  (((total_weight & (total_weight - 1)) == 0) ?
+				   (seed & (total_weight - 1)) : (seed % total_weight)) : 0;
+		uint32_t cumulative = 0;
+		bool found = false;
+
+		for (j = 0; j < k; j++) {
+			if (selected[j] || wear_info->weights[j] == 0) {
+				continue;
+			}
+
+			uint32_t new_cumulative = cumulative + wear_info->weights[j];
+			if (new_cumulative < cumulative) {
+				/* Overflow detected, break for safety. */
+				break;
+			}
+			cumulative = new_cumulative;
+
+			if (random < cumulative) {
+				if (selected_count >= k) {
+					SPDK_ERRLOG("selected_count overflow: %u >= k=%u\n",
+						    selected_count, k);
+					return -ENODEV;
+				}
+
+				uint8_t candidate_idx = candidates[j];
+				if (!is_valid_bdev_idx(ec_bdev, candidate_idx)) {
+					SPDK_ERRLOG("Invalid candidate_idx %u\n", candidate_idx);
+					return -ENODEV;
+				}
+
+				data_indices[selected_count++] = candidate_idx;
+				selected[j] = true;
+				total_weight = (total_weight >= wear_info->weights[j]) ?
+					       total_weight - wear_info->weights[j] : 0;
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			/* Fallback: select the unselected candidate with minimum wear (excluding 255). */
+			uint8_t min_wear_idx = 0;
+			uint8_t min_wear_val = 255;
+			bool fallback_found = false;
+
+			for (j = 0; j < k; j++) {
+				if (selected[j] || wear_info->weights[j] == 0) {
+					continue;
+				}
+				uint8_t wear = wear_info->cached_wear[j];
+				if (wear < min_wear_val && wear != 255) {
+					min_wear_val = wear;
+					min_wear_idx = j;
+					fallback_found = true;
+				}
+			}
+
+			if (!fallback_found) {
+				SPDK_ERRLOG("Failed to select base bdev: no available candidates in fallback\n");
+				return -ENODEV;
+			}
+
+			if (selected_count >= k) {
+				SPDK_ERRLOG("selected_count overflow in fallback: %u >= k=%u\n",
+					    selected_count, k);
+				return -ENODEV;
+			}
+
+			uint8_t candidate_idx = candidates[min_wear_idx];
+			if (!is_valid_bdev_idx(ec_bdev, candidate_idx)) {
+				SPDK_ERRLOG("Invalid candidate_idx %u in fallback\n", candidate_idx);
+				return -ENODEV;
+			}
+
+			data_indices[selected_count++] = candidate_idx;
+			selected[min_wear_idx] = true;
+			total_weight = (total_weight >= wear_info->weights[min_wear_idx]) ?
+				       total_weight - wear_info->weights[min_wear_idx] : 0;
+		}
+	}
+
+	if (selected_count != k) {
+		SPDK_ERRLOG("Failed to select %u data bdevs, only selected %u\n",
+			    k, selected_count);
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
 /* 基于磨损程度的权重分配算法（确定性版本）
  * 
  * 算法原理：
@@ -916,22 +1116,12 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 {
 	uint8_t default_data_indices[EC_MAX_K];
 	uint8_t default_parity_indices[EC_MAX_P];
+	struct wear_collection_result wear_info;
 	int rc;
-	
-	/* 先使用默认算法确定候选（确定性的） */
-	rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, 
-					   default_data_indices, default_parity_indices);
-	if (rc != 0) {
-		return rc;
-	}
-	
 	uint8_t k = ec_bdev->k;
 	uint8_t p = ec_bdev->p;
-	uint32_t weights[EC_MAX_K];
-	uint32_t total_weight = 0;
-	uint8_t i, j;
-	
-	/* 边界检查：确保 k 和 p 在有效范围内 */
+
+	/* Basic sanity checks on k and p. */
 	if (k == 0 || k > EC_MAX_K) {
 		SPDK_ERRLOG("Invalid k value: %u (expected 1-%u)\n", k, EC_MAX_K);
 		return -EINVAL;
@@ -940,196 +1130,44 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 		SPDK_ERRLOG("Invalid p value: %u (expected 1-%u)\n", p, EC_MAX_P);
 		return -EINVAL;
 	}
-	
-	/* 使用stripe_index作为伪随机种子（确保确定性）
-	 * 优化：使用更好的哈希函数，提高分布均匀性
-	 */
-	uint64_t seed64 = stripe_index;
-	seed64 = seed64 * 0x9e3779b97f4a7c15ULL;  /* 黄金比例常数 */
-	seed64 = (seed64 >> 32) ^ seed64;  /* 混合高位和低位 */
-	uint32_t seed = (uint32_t)seed64;
-	
-	/* 收集磨损信息并计算权重 */
-	uint8_t min_wear = 255;
-	uint8_t max_wear = 0;
-	bool any_needs_reread = false;
-	uint8_t valid_wear_count = 0;
-	uint8_t cached_wear[EC_MAX_K] = {0};
-	
-	for (i = 0; i < k; i++) {
-		uint8_t candidate_idx = default_data_indices[i];
-		
-		if (!is_valid_bdev_idx(ec_bdev, candidate_idx)) {
-			/* 发现无效索引，立即回退到默认写入模式 */
-			SPDK_WARNLOG("Invalid candidate index %u detected, falling back to default write mode\n", candidate_idx);
-			wl_ext->all_wear_unavailable = true;
-			return copy_default_selection(ec_bdev, default_data_indices, k,
-						      default_parity_indices, p,
-						      data_indices, parity_indices,
-						      "invalid candidate index");
-		}
-		
-		struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[candidate_idx];
-		bool is_operational = (base_info->desc != NULL && !base_info->is_failed);
-		
-		if (candidate_idx < EC_MAX_K + EC_MAX_P) {
-			wl_ext->wear_info[candidate_idx].is_operational = is_operational;
-		}
-		
-		if (!is_operational) {
-			/* 发现不可用的盘，立即回退到默认写入模式 */
-			SPDK_WARNLOG("Non-operational base bdev %u detected, falling back to default write mode\n", candidate_idx);
-			wl_ext->all_wear_unavailable = true;
-			return copy_default_selection(ec_bdev, default_data_indices, k,
-						      default_parity_indices, p,
-						      data_indices, parity_indices,
-						      "non-operational bdev");
-		}
-		
-		uint8_t wear = get_wear_level_fast(wl_ext, candidate_idx);
-		cached_wear[i] = wear;
-		
-		if (candidate_idx < EC_MAX_K + EC_MAX_P &&
-		    wl_ext->wear_info[candidate_idx].needs_reread) {
-			any_needs_reread = true;
-		}
-		
-		if (wear == 255 || wear > 100) {
-			/* 发现无法获取磨损信息的盘，立即回退到默认写入模式 */
-			SPDK_WARNLOG("Cannot get wear level from base bdev %u (wear=%u), falling back to default write mode\n",
-				     candidate_idx, wear);
-			wl_ext->all_wear_unavailable = true;
-			return copy_default_selection(ec_bdev, default_data_indices, k,
-						      default_parity_indices, p,
-						      data_indices, parity_indices,
-						      "wear info unavailable");
-		}
-		
-		valid_wear_count++;
-		if (wear < min_wear) {
-			min_wear = wear;
-		}
-		if (wear > max_wear) {
-			max_wear = wear;
-		}
-		
-		weights[i] = g_wear_weight_table[wear];
-		if (total_weight <= UINT32_MAX - weights[i]) {
-			total_weight += weights[i];
-		} else {
-			total_weight = UINT32_MAX;
-			SPDK_WARNLOG("total_weight overflow detected\n");
-		}
+
+	/* 1. Get default selection as a candidate set. */
+	rc = ec_select_base_bdevs_default(ec_bdev, stripe_index,
+					   default_data_indices, default_parity_indices);
+	if (rc != 0) {
+		return rc;
 	}
-	
-	/* 检查是否所有候选都无法获取磨损信息 */
-	if (valid_wear_count == 0) {
-		SPDK_WARNLOG("Cannot get wear level from any candidate, falling back to default write mode\n");
+
+	/* 2. Collect wear info and validate candidates. */
+	rc = _collect_and_validate_wear_info(wl_ext, ec_bdev, default_data_indices, k, &wear_info);
+	if (rc != 0) {
+		/* Fallback to default if any candidate is invalid or wear is unavailable. */
 		wl_ext->all_wear_unavailable = true;
 		return copy_default_selection(ec_bdev, default_data_indices, k,
 					      default_parity_indices, p,
 					      data_indices, parity_indices,
-					      "no valid wear info");
+					      "wear info collection failed");
 	}
-	
-	/* 快速路径：磨损差异小且不需要重新读取 */
-	if (min_wear < 255 && max_wear < 255 && max_wear >= min_wear &&
-	    (max_wear - min_wear) < WEAR_DIFF_THRESHOLD && !any_needs_reread) {
+
+	/* 3. Fast path: If wear difference is small, use default selection. */
+	if ((wear_info.max_wear - wear_info.min_wear) < WEAR_DIFF_THRESHOLD &&
+	    !wear_info.any_needs_reread) {
 		wl_ext->fast_path_hits++;
 		return copy_default_selection(ec_bdev, default_data_indices, k,
 					      default_parity_indices, p,
 					      data_indices, parity_indices,
 					      "fast path");
 	}
-	
-	if (total_weight == 0) {
-		SPDK_ERRLOG("All candidate base bdevs are not operational\n");
-		return -ENODEV;
+
+	/* 4. Perform deterministic weighted selection for data indices. */
+	rc = _perform_deterministic_weighted_selection(ec_bdev, default_data_indices, k, &wear_info,
+						       stripe_index, data_indices);
+	if (rc != 0) {
+		return rc;
 	}
-	
-	bool selected[EC_MAX_K] = {false};
-	uint8_t selected_data = 0;
-	
-	for (i = 0; i < k; i++) {
-		/* 使用LCG生成确定性随机数 */
-		seed = seed * 1664525UL + 1013904223UL;
-		uint32_t random = (total_weight > 0) ?
-			(((total_weight & (total_weight - 1)) == 0) ?
-			 (seed & (total_weight - 1)) : (seed % total_weight)) : 0;
-		uint32_t cumulative = 0;
-		bool found = false;
-		
-		for (j = 0; j < k; j++) {
-			if (selected[j] || weights[j] == 0) {
-				continue;
-			}
-			
-			uint32_t new_cumulative = cumulative + weights[j];
-			if (new_cumulative < cumulative) {
-				break;
-			}
-			cumulative = new_cumulative;
-			
-			if (random < cumulative) {
-				if (selected_data >= k) {
-					SPDK_ERRLOG("selected_data overflow: %u >= k=%u\n", selected_data, k);
-					return -ENODEV;
-				}
-				uint8_t candidate_idx = default_data_indices[j];
-				if (!is_valid_bdev_idx(ec_bdev, candidate_idx)) {
-					SPDK_ERRLOG("Invalid candidate_idx %u\n", candidate_idx);
-					return -ENODEV;
-				}
-				data_indices[selected_data++] = candidate_idx;
-				selected[j] = true;
-				total_weight = (total_weight >= weights[j]) ? total_weight - weights[j] : 0;
-				found = true;
-				break;
-			}
-		}
-		
-		if (!found) {
-			uint8_t min_wear_idx = 0;
-			uint8_t min_wear_val = 255;
-			
-			for (j = 0; j < k; j++) {
-				if (selected[j] || weights[j] == 0) {
-					continue;
-				}
-				uint8_t wear = cached_wear[j];
-				if (wear < min_wear_val && wear != 255) {
-					min_wear_val = wear;
-					min_wear_idx = j;
-				}
-			}
-			
-			if (min_wear_val == 255) {
-				SPDK_ERRLOG("Failed to select base bdev: no available candidates\n");
-				return -ENODEV;
-			}
-			
-			if (selected_data >= k) {
-				SPDK_ERRLOG("selected_data overflow in fallback: %u >= k=%u\n", selected_data, k);
-				return -ENODEV;
-			}
-			uint8_t candidate_idx = default_data_indices[min_wear_idx];
-			if (!is_valid_bdev_idx(ec_bdev, candidate_idx)) {
-				SPDK_ERRLOG("Invalid candidate_idx %u in fallback\n", candidate_idx);
-				return -ENODEV;
-			}
-			data_indices[selected_data++] = candidate_idx;
-			selected[min_wear_idx] = true;
-			total_weight = (total_weight >= weights[min_wear_idx]) ? total_weight - weights[min_wear_idx] : 0;
-		}
-	}
-	
-	if (selected_data != k) {
-		SPDK_ERRLOG("Failed to select %u data bdevs, only selected %u\n", k, selected_data);
-		return -ENODEV;
-	}
-	
-	/* 校验块使用默认选择 */
-	for (i = 0; i < p; i++) {
+
+	/* 5. Parity indices always use the default selection. */
+	for (uint8_t i = 0; i < p; i++) {
 		uint8_t idx = default_parity_indices[i];
 		if (!is_valid_bdev_idx(ec_bdev, idx)) {
 			SPDK_ERRLOG("Invalid parity index %u\n", idx);
@@ -1137,7 +1175,7 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 		}
 		parity_indices[i] = idx;
 	}
-	
+
 	return 0;
 }
 
