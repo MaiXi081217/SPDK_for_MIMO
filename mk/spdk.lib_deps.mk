@@ -154,6 +154,7 @@ DEPDIRS-bdev_raid := $(BDEV_DEPS_THREAD) trace
 ifeq ($(CONFIG_RAID5F),y)
 DEPDIRS-bdev_raid += accel
 endif
+DEPDIRS-bdev_ec := $(BDEV_DEPS_THREAD) nvme
 DEPDIRS-bdev_rbd := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_uring := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_virtio := $(BDEV_DEPS_THREAD) virtio
