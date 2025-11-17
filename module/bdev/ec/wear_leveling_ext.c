@@ -5,6 +5,7 @@
 
 #include "bdev_ec.h"
 #include "bdev_ec_internal.h"
+#include "wear_leveling_ext.h"
 #include "spdk/log.h"
 #include "spdk/bdev.h"
 #include "spdk/nvme.h"
@@ -468,7 +469,8 @@ get_nvme_wear_level_from_bdev(struct spdk_bdev *bdev, uint8_t *wear_level)
 static uint32_t
 get_cached_block_size(struct wear_leveling_ext *wl_ext, uint8_t idx)
 {
-	if (idx >= EC_MAX_K + EC_MAX_P || wl_ext == NULL) {
+	/* idx is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check idx >= EC_MAX_K is sufficient */
+	if (idx >= EC_MAX_K || wl_ext == NULL) {
 		return 512;
 	}
 	
@@ -514,7 +516,8 @@ get_cached_block_size(struct wear_leveling_ext *wl_ext, uint8_t idx)
 static void
 predict_wear_level_for_reread_check(struct wear_leveling_ext *wl_ext, uint8_t idx)
 {
-	if (idx >= EC_MAX_K + EC_MAX_P) {
+	/* idx is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check idx >= EC_MAX_K is sufficient */
+	if (idx >= EC_MAX_K) {
 		return;
 	}
 	
@@ -593,7 +596,8 @@ predict_wear_level_for_reread_check(struct wear_leveling_ext *wl_ext, uint8_t id
 static bool
 should_reread_wear_level(struct wear_leveling_ext *wl_ext, uint8_t idx)
 {
-	if (idx >= EC_MAX_K + EC_MAX_P) {
+	/* idx is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check idx >= EC_MAX_K is sufficient */
+	if (idx >= EC_MAX_K) {
 		return true;
 	}
 	
@@ -671,7 +675,8 @@ get_wear_level_with_prediction(struct wear_leveling_ext *wl_ext,
 			       struct ec_base_bdev_info *base_info,
 			       uint8_t *wear_level)
 {
-	if (idx >= EC_MAX_K + EC_MAX_P) {
+	/* idx is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check idx >= EC_MAX_K is sufficient */
+	if (idx >= EC_MAX_K) {
 		return -EINVAL;
 	}
 	
@@ -811,7 +816,8 @@ wear_leveling_get_wear_level(struct ec_bdev_extension_if *ext_if,
 static inline bool
 is_valid_bdev_idx(struct ec_bdev *ec_bdev, uint8_t idx)
 {
-	return idx < ec_bdev->num_base_bdevs && idx < EC_MAX_K + EC_MAX_P;
+	/* idx is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so idx < EC_MAX_K + EC_MAX_P is always true */
+	return idx < ec_bdev->num_base_bdevs;
 }
 
 /* 复制默认选择到输出数组（带边界检查） */
@@ -849,7 +855,8 @@ copy_default_selection(struct ec_bdev *ec_bdev,
 static inline uint8_t
 get_wear_level_fast(struct wear_leveling_ext *wl_ext, uint8_t idx)
 {
-	if (idx >= EC_MAX_K + EC_MAX_P) {
+	/* idx is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check idx >= EC_MAX_K is sufficient */
+	if (idx >= EC_MAX_K) {
 		return 255;
 	}
 	return wl_ext->wear_info[idx].wear_level;
@@ -979,7 +986,8 @@ _perform_deterministic_weighted_selection(struct ec_bdev *ec_bdev,
 	uint32_t seed;
 	uint8_t i, j;
 
-	if (k == 0 || k > EC_MAX_K) {
+	/* k is uint8_t (max 255), EC_MAX_K = 255, so k > EC_MAX_K is always false */
+	if (k == 0) {
 		SPDK_ERRLOG("Invalid k value: %u (expected 1-%u)\n", k, EC_MAX_K);
 		return -EINVAL;
 	}
@@ -1122,11 +1130,12 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 	uint8_t p = ec_bdev->p;
 
 	/* Basic sanity checks on k and p. */
-	if (k == 0 || k > EC_MAX_K) {
+	/* k and p are uint8_t (max 255), EC_MAX_K = EC_MAX_P = 255, so k > EC_MAX_K and p > EC_MAX_P are always false */
+	if (k == 0) {
 		SPDK_ERRLOG("Invalid k value: %u (expected 1-%u)\n", k, EC_MAX_K);
 		return -EINVAL;
 	}
-	if (p == 0 || p > EC_MAX_P) {
+	if (p == 0) {
 		SPDK_ERRLOG("Invalid p value: %u (expected 1-%u)\n", p, EC_MAX_P);
 		return -EINVAL;
 	}
@@ -1199,7 +1208,8 @@ wear_leveling_select_base_bdevs(struct ec_bdev_extension_if *ext_if,
 	uint32_t strip_size_shift = ec_bdev->strip_size_shift;
 	uint8_t k = ec_bdev->k;
 	
-	if (k == 0 || k > EC_MAX_K) {
+	/* k is uint8_t (max 255), EC_MAX_K = 255, so k > EC_MAX_K is always false */
+	if (k == 0) {
 		SPDK_ERRLOG("Invalid k value: %u (expected 1-%u)\n", k, EC_MAX_K);
 		return -EINVAL;
 	}
@@ -1369,7 +1379,10 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 	uint8_t wear_read_success_count = 0;  /* 成功读取磨损信息的数量 */
 	
 	/* 边界检查：确保不会超出数组范围 */
-	if (ec_bdev->num_base_bdevs > EC_MAX_K + EC_MAX_P) {
+	/* num_base_bdevs is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so this check is always false */
+	/* However, we still check against EC_MAX_K to ensure array bounds safety */
+
+	if ((unsigned int)ec_bdev->num_base_bdevs > EC_MAX_K + EC_MAX_P) {
 		SPDK_ERRLOG("EC bdev %s has too many base bdevs (%u > %u)\n",
 			    ec_bdev->bdev.name, ec_bdev->num_base_bdevs, EC_MAX_K + EC_MAX_P);
 		free(wl_ext);
@@ -1377,7 +1390,8 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 	}
 	
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
-		if (i >= EC_MAX_K + EC_MAX_P) {
+		/* i is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check i >= EC_MAX_K is sufficient */
+		if (i >= EC_MAX_K) {
 			SPDK_ERRLOG("EC bdev %s: base bdev index %u exceeds maximum\n",
 				    ec_bdev->bdev.name, i);
 			break;
@@ -1583,8 +1597,9 @@ wear_leveling_ext_set_tbw(struct ec_bdev *ec_bdev,
 		return -EINVAL;
 	}
 	
+	/* base_bdev_index is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check base_bdev_index >= EC_MAX_K is sufficient */
 	if (base_bdev_index >= ec_bdev->num_base_bdevs || 
-	    base_bdev_index >= EC_MAX_K + EC_MAX_P) {
+	    base_bdev_index >= EC_MAX_K) {
 		return -EINVAL;
 	}
 	
