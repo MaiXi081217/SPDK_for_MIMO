@@ -1616,7 +1616,8 @@ def add_parser(subparsers):
                                   strip_size_kb=args.strip_size_kb,
                                   base_bdevs=base_bdevs,
                                   uuid=args.uuid,
-                                  superblock=args.superblock))
+                                  superblock=args.superblock,
+                                  wear_leveling_mode=args.wear_leveling_mode))
     
     p = subparsers.add_parser('bdev_ec_create', help='Create new EC (Erasure Code) bdev')
     p.add_argument('-n', '--name', help='EC bdev name', required=True)
@@ -1632,6 +1633,11 @@ def add_parser(subparsers):
     p.add_argument('--uuid', help='UUID for this EC bdev')
     p.add_argument('-s', '--superblock', help='information about EC bdev will be stored in superblock on each base bdev, '
                                               'disabled by default', action='store_true')
+    p.add_argument('-w', '--wear-leveling-mode', dest='wear_leveling_mode', help='''Wear leveling mode (0=DISABLED, 1=SIMPLE, 2=FULL). 
+    0=DISABLED: No wear leveling (most stable, use default EC scheduling)
+    1=SIMPLE: Basic wear leveling using cached wear info only
+    2=FULL: Full wear leveling with NVMe health monitoring and prediction (default)''', 
+                   type=int, default=2, choices=[0, 1, 2])
     p.set_defaults(func=bdev_ec_create)
 
     def bdev_ec_delete(args):

@@ -18,11 +18,9 @@
 #include <stddef.h>
 #include <errno.h>
 
-#define WEAR_LEVELING_EXT_NAME "wear_leveling"
-
-/* 常量定义：避免重复计算 */
-#define GB_TO_BYTES (1024ULL * 1024 * 1024)
-#define TB_TO_GB (1024ULL)
+/* 别名：方便使用头文件中的常量 */
+#define GB_TO_BYTES WEAR_GB_TO_BYTES
+#define TB_TO_GB WEAR_TB_TO_GB
 
 /* 预计算权重表：磨损等级 0-100 对应的权重
  * weight = (100 - wear_level) * 10 + 1
@@ -41,75 +39,28 @@ static const uint32_t g_wear_weight_table[101] = {
 	101, 91, 81, 71, 61, 51, 41, 31, 21, 11, 1        /* 90-100 */
 };
 
-/* 磨损差异阈值：如果所有候选的磨损差异小于此值，使用快速路径（直接使用默认选择） */
-#define WEAR_DIFF_THRESHOLD 5  /* 5% 的磨损差异阈值 */
-
-/* Base bdev磨损信息（优化内存布局，提高缓存局部性）
- * 
- * 优化说明：
- * 1. 移除冗余的index字段（可通过数组索引计算）
- * 2. 使用位域压缩布尔标志，节省内存
- * 3. 将经常一起访问的字段放在一起（wear_level和predicted_wear_level）
- * 4. 对齐到8字节边界，提高访问效率
+/* 
+ * ============================================================================
+ * 内部结构体定义（仅在 .c 文件中使用）
+ * ============================================================================
  */
-struct base_bdev_wear_info {
-	/* 磨损等级（热路径，放在前面） */
-	uint8_t wear_level;         /* 当前磨损等级 0-100（实际读取的，用于制定策略的基准） */
-	uint8_t predicted_wear_level; /* 预测的磨损等级 0-100（仅用于判断是否需要重新读取，不用于选择） */
-	
-	/* 写入统计（经常一起访问） */
-	uint64_t total_writes;      /* 累计写入量（块数） */
-	uint64_t writes_since_last_read; /* 上次读取后的写入量 */
-	
-	/* 时间戳 */
-	uint64_t last_read_timestamp;    /* 上次读取实际磨损的时间戳 */
-	
-	/* 标志位（使用位域节省内存） */
-	unsigned int is_operational : 1;  /* 是否可用 */
-	unsigned int needs_reread : 1;    /* 是否需要重新读取 */
-	unsigned int reserved : 6;        /* 保留位，用于未来扩展 */
-} __attribute__((packed));
 
-/* Base bdev配置信息（TBW和磨损率，经常一起访问） */
-struct base_bdev_config {
-	double tbw;          /* TBW（Total Bytes Written，单位：TB） */
-	double wear_per_gb; /* 每GB磨损率 */
-} __attribute__((packed));
-
-/* 磨损均衡扩展模块（优化内存布局）
- * 
- * 优化说明：
- * 1. 移除未使用的wear_info_timestamp数组
- * 2. 将TBW和wear_per_gb合并为结构体，提高缓存局部性
- * 3. 将配置参数放在一起，统计信息放在一起
- * 4. 优化字段顺序，减少内存对齐浪费
- */
+/* 磨损均衡扩展模块（私有实现结构） */
 struct wear_leveling_ext {
 	/* 扩展接口（必须放在最前面） */
 	struct ec_bdev_extension_if ext_if;
 	struct ec_bdev *ec_bdev;
+
+	/* 数据采集模块 */
+	struct wear_data_provider data;
 	
-	/* 磨损统计信息（热路径数据，放在前面） */
-	struct base_bdev_wear_info wear_info[EC_MAX_K + EC_MAX_P];
-	
-	/* Base bdev配置信息（TBW和磨损率，经常一起访问） */
-	struct base_bdev_config bdev_config[EC_MAX_K + EC_MAX_P];
-	
-	/* 磨损预测参数（配置参数，访问频率较低） */
-	uint64_t wear_predict_threshold_blocks;  /* 写入多少块后重新读取（默认10GB） */
-	uint8_t wear_predict_threshold_percent;  /* 预测磨损变化超过多少百分比时重新读取（默认5%） */
-	uint64_t wear_read_interval_us;          /* 最小读取间隔（微秒，默认30秒） */
-	
-	/* 磨损均衡参数（已移除策略，只使用基于磨损的权重分配） */
-	bool all_wear_unavailable;  /* 如果所有base bdev都无法读取磨损信息，回退到默认选择 */
-	
-	/* 性能优化：缓存block_size（避免重复查询） */
-	uint32_t cached_block_size[EC_MAX_K + EC_MAX_P];
-	
-	/* 性能统计（访问频率低，放在最后） */
-	uint64_t cache_hits;
-	uint64_t cache_misses;
-	uint64_t fast_path_hits;  /* 快速路径命中次数（磨损差异小，直接使用默认选择） */
+	/* 调度策略模块 */
+	struct wear_scheduler_state sched;
+
+	/* 磨损预测参数（仅FULL模式使用） */
+	uint64_t wear_predict_threshold_blocks;  /* 写入多少块后重新读取 */
+	uint8_t wear_predict_threshold_percent;  /* 预测磨损变化超过多少百分比时重新读取 */
+	uint64_t wear_read_interval_us;          /* 最小读取间隔（微秒） */
 };
 
 /* 前向声明：使用弱符号访问 bdev_nvme_get_ctrlr（避免直接依赖 bdev_nvme 模块） */
@@ -475,8 +426,8 @@ get_cached_block_size(struct wear_leveling_ext *wl_ext, uint8_t idx)
 	}
 	
 	/* 如果已缓存，直接返回 */
-	if (wl_ext->cached_block_size[idx] != 0) {
-		return wl_ext->cached_block_size[idx];
+	if (wl_ext->data.cached_block_size[idx] != 0) {
+		return wl_ext->data.cached_block_size[idx];
 	}
 	
 	/* 从bdev获取block size */
@@ -487,7 +438,7 @@ get_cached_block_size(struct wear_leveling_ext *wl_ext, uint8_t idx)
 			if (bdev != NULL) {
 				uint32_t block_size = spdk_bdev_get_block_size(bdev);
 				if (block_size != 0) {
-					wl_ext->cached_block_size[idx] = block_size;
+					wl_ext->data.cached_block_size[idx] = block_size;
 					return block_size;
 				}
 			}
@@ -495,7 +446,7 @@ get_cached_block_size(struct wear_leveling_ext *wl_ext, uint8_t idx)
 	}
 	
 	/* 默认512字节 */
-	wl_ext->cached_block_size[idx] = 512;
+	wl_ext->data.cached_block_size[idx] = 512;
 	return 512;
 }
 
@@ -521,7 +472,7 @@ predict_wear_level_for_reread_check(struct wear_leveling_ext *wl_ext, uint8_t id
 		return;
 	}
 	
-	struct base_bdev_wear_info *info = &wl_ext->wear_info[idx];
+	struct base_bdev_wear_info *info = &wl_ext->data.wear_info[idx];
 	
 	/* 如果基准磨损是无效值（255），不进行预测计算 */
 	if (info->wear_level == 255) {
@@ -551,9 +502,9 @@ predict_wear_level_for_reread_check(struct wear_leveling_ext *wl_ext, uint8_t id
 	 * wear_per_gb = 100 / (TBW * 1024)  // 100%磨损 / (TBW转换为GB)
 	 * 检查 wear_per_gb 是否有效（防止异常值）
 	 */
-	if (wl_ext->bdev_config[idx].wear_per_gb > 0.0 && 
-	    wl_ext->bdev_config[idx].wear_per_gb <= 100.0) {
-		wear_increase = gb_written * wl_ext->bdev_config[idx].wear_per_gb;
+	if (wl_ext->data.bdev_config[idx].wear_per_gb > 0.0 &&
+	    wl_ext->data.bdev_config[idx].wear_per_gb <= 100.0) {
+		wear_increase = gb_written * wl_ext->data.bdev_config[idx].wear_per_gb;
 		/* 检查结果是否合理（防止异常值） */
 		if (wear_increase < 0.0 || wear_increase > 100.0) {
 			/* 异常值，使用默认值 */
@@ -601,7 +552,7 @@ should_reread_wear_level(struct wear_leveling_ext *wl_ext, uint8_t idx)
 		return true;
 	}
 	
-	struct base_bdev_wear_info *info = &wl_ext->wear_info[idx];
+	struct base_bdev_wear_info *info = &wl_ext->data.wear_info[idx];
 	
 	if (info->last_read_timestamp == 0) {
 		/* 从未读取过，需要读取 */
@@ -684,7 +635,7 @@ get_wear_level_with_prediction(struct wear_leveling_ext *wl_ext,
 		return -ENODEV;
 	}
 	
-	struct base_bdev_wear_info *info = &wl_ext->wear_info[idx];
+	struct base_bdev_wear_info *info = &wl_ext->data.wear_info[idx];
 	
 	/* 检查是否需要重新读取实际磨损
 	 * 注意：如果设置了 needs_reread 标志，优先重新读取
@@ -710,7 +661,7 @@ get_wear_level_with_prediction(struct wear_leveling_ext *wl_ext,
 			info->writes_since_last_read = 0;
 			info->last_read_timestamp = spdk_get_ticks();
 			info->needs_reread = false; /* 清除重新读取标志 */
-			wl_ext->cache_misses++;
+			wl_ext->data.cache_misses++;
 		} else {
 			/* 读取失败，处理各种错误场景（鲁棒性）
 			 * 
@@ -735,7 +686,7 @@ get_wear_level_with_prediction(struct wear_leveling_ext *wl_ext,
 				SPDK_WARNLOG("Failed to re-read wear level (rc: %d), using cached value %u\n", 
 					     rc, info->wear_level);
 			}
-			wl_ext->cache_misses++;
+			wl_ext->data.cache_misses++;
 			/* 保持 needs_reread 标志，以便后续重试 */
 		}
 	} else {
@@ -743,7 +694,7 @@ get_wear_level_with_prediction(struct wear_leveling_ext *wl_ext,
 		 * 注意：不更新 predicted_wear_level，因为选择策略使用的是 wear_level
 		 * predicted_wear_level 只在 should_reread_wear_level 中用于判断是否需要重新读取
 		 */
-		wl_ext->cache_hits++;
+		wl_ext->data.cache_hits++;
 		
 		/* 更新预测值（仅用于判断是否需要重新读取，不影响选择策略） */
 		predict_wear_level_for_reread_check(wl_ext, idx);
@@ -859,7 +810,7 @@ get_wear_level_fast(struct wear_leveling_ext *wl_ext, uint8_t idx)
 	if (idx >= EC_MAX_K) {
 		return 255;
 	}
-	return wl_ext->wear_info[idx].wear_level;
+	return wl_ext->data.wear_info[idx].wear_level;
 }
 
 /* Helper struct for collecting wear info from candidates */
@@ -906,7 +857,7 @@ _collect_and_validate_wear_info(struct wear_leveling_ext *wl_ext,
 		struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[candidate_idx];
 		bool is_operational = (base_info->desc != NULL && !base_info->is_failed);
 
-		wl_ext->wear_info[candidate_idx].is_operational = is_operational;
+		wl_ext->data.wear_info[candidate_idx].is_operational = is_operational;
 
 		if (!is_operational) {
 			/* Non-operational bdev, caller will fall back to default selection. */
@@ -915,7 +866,7 @@ _collect_and_validate_wear_info(struct wear_leveling_ext *wl_ext,
 		}
 
 		/* Get wear level: if needs_reread is set, try to refresh first. */
-		if (wl_ext->wear_info[candidate_idx].needs_reread) {
+		if (wl_ext->data.wear_info[candidate_idx].needs_reread) {
 			uint8_t wear_level;
 			int rc = get_wear_level_with_prediction(wl_ext, candidate_idx, base_info, &wear_level);
 			if (rc == 0) {
@@ -1150,18 +1101,40 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 	/* 2. Collect wear info and validate candidates. */
 	rc = _collect_and_validate_wear_info(wl_ext, ec_bdev, default_data_indices, k, &wear_info);
 	if (rc != 0) {
+		/* 健康检测：记录失败次数，可能触发自动降级 */
+		wl_ext->sched.consecutive_failures++;
+		
+		/* 按连续失败次数自动降级模式 */
+		if (wl_ext->sched.consecutive_failures >= wl_ext->sched.auto_fallback_threshold) {
+			
+			if (wl_ext->sched.mode == WL_MODE_FULL) {
+				SPDK_WARNLOG("EC bdev %s: Wear collection failed %u times, auto-fallback from FULL to SIMPLE mode\n",
+					     ec_bdev->bdev.name, wl_ext->sched.consecutive_failures);
+				wl_ext->sched.mode = WL_MODE_SIMPLE;
+				wl_ext->sched.consecutive_failures = 0;  /* 重置计数器 */
+			} else if (wl_ext->sched.mode == WL_MODE_SIMPLE) {
+				SPDK_WARNLOG("EC bdev %s: Wear collection failed %u times, auto-fallback from SIMPLE to DISABLED mode\n",
+					     ec_bdev->bdev.name, wl_ext->sched.consecutive_failures);
+				wl_ext->sched.mode = WL_MODE_DISABLED;
+				wl_ext->sched.consecutive_failures = 0;  /* 重置计数器 */
+			}
+		}
+		
 		/* Fallback to default if any candidate is invalid or wear is unavailable. */
-		wl_ext->all_wear_unavailable = true;
+		wl_ext->sched.all_wear_unavailable = true;
 		return copy_default_selection(ec_bdev, default_data_indices, k,
 					      default_parity_indices, p,
 					      data_indices, parity_indices,
 					      "wear info collection failed");
 	}
+	
+	/* 成功时重置失败计数 */
+	wl_ext->sched.consecutive_failures = 0;
 
 	/* 3. Fast path: If wear difference is small, use default selection. */
 	if ((wear_info.max_wear - wear_info.min_wear) < WEAR_DIFF_THRESHOLD &&
 	    !wear_info.any_needs_reread) {
-		wl_ext->fast_path_hits++;
+		wl_ext->sched.fast_path_hits++;
 		return copy_default_selection(ec_bdev, default_data_indices, k,
 					      default_parity_indices, p,
 					      data_indices, parity_indices,
@@ -1222,11 +1195,32 @@ wear_leveling_select_base_bdevs(struct ec_bdev_extension_if *ext_if,
 	uint64_t start_strip = offset_blocks >> strip_size_shift;
 	uint64_t stripe_index = start_strip / k;
 	
-	if (wl_ext->all_wear_unavailable) {
+	/* 根据模式选择策略（简化可靠原则） */
+	switch (wl_ext->sched.mode) {
+	case WL_MODE_DISABLED:
+		/* DISABLED模式：始终使用默认策略 */
+		return ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+		
+	case WL_MODE_SIMPLE:
+		/* SIMPLE模式：基于缓存磨损排序，无预测/重读 */
+		/* 如果磨损信息不可用，fallback到默认 */
+		if (wl_ext->sched.all_wear_unavailable) {
+			return ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+		}
+		/* TODO: 实现简单排序策略 */
+		return select_wear_based_strategy(wl_ext, ec_bdev, stripe_index, data_indices, parity_indices);
+		
+	case WL_MODE_FULL:
+		/* FULL模式：完整功能（预测+重读+权重选择） */
+		if (wl_ext->sched.all_wear_unavailable) {
+			return ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+		}
+		return select_wear_based_strategy(wl_ext, ec_bdev, stripe_index, data_indices, parity_indices);
+		
+	default:
+		SPDK_ERRLOG("Unknown wear leveling mode: %d\n", wl_ext->sched.mode);
 		return ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
 	}
-	
-	return select_wear_based_strategy(wl_ext, ec_bdev, stripe_index, data_indices, parity_indices);
 }
 
 /* I/O完成通知 - 更新磨损统计 */
@@ -1253,7 +1247,7 @@ wear_leveling_notify_io_complete(struct ec_bdev_extension_if *ext_if,
 		uint8_t idx = (uint8_t)idx_diff;
 		
 		if (is_valid_bdev_idx(ec_bdev, idx)) {
-			struct base_bdev_wear_info *info = &wl_ext->wear_info[idx];
+			struct base_bdev_wear_info *info = &wl_ext->data.wear_info[idx];
 			
 			/* 更新写入统计 */
 			if (info->total_writes <= UINT64_MAX - num_blocks) {
@@ -1310,13 +1304,24 @@ wear_leveling_ext_fini_cb(struct ec_bdev_extension_if *ext_if, struct ec_bdev *e
  * - 根据磨损程度分配写入量：磨损低的写入多，磨损高的写入少
  * - 磨损相同时，写入量相同
  * - 使用确定性加权选择，确保同一stripe总是选择相同的base bdev
+ * 
+ * mode参数控制复杂度：
+ * - WL_MODE_DISABLED: 不启用磨损均衡，始终使用默认策略
+ * - WL_MODE_SIMPLE: 仅基于已缓存磨损信息排序，无预测/重读
+ * - WL_MODE_FULL: 完整功能（预测+NVMe读取+权重选择）
  */
 int
-wear_leveling_ext_register(struct ec_bdev *ec_bdev)
+wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode)
 {
 	struct wear_leveling_ext *wl_ext;
 	
 	if (ec_bdev == NULL) {
+		return -EINVAL;
+	}
+	
+	/* 验证模式参数 */
+	if (mode < WL_MODE_DISABLED || mode > WL_MODE_FULL) {
+		SPDK_ERRLOG("Invalid wear leveling mode: %d\n", mode);
 		return -EINVAL;
 	}
 	
@@ -1341,10 +1346,10 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 	wl_ext->ext_if.init = wear_leveling_ext_init_cb;
 	wl_ext->ext_if.fini = wear_leveling_ext_fini_cb;
 	
-	/* 设置磨损预测参数 */
-	wl_ext->wear_predict_threshold_blocks = 20971520; /* 默认10GB (20M blocks * 512B) */
-	wl_ext->wear_predict_threshold_percent = 5;       /* 默认5% */
-	wl_ext->wear_read_interval_us = 30000000;         /* 默认30秒最小读取间隔 */
+	/* 设置磨损预测参数（使用头文件中定义的默认值） */
+	wl_ext->wear_predict_threshold_blocks = WEAR_DEFAULT_THRESHOLD_BLOCKS;
+	wl_ext->wear_predict_threshold_percent = WEAR_DEFAULT_THRESHOLD_PERCENT;
+	wl_ext->wear_read_interval_us = WEAR_DEFAULT_READ_INTERVAL_US;
 	
 	/* 参数验证：确保阈值合理 */
 	if (wl_ext->wear_predict_threshold_percent == 0) {
@@ -1354,14 +1359,20 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 		wl_ext->wear_predict_threshold_percent = 100; /* 最大100% */
 	}
 	
+	/* 初始化调度器状态 */
+	wl_ext->sched.mode = mode;
+	wl_ext->sched.all_wear_unavailable = false;
+	wl_ext->sched.fast_path_hits = 0;
+	wl_ext->sched.consecutive_failures = 0;
+	wl_ext->sched.auto_fallback_threshold = WEAR_AUTO_FALLBACK_THRESHOLD;
+	
 	/* 初始化磨损信息 */
-	memset(wl_ext->wear_info, 0, sizeof(wl_ext->wear_info));
-	memset(wl_ext->bdev_config, 0, sizeof(wl_ext->bdev_config));
-	memset(wl_ext->cached_block_size, 0, sizeof(wl_ext->cached_block_size));
-	wl_ext->cache_hits = 0;
-	wl_ext->cache_misses = 0;
-	wl_ext->fast_path_hits = 0;
-	wl_ext->all_wear_unavailable = false;  /* 初始化为false，后续检查 */
+	memset(&wl_ext->data, 0, sizeof(wl_ext->data));
+	
+	SPDK_NOTICELOG("Wear leveling extension registered for EC bdev %s in mode %d (%s)\n",
+		       ec_bdev->bdev.name, mode,
+		       mode == WL_MODE_DISABLED ? "DISABLED" :
+		       mode == WL_MODE_SIMPLE ? "SIMPLE" : "FULL");
 	
 	/* 初始化每个bdev的TBW和磨损率，并读取实际磨损信息
 	 * 根据实际NVMe盘的特性设置默认值：
@@ -1374,20 +1385,12 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 	 * 即500GB SSD的TBW = 500 * 0.4 = 200TB
 	 */
 	struct ec_base_bdev_info *base_info;
-	uint8_t i = 0;
-	uint8_t operational_count = 0;  /* 可用的base bdev数量 */
-	uint8_t wear_read_success_count = 0;  /* 成功读取磨损信息的数量 */
+	uint16_t i = 0;  /* 使用uint16_t避免类型限制问题 */
+	uint16_t operational_count = 0;
+	uint16_t wear_read_success_count = 0;
 	
-	/* 边界检查：确保不会超出数组范围 */
-	/* num_base_bdevs is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so this check is always false */
-	/* However, we still check against EC_MAX_K to ensure array bounds safety */
-
-	if ((unsigned int)ec_bdev->num_base_bdevs > EC_MAX_K + EC_MAX_P) {
-		SPDK_ERRLOG("EC bdev %s has too many base bdevs (%u > %u)\n",
-			    ec_bdev->bdev.name, ec_bdev->num_base_bdevs, EC_MAX_K + EC_MAX_P);
-		free(wl_ext);
-		return -EINVAL;
-	}
+	/* 注意：由于num_base_bdevs是uint8_t(max 255)且数组大小为EC_MAX_K+EC_MAX_P(510)，
+	 * 数组边界检查已由类型系统保证，无需显式检查 */
 	
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		/* i is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check i >= EC_MAX_K is sufficient */
@@ -1401,8 +1404,8 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
 			if (bdev == NULL) {
 				/* bdev 为 NULL，跳过这个 base_info */
-				wl_ext->bdev_config[i].tbw = 0;
-				wl_ext->bdev_config[i].wear_per_gb = 0;
+				wl_ext->data.bdev_config[i].tbw = 0;
+				wl_ext->data.bdev_config[i].wear_per_gb = 0;
 				i++;
 				continue;
 			}
@@ -1426,56 +1429,62 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 			 * 显式转换为 double 进行计算，避免精度损失
 			 */
 			double capacity_gb_double = (double)capacity_gb;
-			wl_ext->bdev_config[i].tbw = capacity_gb_double * 0.004;  /* 0.4 / 100 = 0.004 */
+			wl_ext->data.bdev_config[i].tbw = capacity_gb_double * 0.004;  /* 0.4 / 100 = 0.004 */
 			
 			/* 检查结果是否合理（防止异常值） */
-			if (wl_ext->bdev_config[i].tbw < 0.0 || wl_ext->bdev_config[i].tbw > 1000000.0) {
+			if (wl_ext->data.bdev_config[i].tbw < 0.0 || wl_ext->data.bdev_config[i].tbw > 1000000.0) {
 				SPDK_WARNLOG("Calculated TBW out of range: %.2f TB (capacity_gb=%lu), using default\n",
-					     wl_ext->bdev_config[i].tbw, capacity_gb);
-				wl_ext->bdev_config[i].tbw = 180.0;  /* 默认180TB */
+					     wl_ext->data.bdev_config[i].tbw, capacity_gb);
+				wl_ext->data.bdev_config[i].tbw = 180.0;  /* 默认180TB */
+				
 			}
 			
 			/* 计算每GB磨损率：wear_per_gb = 100 / (TBW * 1024)
 			 * 注意：tbw 可能为 0（如果 capacity_gb 为 0），需要检查
 			 * 防止除零和异常值
 			 */
-			double tbw_gb = wl_ext->bdev_config[i].tbw * TB_TO_GB;
-			if (wl_ext->bdev_config[i].tbw > 0.0 && tbw_gb > 0.0) {
-				wl_ext->bdev_config[i].wear_per_gb = 100.0 / tbw_gb;
+			double tbw_gb = wl_ext->data.bdev_config[i].tbw * TB_TO_GB;
+			if (wl_ext->data.bdev_config[i].tbw > 0.0 && tbw_gb > 0.0) {
+				wl_ext->data.bdev_config[i].wear_per_gb = 100.0 / tbw_gb;
 				/* 检查结果是否合理（防止异常值） */
-				if (wl_ext->bdev_config[i].wear_per_gb <= 0.0 || 
-				    wl_ext->bdev_config[i].wear_per_gb > 100.0) {
+				if (wl_ext->data.bdev_config[i].wear_per_gb <= 0.0 ||
+				    wl_ext->data.bdev_config[i].wear_per_gb > 100.0) {
 					/* 异常值，使用默认值 */
-					wl_ext->bdev_config[i].wear_per_gb = 0.000543;  /* 默认180TB的磨损率 */
+					wl_ext->data.bdev_config[i].wear_per_gb = 0.000543;  /* 默认180TB的磨损率 */
 				}
 			} else {
 				/* TBW 为 0 或无效，使用默认值 */
-				wl_ext->bdev_config[i].wear_per_gb = 0.000543;  /* 默认180TB的磨损率 */
+				wl_ext->data.bdev_config[i].wear_per_gb = 0.000543;  /* 默认180TB的磨损率 */
 			}
 			
 			/* 性能优化：预缓存block_size，避免首次访问时的查询开销 */
 			if (block_size != 0) {
-				wl_ext->cached_block_size[i] = block_size;
+				wl_ext->data.cached_block_size[i] = block_size;
 			} else {
-				wl_ext->cached_block_size[i] = 512;  /* 默认值 */
+				wl_ext->data.cached_block_size[i] = 512;  /* 默认值 */
 			}
 			
-			/* 初始化时读取实际磨损信息
-			 * 优化：异步读取可能更好，但这里保持同步以确保初始化完成
-			 * 如果读取失败，使用默认值，后续会通过预测机制更新
+			/* 初始化时读取实际磨损信息（仅在FULL模式）
+			 * 简化原则：SIMPLE和DISABLED模式不读取NVMe健康信息
+			 * FULL模式才进行完整的健康信息读取
 			 */
 			if (!base_info->is_failed) {
 				operational_count++;
 				uint8_t wear_level = 255;  /* 初始化为无效值 */
-				int read_rc = get_nvme_wear_level_from_bdev(bdev, &wear_level);
+				int read_rc = -ENOTSUP;  /* 默认不支持 */
+				
+				/* 只在FULL模式读取NVMe健康信息 */
+				if (mode == WL_MODE_FULL) {
+					read_rc = get_nvme_wear_level_from_bdev(bdev, &wear_level);
+				}
 				if (read_rc == 0) {
 					/* 成功读取，验证值的有效性（双重检查，鲁棒性） */
 					if (wear_level <= 100) {
-						wl_ext->wear_info[i].wear_level = wear_level;
-						wl_ext->wear_info[i].predicted_wear_level = wear_level;
-						wl_ext->wear_info[i].last_read_timestamp = spdk_get_ticks();
-						wl_ext->wear_info[i].is_operational = 1;
-						wl_ext->wear_info[i].needs_reread = 0;
+						wl_ext->data.wear_info[i].wear_level = wear_level;
+						wl_ext->data.wear_info[i].predicted_wear_level = wear_level;
+						wl_ext->data.wear_info[i].last_read_timestamp = spdk_get_ticks();
+						wl_ext->data.wear_info[i].is_operational = 1;
+						wl_ext->data.wear_info[i].needs_reread = 0;
 						wear_read_success_count++;  /* 成功读取磨损信息 */
 					} else {
 						/* 读取成功但值无效（不应该发生，因为函数内部已验证）
@@ -1483,11 +1492,11 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 						 */
 						SPDK_ERRLOG("EC bdev %s: base bdev %u returned invalid wear level %u (expected 0-100)\n",
 							    ec_bdev->bdev.name, i, wear_level);
-						wl_ext->wear_info[i].wear_level = 255;  /* 无效值 */
-						wl_ext->wear_info[i].predicted_wear_level = 255;
-						wl_ext->wear_info[i].last_read_timestamp = 0;
-						wl_ext->wear_info[i].needs_reread = 1;
-						wl_ext->wear_info[i].is_operational = 1;  /* 设备可用，只是无法读取磨损 */
+						wl_ext->data.wear_info[i].wear_level = 255;  /* 无效值 */
+						wl_ext->data.wear_info[i].predicted_wear_level = 255;
+						wl_ext->data.wear_info[i].last_read_timestamp = 0;
+						wl_ext->data.wear_info[i].needs_reread = 1;
+						wl_ext->data.wear_info[i].is_operational = 1;  /* 设备可用，只是无法读取磨损 */
 					}
 				} else {
 					/* 读取失败，处理各种错误场景（鲁棒性）
@@ -1503,21 +1512,21 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 					 */
 					SPDK_WARNLOG("EC bdev %s: Failed to read wear level from base bdev %u (rc: %d, bdev: %s)\n",
 						     ec_bdev->bdev.name, i, read_rc, spdk_bdev_get_name(bdev));
-					wl_ext->wear_info[i].wear_level = 255;  /* 无效值 */
-					wl_ext->wear_info[i].predicted_wear_level = 255;
-					wl_ext->wear_info[i].last_read_timestamp = 0; /* 标记需要读取 */
-					wl_ext->wear_info[i].needs_reread = 1;
-					wl_ext->wear_info[i].is_operational = 1;  /* 设备可用，只是无法读取磨损 */
+					wl_ext->data.wear_info[i].wear_level = 255;  /* 无效值 */
+					wl_ext->data.wear_info[i].predicted_wear_level = 255;
+					wl_ext->data.wear_info[i].last_read_timestamp = 0; /* 标记需要读取 */
+					wl_ext->data.wear_info[i].needs_reread = 1;
+					wl_ext->data.wear_info[i].is_operational = 1;  /* 设备可用，只是无法读取磨损 */
 				}
 			} else {
 				/* base bdev 已失败，标记为不可用 */
-				wl_ext->wear_info[i].is_operational = 0;
+				wl_ext->data.wear_info[i].is_operational = 0;
 			}
 		} else {
 			/* base_info->desc 为 NULL，标记为不可用 */
-			wl_ext->bdev_config[i].tbw = 0;
-			wl_ext->bdev_config[i].wear_per_gb = 0;
-			wl_ext->wear_info[i].is_operational = 0;
+			wl_ext->data.bdev_config[i].tbw = 0;
+			wl_ext->data.bdev_config[i].wear_per_gb = 0;
+			wl_ext->data.wear_info[i].is_operational = 0;
 		}
 		
 		i++;
@@ -1534,17 +1543,17 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev)
 				     "immediately falling back to default write strategy\n", 
 				     ec_bdev->bdev.name, 
 				     operational_count - wear_read_success_count, operational_count);
-			wl_ext->all_wear_unavailable = true;
+			wl_ext->sched.all_wear_unavailable = true;
 		} else {
 			/* 所有可用的base bdev都能读取磨损信息，可以使用磨损均衡 */
-			wl_ext->all_wear_unavailable = false;
+			wl_ext->sched.all_wear_unavailable = false;
 			SPDK_NOTICELOG("EC bdev %s: Wear leveling enabled, all %u base bdevs have wear info\n",
 				       ec_bdev->bdev.name, operational_count);
 		}
 	} else {
 		/* 没有可用的base bdev，这种情况不应该发生 */
 		SPDK_ERRLOG("EC bdev %s: No operational base bdevs found\n", ec_bdev->bdev.name);
-		wl_ext->all_wear_unavailable = true;
+		wl_ext->sched.all_wear_unavailable = true;
 	}
 	
 	/* 注册到EC bdev
@@ -1587,7 +1596,7 @@ wear_leveling_ext_unregister(struct ec_bdev *ec_bdev)
 /* 设置指定base bdev的TBW */
 int
 wear_leveling_ext_set_tbw(struct ec_bdev *ec_bdev,
-			   uint8_t base_bdev_index,
+			   uint16_t base_bdev_index,
 			   double tbw)
 {
 	struct ec_bdev_extension_if *ext_if;
@@ -1597,9 +1606,9 @@ wear_leveling_ext_set_tbw(struct ec_bdev *ec_bdev,
 		return -EINVAL;
 	}
 	
-	/* base_bdev_index is uint8_t (max 255), EC_MAX_K + EC_MAX_P = 510, so check base_bdev_index >= EC_MAX_K is sufficient */
+	/* 边界检查：使用uint16_t避免类型限制问题 */
 	if (base_bdev_index >= ec_bdev->num_base_bdevs || 
-	    base_bdev_index >= EC_MAX_K) {
+	    base_bdev_index >= (EC_MAX_K + EC_MAX_P)) {
 		return -EINVAL;
 	}
 	
@@ -1616,19 +1625,19 @@ wear_leveling_ext_set_tbw(struct ec_bdev *ec_bdev,
 	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
 	
 	/* 设置TBW */
-	wl_ext->bdev_config[base_bdev_index].tbw = tbw;
+	wl_ext->data.bdev_config[base_bdev_index].tbw = tbw;
 	
 	/* 重新计算磨损率：wear_per_gb = 100 / (TBW * 1024)
 	 * 注意：tbw 已经检查过 > 0，但为了鲁棒性，仍然检查除零和异常值
 	 */
 	double tbw_gb = tbw * TB_TO_GB;
 	if (tbw_gb > 0.0) {
-		wl_ext->bdev_config[base_bdev_index].wear_per_gb = 100.0 / tbw_gb;
+		wl_ext->data.bdev_config[base_bdev_index].wear_per_gb = 100.0 / tbw_gb;
 		/* 检查结果是否合理（防止异常值） */
-		if (wl_ext->bdev_config[base_bdev_index].wear_per_gb <= 0.0 ||
-		    wl_ext->bdev_config[base_bdev_index].wear_per_gb > 100.0) {
+		if (wl_ext->data.bdev_config[base_bdev_index].wear_per_gb <= 0.0 ||
+		    wl_ext->data.bdev_config[base_bdev_index].wear_per_gb > 100.0) {
 			SPDK_ERRLOG("Invalid wear_per_gb calculated: %f (tbw=%.2f)\n",
-				    wl_ext->bdev_config[base_bdev_index].wear_per_gb, tbw);
+				    wl_ext->data.bdev_config[base_bdev_index].wear_per_gb, tbw);
 			return -EINVAL;
 		}
 	} else {
@@ -1637,7 +1646,7 @@ wear_leveling_ext_set_tbw(struct ec_bdev *ec_bdev,
 	}
 	
 	SPDK_NOTICELOG("Set TBW for base bdev %u to %.2f TB, wear_per_gb = %.6f\n",
-		       base_bdev_index, tbw, wl_ext->bdev_config[base_bdev_index].wear_per_gb);
+		       base_bdev_index, tbw, wl_ext->data.bdev_config[base_bdev_index].wear_per_gb);
 	
 	return 0;
 }
@@ -1678,5 +1687,65 @@ wear_leveling_ext_set_predict_params(struct ec_bdev *ec_bdev,
 		       threshold_blocks, threshold_percent, read_interval_us);
 	
 	return 0;
+}
+
+/* 设置磨损均衡模式 */
+int
+wear_leveling_ext_set_mode(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode)
+{
+	struct ec_bdev_extension_if *ext_if;
+	struct wear_leveling_ext *wl_ext;
+	
+	if (ec_bdev == NULL) {
+		return -EINVAL;
+	}
+	
+	/* 验证模式参数 */
+	if (mode < WL_MODE_DISABLED || mode > WL_MODE_FULL) {
+		SPDK_ERRLOG("Invalid wear leveling mode: %d\n", mode);
+		return -EINVAL;
+	}
+	
+	ext_if = ec_bdev_get_extension(ec_bdev);
+	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
+		return -ENOENT;
+	}
+	
+	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
+	
+	/* 记录模式切换 */
+	SPDK_NOTICELOG("Changing wear leveling mode for EC bdev %s from %d (%s) to %d (%s)\n",
+		       ec_bdev->bdev.name,
+		       wl_ext->sched.mode,
+		       wl_ext->sched.mode == WL_MODE_DISABLED ? "DISABLED" :
+		       wl_ext->sched.mode == WL_MODE_SIMPLE ? "SIMPLE" : "FULL",
+		       mode,
+		       mode == WL_MODE_DISABLED ? "DISABLED" :
+		       mode == WL_MODE_SIMPLE ? "SIMPLE" : "FULL");
+	
+	wl_ext->sched.mode = mode;
+	
+	return 0;
+}
+
+/* 获取当前磨损均衡模式 */
+int
+wear_leveling_ext_get_mode(struct ec_bdev *ec_bdev)
+{
+	struct ec_bdev_extension_if *ext_if;
+	struct wear_leveling_ext *wl_ext;
+	
+	if (ec_bdev == NULL) {
+		return -EINVAL;
+	}
+	
+	ext_if = ec_bdev_get_extension(ec_bdev);
+	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
+		return -ENOENT;
+	}
+	
+	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
+	
+	return (int)wl_ext->sched.mode;
 }
 
