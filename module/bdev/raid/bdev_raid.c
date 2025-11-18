@@ -80,6 +80,11 @@ struct raid_bdev_process {
 	int				status;
 	TAILQ_HEAD(, raid_process_finish_action) finish_actions;
 	struct raid_process_qos		qos;
+	/* Fine-grained rebuild state tracking */
+	enum raid_rebuild_state		rebuild_state;
+	/* Callback for rebuild completion */
+	void (*rebuild_done_cb)(void *ctx, int status);
+	void *rebuild_done_ctx;
 };
 
 struct raid_process_finish_action {
@@ -1123,14 +1128,34 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
 	if (raid_bdev->process) {
 		struct raid_bdev_process *process = raid_bdev->process;
 		uint64_t offset = process->window_offset;
+		uint64_t total_size = raid_bdev->bdev.blockcnt;
+		double percent = 0.0;
+
+		if (total_size > 0) {
+			percent = (double)offset * 100.0 / (double)total_size;
+		}
 
 		spdk_json_write_named_object_begin(w, "process");
-		spdk_json_write_name(w, "type");
-		spdk_json_write_string(w, raid_bdev_process_to_str(process->type));
-		spdk_json_write_named_string(w, "target", process->target->name);
+		spdk_json_write_named_string(w, "type", raid_bdev_process_to_str(process->type));
+		if (process->target != NULL) {
+			spdk_json_write_named_string(w, "target", process->target->name);
+			/* Find target slot */
+			uint8_t target_slot = 0;
+			RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+				if (base_info == process->target) {
+					target_slot = (uint8_t)(base_info - raid_bdev->base_bdev_info);
+					break;
+				}
+			}
+			spdk_json_write_named_uint8(w, "target_slot", target_slot);
+		}
 		spdk_json_write_named_object_begin(w, "progress");
-		spdk_json_write_named_uint64(w, "blocks", offset);
-		spdk_json_write_named_uint32(w, "percent", offset * 100.0 / raid_bdev->bdev.blockcnt);
+		spdk_json_write_named_uint64(w, "current_offset", offset);
+		spdk_json_write_named_uint64(w, "total_size", total_size);
+		spdk_json_write_named_double(w, "percent", percent);
+		if (process->type == RAID_PROCESS_REBUILD) {
+			spdk_json_write_named_string(w, "state", raid_rebuild_state_to_str(process->rebuild_state));
+		}
 		spdk_json_write_object_end(w);
 		spdk_json_write_object_end(w);
 	}
@@ -1406,6 +1431,23 @@ raid_bdev_process_to_str(enum raid_process_type value)
 	}
 
 	return g_raid_process_type_names[value];
+}
+
+static const char *g_raid_rebuild_state_names[] = {
+	[RAID_REBUILD_STATE_IDLE]		= "idle",
+	[RAID_REBUILD_STATE_READING]		= "reading",
+	[RAID_REBUILD_STATE_WRITING]		= "writing",
+	[RAID_REBUILD_STATE_CALCULATING]	= "calculating",
+};
+
+const char *
+raid_rebuild_state_to_str(enum raid_rebuild_state state)
+{
+	if (state > RAID_REBUILD_STATE_CALCULATING) {
+		return "";
+	}
+
+	return g_raid_rebuild_state_names[state];
 }
 
 /*
@@ -2719,7 +2761,20 @@ raid_bdev_process_finish_write_sb(void *ctx)
 	struct raid_bdev_superblock *sb = raid_bdev->sb;
 	struct raid_bdev_sb_base_bdev *sb_base_bdev;
 	struct raid_base_bdev_info *base_info;
+	struct raid_bdev_process *process = raid_bdev->process;
 	uint8_t i;
+	uint8_t target_slot = 0;
+
+	/* Safety check: sb should not be NULL if superblock_enabled is true */
+	if (sb == NULL) {
+		SPDK_ERRLOG("Superblock is NULL for raid bdev %s\n", raid_bdev->bdev.name);
+		return;
+	}
+
+	/* Find target slot if rebuild was in progress */
+	if (process != NULL && process->type == RAID_PROCESS_REBUILD && process->target != NULL) {
+		target_slot = raid_bdev_base_bdev_slot(process->target);
+	}
 
 	for (i = 0; i < sb->base_bdevs_size; i++) {
 		sb_base_bdev = &sb->base_bdevs[i];
@@ -2731,6 +2786,22 @@ raid_bdev_process_finish_write_sb(void *ctx)
 				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
 				sb_base_bdev->data_offset = base_info->data_offset;
 				spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
+				/* Clear rebuild progress when rebuild completes */
+				sb_base_bdev->rebuild_offset = 0;
+				sb_base_bdev->rebuild_total_size = 0;
+			}
+		} else if (sb_base_bdev->state == RAID_SB_BASE_BDEV_REBUILDING &&
+			   sb_base_bdev->slot == target_slot) {
+			/* Update REBUILDING state to CONFIGURED if rebuild completed successfully */
+			if (process != NULL && process->status == 0) {
+				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
+				sb_base_bdev->rebuild_offset = 0;
+				sb_base_bdev->rebuild_total_size = 0;
+			} else {
+				/* Rebuild failed, revert to FAILED */
+				sb_base_bdev->state = RAID_SB_BASE_BDEV_FAILED;
+				sb_base_bdev->rebuild_offset = 0;
+				sb_base_bdev->rebuild_total_size = 0;
 			}
 		}
 	}
@@ -2750,6 +2821,11 @@ _raid_bdev_process_finish_done(void *ctx)
 		TAILQ_REMOVE(&process->finish_actions, finish_action, link);
 		finish_action->cb(finish_action->cb_ctx);
 		free(finish_action);
+	}
+
+	/* Call rebuild done callback if rebuild was in progress */
+	if (process->type == RAID_PROCESS_REBUILD && process->rebuild_done_cb != NULL) {
+		process->rebuild_done_cb(process->rebuild_done_ctx, process->status);
 	}
 
 	spdk_poller_unregister(&process->qos.process_continue_poller);
@@ -2940,6 +3016,19 @@ raid_bdev_process_window_range_unlocked(void *ctx, int status)
 
 	process->window_range_locked = false;
 	process->window_offset += process->window_size;
+
+	/* Update rebuild progress in superblock periodically (every window) */
+	if (process->type == RAID_PROCESS_REBUILD && 
+	    process->raid_bdev->sb != NULL && 
+	    process->target != NULL) {
+		uint8_t target_slot = raid_bdev_base_bdev_slot(process->target);
+		/* Update progress every window (can be optimized to update less frequently) */
+		raid_bdev_sb_update_rebuild_progress(process->raid_bdev, target_slot,
+						     process->window_offset,
+						     process->raid_bdev->bdev.blockcnt);
+		/* Write superblock asynchronously (non-blocking) */
+		raid_bdev_write_superblock(process->raid_bdev, NULL, NULL);
+	}
 
 	raid_bdev_process_thread_run(process);
 }
@@ -3356,6 +3445,10 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
 					    raid_bdev->bdev.write_unit_size);
 	TAILQ_INIT(&process->requests);
 	TAILQ_INIT(&process->finish_actions);
+	/* Initialize rebuild state and callback */
+	process->rebuild_state = RAID_REBUILD_STATE_IDLE;
+	process->rebuild_done_cb = NULL;
+	process->rebuild_done_ctx = NULL;
 
 	if (g_opts.process_max_bandwidth_mb_sec != 0) {
 		process->qos.enable_qos = true;
@@ -3379,16 +3472,69 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
 	return process;
 }
 
+/* Forward declarations */
+static const struct raid_bdev_sb_base_bdev *
+raid_bdev_sb_find_base_bdev_by_slot(const struct raid_bdev *raid_bdev, uint8_t slot);
+static int
+raid_bdev_start_rebuild_with_cb(struct raid_base_bdev_info *target,
+				void (*done_cb)(void *ctx, int status), void *done_ctx);
+
 static int
 raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
 {
+	return raid_bdev_start_rebuild_with_cb(target, NULL, NULL);
+}
+
+static int
+raid_bdev_start_rebuild_with_cb(struct raid_base_bdev_info *target,
+				void (*done_cb)(void *ctx, int status), void *done_ctx)
+{
 	struct raid_bdev_process *process;
+	struct raid_bdev *raid_bdev = target->raid_bdev;
+	uint8_t target_slot;
+	uint64_t rebuild_offset = 0;
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
+	process = raid_bdev_process_alloc(raid_bdev, RAID_PROCESS_REBUILD, target);
 	if (process == NULL) {
 		return -ENOMEM;
+	}
+
+	/* Set rebuild callback */
+	process->rebuild_done_cb = done_cb;
+	process->rebuild_done_ctx = done_ctx;
+
+	/* Find target slot */
+	target_slot = raid_bdev_base_bdev_slot(target);
+
+	/* Check if we're resuming a previous rebuild (REBUILDING state) */
+	if (raid_bdev->sb != NULL) {
+		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, target_slot);
+		if (sb_base != NULL && sb_base->state == RAID_SB_BASE_BDEV_REBUILDING) {
+			/* Resume from previous progress */
+			rebuild_offset = sb_base->rebuild_offset;
+			/* Validate rebuild_offset: ensure it's within valid range */
+			if (rebuild_offset > raid_bdev->bdev.blockcnt) {
+				SPDK_WARNLOG("Invalid rebuild_offset %lu (exceeds blockcnt %lu), resetting to 0\n",
+					     rebuild_offset, raid_bdev->bdev.blockcnt);
+				rebuild_offset = 0;
+			}
+			process->window_offset = rebuild_offset;
+			SPDK_NOTICELOG("Resuming rebuild for base bdev %s (slot %u) from offset %lu blocks\n",
+				       target->name, target_slot, rebuild_offset);
+		}
+	}
+
+	/* Update superblock to mark base bdev as REBUILDING before starting rebuild */
+	if (raid_bdev->sb != NULL) {
+		if (raid_bdev_sb_update_base_bdev_state(raid_bdev, target_slot,
+							 RAID_SB_BASE_BDEV_REBUILDING)) {
+			/* Initialize or update rebuild progress in superblock */
+			raid_bdev_sb_update_rebuild_progress(raid_bdev, target_slot, rebuild_offset,
+							     raid_bdev->bdev.blockcnt);
+			raid_bdev_write_superblock(raid_bdev, NULL, NULL);
+		}
 	}
 
 	raid_bdev_process_start(process);
@@ -3413,8 +3559,6 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
 }
 
 /* Forward declarations for helper functions */
-static const struct raid_bdev_sb_base_bdev *
-raid_bdev_sb_find_base_bdev_by_slot(const struct raid_bdev *raid_bdev, uint8_t slot);
 
 static void
 raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
@@ -4275,18 +4419,24 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
 		}
 
 		/* Slot is not occupied, check superblock state
-		 * This is the auto-recovery path: if slot is FAILED/MISSING,
+		 * This is the auto-recovery path: if slot is FAILED/MISSING/REBUILDING,
 		 * we automatically configure and rebuild the disk.
 		 */
 		if (sb_base_bdev->state == RAID_SB_BASE_BDEV_MISSING ||
-		    sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED) {
-			/* Auto-recovering a MISSING or FAILED disk */
+		    sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED ||
+		    sb_base_bdev->state == RAID_SB_BASE_BDEV_REBUILDING) {
+			/* Auto-recovering a MISSING, FAILED, or REBUILDING disk */
 			assert(base_info->is_configured == false);
 			assert(spdk_uuid_is_null(&base_info->uuid));
 			spdk_uuid_copy(&base_info->uuid, &sb_base_bdev->uuid);
-			SPDK_NOTICELOG("Auto-recovering bdev %s to RAID bdev %s (slot was %s).\n",
-				       bdev->name, raid_bdev->bdev.name,
-				       sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED ? "FAILED" : "MISSING");
+			if (sb_base_bdev->state == RAID_SB_BASE_BDEV_REBUILDING) {
+				SPDK_NOTICELOG("Auto-recovering bdev %s to RAID bdev %s (previous rebuild was not completed).\n",
+					       bdev->name, raid_bdev->bdev.name);
+			} else {
+				SPDK_NOTICELOG("Auto-recovering bdev %s to RAID bdev %s (slot was %s).\n",
+					       bdev->name, raid_bdev->bdev.name,
+					       sb_base_bdev->state == RAID_SB_BASE_BDEV_FAILED ? "FAILED" : "MISSING");
+			}
 			/* Use existing=true to indicate this is from examine (auto-recovery) */
 			rc = raid_bdev_configure_base_bdev(base_info, true, cb_fn, cb_ctx);
 			if (rc != 0) {
@@ -4502,6 +4652,43 @@ raid_bdev_examine(struct spdk_bdev *bdev)
 	return;
 done:
 	raid_bdev_examine_done(bdev, rc);
+}
+
+/*
+ * Check if rebuild is in progress
+ */
+bool
+raid_bdev_is_rebuilding(struct raid_bdev *raid_bdev)
+{
+	if (raid_bdev == NULL) {
+		return false;
+	}
+
+	return (raid_bdev->process != NULL &&
+		raid_bdev->process->type == RAID_PROCESS_REBUILD &&
+		raid_bdev->process->state == RAID_PROCESS_STATE_RUNNING);
+}
+
+/*
+ * Get rebuild progress
+ */
+int
+raid_bdev_get_rebuild_progress(struct raid_bdev *raid_bdev, uint64_t *current_offset,
+			       uint64_t *total_size)
+{
+	if (raid_bdev == NULL || current_offset == NULL || total_size == NULL) {
+		return -EINVAL;
+	}
+
+	if (raid_bdev->process == NULL ||
+	    raid_bdev->process->type != RAID_PROCESS_REBUILD) {
+		return -ENODEV;
+	}
+
+	*current_offset = raid_bdev->process->window_offset;
+	*total_size = raid_bdev->bdev.blockcnt;
+
+	return 0;
 }
 
 /* Log component for bdev raid bdev module */
