@@ -48,7 +48,7 @@ all: $(APP)
 
 $(APP) : $(OBJS) $(SPDK_LIB_FILES) $(ENV_LIBS)
 	$(Q)+echo "  LINK $(notdir $@)"; \
-	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(ENV_LDFLAGS) $(ENV_LIBS) $(SYS_LIBS)
+	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) $(OBJS) $(ENV_LIBS) $(LIBS) $(ENV_LDFLAGS) $(SYS_LIBS)
 
 clean:
 	$(CLEAN_C) $(APP)
