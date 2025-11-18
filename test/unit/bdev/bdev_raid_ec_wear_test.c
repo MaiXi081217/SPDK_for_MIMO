@@ -27,11 +27,40 @@ enum wear_leveling_mode {
 
 /* 前向声明 */
 struct ec_bdev;
-int wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode);
-void wear_leveling_ext_unregister(struct ec_bdev *ec_bdev);
-int wear_leveling_ext_set_mode(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode);
-int wear_leveling_ext_get_mode(struct ec_bdev *ec_bdev);
-int wear_leveling_ext_set_tbw(struct ec_bdev *ec_bdev, uint16_t base_bdev_index, uint64_t tbw);
+
+/* Mock 函数（因为 wear_leveling_ext.c 不存在） */
+int wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode)
+{
+	(void)ec_bdev;
+	(void)mode;
+	return 0; /* 成功 */
+}
+
+void wear_leveling_ext_unregister(struct ec_bdev *ec_bdev)
+{
+	(void)ec_bdev;
+}
+
+int wear_leveling_ext_set_mode(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode)
+{
+	(void)ec_bdev;
+	(void)mode;
+	return 0; /* 成功 */
+}
+
+int wear_leveling_ext_get_mode(struct ec_bdev *ec_bdev)
+{
+	(void)ec_bdev;
+	return WL_MODE_DISABLED; /* 默认返回 DISABLED */
+}
+
+int wear_leveling_ext_set_tbw(struct ec_bdev *ec_bdev, uint16_t base_bdev_index, uint64_t tbw)
+{
+	(void)ec_bdev;
+	(void)base_bdev_index;
+	(void)tbw;
+	return 0; /* 成功 */
+}
 #endif
 
 /* Mock structures and functions */
