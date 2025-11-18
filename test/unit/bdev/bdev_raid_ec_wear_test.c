@@ -921,7 +921,16 @@ test_rebuild_scenario_4_old_disk_with_sb_after_rebuild(void)
 		raid_bdev_sb_update_base_bdev_state(raid_bdev, slot, RAID_SB_BASE_BDEV_CONFIGURED);
 
 		/* 验证：如果旧盘的 UUID 匹配但 slot 已经被新盘占用，应该拒绝加入 */
-		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot);
+		const struct raid_bdev_sb_base_bdev *sb_base = NULL;
+		if (raid_bdev->sb != NULL) {
+			uint8_t i;
+			for (i = 0; i < raid_bdev->sb->base_bdevs_size; i++) {
+				if (raid_bdev->sb->base_bdevs[i].slot == slot) {
+					sb_base = &raid_bdev->sb->base_bdevs[i];
+					break;
+				}
+			}
+		}
 		if (sb_base != NULL) {
 			/* Slot 已经被占用（CONFIGURED），旧盘不应该被加入 */
 			CU_ASSERT(sb_base->state == RAID_SB_BASE_BDEV_CONFIGURED);
@@ -1027,7 +1036,16 @@ test_rebuild_scenario_6_repaired_disk_rejoin(void)
 		/* 6. 验证是否可以重新加入（作为 spare 或替换） */
 		/* 7. 验证是否需要重建（因为数据可能已过时） */
 
-		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot);
+		const struct raid_bdev_sb_base_bdev *sb_base = NULL;
+		if (raid_bdev->sb != NULL) {
+			uint8_t i;
+			for (i = 0; i < raid_bdev->sb->base_bdevs_size; i++) {
+				if (raid_bdev->sb->base_bdevs[i].slot == slot) {
+					sb_base = &raid_bdev->sb->base_bdevs[i];
+					break;
+				}
+			}
+		}
 		if (sb_base != NULL) {
 			/* 如果 UUID 匹配且状态是 FAILED，修复后应该可以重新加入 */
 			CU_ASSERT(sb_base->state == RAID_SB_BASE_BDEV_FAILED);
