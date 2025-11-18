@@ -137,7 +137,17 @@ test_raid_rebuild_state_persistence(void)
 		CU_ASSERT(state_updated == true);
 
 		/* 验证状态已更新 */
-		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot);
+		/* 注意：raid_bdev_sb_find_base_bdev_by_slot 是静态函数，实际测试中需要通过其他方式验证 */
+		const struct raid_bdev_sb_base_bdev *sb_base = NULL;
+		if (raid_bdev->sb != NULL) {
+			uint8_t i;
+			for (i = 0; i < raid_bdev->sb->base_bdevs_size; i++) {
+				if (raid_bdev->sb->base_bdevs[i].slot == slot) {
+					sb_base = &raid_bdev->sb->base_bdevs[i];
+					break;
+				}
+			}
+		}
 		if (sb_base != NULL) {
 			CU_ASSERT(sb_base->state == RAID_SB_BASE_BDEV_REBUILDING);
 		}
@@ -502,7 +512,7 @@ test_wear_leveling_register(void)
 	/* Cleanup */
 	if (ec_bdev) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, NULL, NULL);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
 	}
 }
 
@@ -546,7 +556,7 @@ test_wear_leveling_set_mode(void)
 	/* Cleanup */
 	if (ec_bdev) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, NULL, NULL);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
 	}
 }
 
@@ -578,7 +588,7 @@ test_wear_leveling_auto_fallback(void)
 	/* Cleanup */
 	if (ec_bdev) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, NULL, NULL);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
 	}
 }
 
@@ -611,7 +621,7 @@ test_wear_leveling_set_tbw(void)
 	/* Cleanup */
 	if (ec_bdev) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, NULL, NULL);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
 	}
 }
 
