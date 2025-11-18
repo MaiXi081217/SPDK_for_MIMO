@@ -278,8 +278,16 @@ const char *raid_bdev_level_to_str(enum raid_level level);
 enum raid_bdev_state raid_bdev_str_to_state(const char *str);
 const char *raid_bdev_state_to_str(enum raid_bdev_state state);
 const char *raid_bdev_process_to_str(enum raid_process_type value);
+/* Forward declaration */
+enum raid_rebuild_state;
+const char *raid_rebuild_state_to_str(enum raid_rebuild_state state);
 void raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w);
 int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_base_bdev_cb cb_fn, void *cb_ctx);
+/* Get rebuild progress API */
+int raid_bdev_get_rebuild_progress(struct raid_bdev *raid_bdev, uint64_t *current_offset,
+				   uint64_t *total_size);
+/* Check if rebuild is in progress */
+bool raid_bdev_is_rebuilding(struct raid_bdev *raid_bdev);
 
 /*
  * RAID module descriptor
@@ -481,6 +489,15 @@ enum raid_bdev_sb_base_bdev_state {
 	RAID_SB_BASE_BDEV_CONFIGURED	= 1,
 	RAID_SB_BASE_BDEV_FAILED	= 2,
 	RAID_SB_BASE_BDEV_SPARE		= 3,
+	RAID_SB_BASE_BDEV_REBUILDING	= 4,	/* Rebuild in progress but not completed */
+};
+
+/* Rebuild state for fine-grained tracking */
+enum raid_rebuild_state {
+	RAID_REBUILD_STATE_IDLE,
+	RAID_REBUILD_STATE_READING,
+	RAID_REBUILD_STATE_WRITING,
+	RAID_REBUILD_STATE_CALCULATING,	/* For RAID5F parity calculation */
 };
 
 struct raid_bdev_sb_base_bdev {
@@ -496,10 +513,14 @@ struct raid_bdev_sb_base_bdev {
 	uint32_t		flags;
 	/* slot number of this base bdev in the raid */
 	uint8_t			slot;
+	/* Rebuild progress: current offset in blocks (only valid when state is REBUILDING) */
+	uint64_t		rebuild_offset;
+	/* Rebuild progress: total size in blocks (only valid when state is REBUILDING) */
+	uint64_t		rebuild_total_size;
 
-	uint8_t			reserved[23];
+	uint8_t			reserved[15];
 };
-SPDK_STATIC_ASSERT(sizeof(struct raid_bdev_sb_base_bdev) == 64, "incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct raid_bdev_sb_base_bdev) == 80, "incorrect size");
 
 struct raid_bdev_superblock {
 #define RAID_BDEV_SB_SIG "SPDKRAID"
@@ -565,6 +586,12 @@ int raid_bdev_wipe_single_base_bdev_superblock(struct raid_base_bdev_info *base_
 						raid_base_bdev_cb cb, void *cb_ctx);
 int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 					raid_bdev_load_sb_cb cb, void *cb_ctx);
+/* Update superblock base bdev state for a specific slot */
+bool raid_bdev_sb_update_base_bdev_state(struct raid_bdev *raid_bdev, uint8_t slot,
+					 enum raid_bdev_sb_base_bdev_state new_state);
+/* Update rebuild progress in superblock for a specific slot */
+bool raid_bdev_sb_update_rebuild_progress(struct raid_bdev *raid_bdev, uint8_t slot,
+					  uint64_t rebuild_offset, uint64_t rebuild_total_size);
 
 struct spdk_raid_bdev_opts {
 	/* Size of the background process window in KiB */
