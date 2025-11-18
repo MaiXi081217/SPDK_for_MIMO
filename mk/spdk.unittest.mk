@@ -33,10 +33,12 @@ APP = $(TEST_FILE:.c=)$(EXEEXT)
 
 ifneq ($(UNIT_TEST_LINK_ENV),1)
 ENV_LINKER_ARGS =
+ENV_LIBS =
 else
 # Rewrite the env linker args to be static.
 ENV_DPDK_FILE = $(call spdk_lib_list_to_static_libs,env_dpdk)
 SPDK_LIB_LIST += env_dpdk
+ENV_LIBS = $(ENV_DPDK_FILE)
 endif
 
 install: all
