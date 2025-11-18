@@ -16,6 +16,18 @@
 #define EC_MAX_K 255
 #define EC_MAX_P 255
 
+/* Buffer pool configuration */
+#define EC_BDEV_DEFAULT_BUF_ALIGNMENT	0x1000	/* 4KB default alignment */
+#define EC_BDEV_PARITY_BUF_POOL_MAX	128	/* Maximum parity buffers in pool */
+#define EC_BDEV_RMW_BUF_POOL_MAX	64	/* Maximum RMW stripe buffers in pool */
+#define EC_BDEV_BITMAP_SIZE_LIMIT	64	/* Bitmap size limit for fast lookup */
+
+/* Invalid offset marker */
+#define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
+
+/* RPC configuration */
+#define EC_RPC_MAX_BASE_BDEVS		255	/* Maximum base bdevs in RPC */
+
 /*
  * EC bdev state
  */

@@ -38,7 +38,7 @@ int
 ec_bdev_alloc_superblock(struct ec_bdev *ec_bdev, uint32_t block_size)
 {
 	struct ec_bdev_superblock *sb;
-	uint64_t align = 0x1000; /* Default 4KB alignment */
+	uint64_t align = EC_BDEV_DEFAULT_BUF_ALIGNMENT;
 	struct ec_base_bdev_info *base_info;
 
 	assert(ec_bdev->sb == NULL);
@@ -122,7 +122,7 @@ ec_bdev_alloc_sb_io_buf(struct ec_bdev *ec_bdev)
 {
 	struct ec_bdev_superblock *sb = ec_bdev->sb;
 	uint32_t data_block_size = spdk_bdev_get_data_block_size(&ec_bdev->bdev);
-	uint64_t align = 0x1000; /* Default alignment */
+	uint64_t align = EC_BDEV_DEFAULT_BUF_ALIGNMENT;
 	struct ec_base_bdev_info *base_info;
 
 	/* Try to get alignment from first configured base bdev if available */
@@ -789,7 +789,7 @@ ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
 	ctx->cb_ctx = cb_ctx;
 
 	/* Allocate zero buffer for wiping */
-	ctx->zero_buf = spdk_dma_malloc(ec_bdev->sb_io_buf_size, 0x1000, NULL);
+	ctx->zero_buf = spdk_dma_malloc(ec_bdev->sb_io_buf_size, EC_BDEV_DEFAULT_BUF_ALIGNMENT, NULL);
 	if (ctx->zero_buf == NULL) {
 		SPDK_ERRLOG("Failed to allocate buffer for wiping superblock\n");
 		free(ctx);

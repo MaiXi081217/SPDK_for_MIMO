@@ -18,8 +18,6 @@
 extern struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev) __attribute__((weak));
 extern struct spdk_pci_device *spdk_nvme_ctrlr_get_pci_device(struct spdk_nvme_ctrlr *ctrlr) __attribute__((weak));
 
-#define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
-
 static bool g_shutdown_started = false;
 
 
@@ -969,16 +967,27 @@ ec_start(struct ec_bdev *ec_bdev)
 
 	/* Set optimal_io_boundary for reading (similar to RAID0/RAID5F)
 	 * This allows bdev layer to automatically split I/O at strip boundaries
-	 * Note: We do NOT set write_unit_size to allow flexible writes (FTL-friendly)
+
+
 	 * Only set if we have multiple base bdevs (k + p > 1), similar to RAID0
 	 */
 	if (ec_bdev->num_base_bdevs > 1) {
 		ec_bdev->bdev.optimal_io_boundary = ec_bdev->strip_size;
 		ec_bdev->bdev.split_on_optimal_io_boundary = true;
+		
+		/* Set write_unit_size to full stripe size (strip_size * k) as a hint for optimal write performance
+		 * Note: We do NOT set split_on_write_unit to avoid rejecting small writes (< write_unit_size).
+		 * Instead, we rely on optimal_io_boundary splitting and EC module's RMW handling for partial stripes.
+		 * This allows both small writes (via RMW) and large writes (via full stripe path) to work correctly.
+		 */
+		ec_bdev->bdev.write_unit_size = ec_bdev->strip_size * k;
+		ec_bdev->bdev.split_on_write_unit = false;
 	} else {
 		/* Do not need to split reads/writes on single bdev EC modules. */
 		ec_bdev->bdev.optimal_io_boundary = 0;
 		ec_bdev->bdev.split_on_optimal_io_boundary = false;
+		ec_bdev->bdev.write_unit_size = 0;
+		ec_bdev->bdev.split_on_write_unit = false;
 	}
 
 	return 0;
@@ -1085,11 +1094,7 @@ ec_bdev_unregister_extension(struct ec_bdev *ec_bdev)
 struct ec_bdev_extension_if *
 ec_bdev_get_extension(struct ec_bdev *ec_bdev)
 {
-	if (ec_bdev == NULL) {
-		return NULL;
-	}
-
-	return ec_bdev->extension_if;
+	return ec_bdev != NULL ? ec_bdev->extension_if : NULL;
 }
 
 /* ec_select_base_bdevs_default is defined in bdev_ec_io.c */
