@@ -730,7 +730,16 @@ test_rebuild_resume_after_restart(void)
 		raid_bdev_sb_update_rebuild_progress(raid_bdev, slot, rebuild_offset, rebuild_total);
 
 		/* 验证状态和进度已保存 */
-		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot);
+		const struct raid_bdev_sb_base_bdev *sb_base = NULL;
+		if (raid_bdev->sb != NULL) {
+			uint8_t i;
+			for (i = 0; i < raid_bdev->sb->base_bdevs_size; i++) {
+				if (raid_bdev->sb->base_bdevs[i].slot == slot) {
+					sb_base = &raid_bdev->sb->base_bdevs[i];
+					break;
+				}
+			}
+		}
 		if (sb_base != NULL) {
 			CU_ASSERT(sb_base->state == RAID_SB_BASE_BDEV_REBUILDING);
 			CU_ASSERT(sb_base->rebuild_offset == rebuild_offset);
@@ -814,7 +823,16 @@ test_rebuild_scenario_2_add_new_disk_auto_rebuild(void)
 		/* 8. 验证 superblock 是否更新（状态变为 REBUILDING） */
 
 		/* 验证逻辑：如果 UUID 不匹配或为 NULL，应该自动启动重建 */
-		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot);
+		const struct raid_bdev_sb_base_bdev *sb_base = NULL;
+		if (raid_bdev->sb != NULL) {
+			uint8_t i;
+			for (i = 0; i < raid_bdev->sb->base_bdevs_size; i++) {
+				if (raid_bdev->sb->base_bdevs[i].slot == slot) {
+					sb_base = &raid_bdev->sb->base_bdevs[i];
+					break;
+				}
+			}
+		}
 		if (sb_base != NULL) {
 			CU_ASSERT(sb_base->state == RAID_SB_BASE_BDEV_MISSING);
 		}
@@ -866,7 +884,16 @@ test_rebuild_scenario_3_rebuild_interrupted_resume(void)
 		/* 5. 验证 superblock 状态是否保留为 REBUILDING */
 		/* 6. 验证重建进度是否保留 */
 
-		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot);
+		const struct raid_bdev_sb_base_bdev *sb_base = NULL;
+		if (raid_bdev->sb != NULL) {
+			uint8_t i;
+			for (i = 0; i < raid_bdev->sb->base_bdevs_size; i++) {
+				if (raid_bdev->sb->base_bdevs[i].slot == slot) {
+					sb_base = &raid_bdev->sb->base_bdevs[i];
+					break;
+				}
+			}
+		}
 		if (sb_base != NULL) {
 			CU_ASSERT(sb_base->state == RAID_SB_BASE_BDEV_REBUILDING);
 			CU_ASSERT(sb_base->rebuild_offset == rebuild_offset);
