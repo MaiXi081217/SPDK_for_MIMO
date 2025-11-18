@@ -132,6 +132,62 @@ raid_bdev_sb_check_crc(struct raid_bdev_superblock *sb)
 	return crc == prev;
 }
 
+/*
+ * Update superblock base bdev state for a specific slot
+ * This helper function reduces code duplication across the codebase
+ */
+bool
+raid_bdev_sb_update_base_bdev_state(struct raid_bdev *raid_bdev, uint8_t slot,
+				    enum raid_bdev_sb_base_bdev_state new_state)
+{
+	struct raid_bdev_superblock *sb;
+	uint8_t i;
+
+	if (raid_bdev == NULL || raid_bdev->sb == NULL) {
+		return false;
+	}
+
+	sb = raid_bdev->sb;
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		if (sb->base_bdevs[i].slot == slot) {
+			sb->base_bdevs[i].state = new_state;
+			sb->seq_number++;
+			raid_bdev_sb_update_crc(sb);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Update rebuild progress in superblock for a specific slot
+ */
+bool
+raid_bdev_sb_update_rebuild_progress(struct raid_bdev *raid_bdev, uint8_t slot,
+				     uint64_t rebuild_offset, uint64_t rebuild_total_size)
+{
+	struct raid_bdev_superblock *sb;
+	uint8_t i;
+
+	if (raid_bdev == NULL || raid_bdev->sb == NULL) {
+		return false;
+	}
+
+	sb = raid_bdev->sb;
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		if (sb->base_bdevs[i].slot == slot) {
+			sb->base_bdevs[i].rebuild_offset = rebuild_offset;
+			sb->base_bdevs[i].rebuild_total_size = rebuild_total_size;
+			sb->seq_number++;
+			raid_bdev_sb_update_crc(sb);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static int
 raid_bdev_parse_superblock(struct raid_bdev_read_sb_ctx *ctx)
 {
