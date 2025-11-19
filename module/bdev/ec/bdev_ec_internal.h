@@ -206,15 +206,14 @@ ec_select_base_bdevs_with_extension(struct ec_bdev *ec_bdev,
 				    uint8_t *parity_indices)
 {
 	struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
-	int rc;
 
-	/* Check if extension interface is available and has select callback */
+	/* Use extension interface if available, otherwise fall back to default */
 	if (ext_if != NULL && ext_if->select_base_bdevs != NULL) {
-		rc = ext_if->select_base_bdevs(ext_if, ec_bdev,
-						offset_blocks, num_blocks,
-						data_indices, parity_indices,
-						ext_if->ctx);
-		if (rc != 0) {
+		int rc = ext_if->select_base_bdevs(ext_if, ec_bdev,
+						    offset_blocks, num_blocks,
+						    data_indices, parity_indices,
+						    ext_if->ctx);
+		if (spdk_unlikely(rc != 0)) {
 			SPDK_ERRLOG("Extension interface failed to select base bdevs for EC bdev %s\n",
 				    ec_bdev->bdev.name);
 			return rc;
@@ -224,6 +223,23 @@ ec_select_base_bdevs_with_extension(struct ec_bdev *ec_bdev,
 
 	/* Fall back to default selection */
 	return ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+}
+
+/* Extension interface helper - notify I/O completion for wear level tracking */
+static inline void
+ec_notify_extension_io_complete(struct ec_bdev *ec_bdev,
+				struct ec_base_bdev_info *base_info,
+				uint64_t offset_blocks,
+				uint32_t num_blocks,
+				bool is_write)
+{
+	struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
+
+	if (ext_if != NULL && ext_if->notify_io_complete != NULL && base_info != NULL) {
+		ext_if->notify_io_complete(ext_if, ec_bdev, base_info,
+					   offset_blocks, num_blocks,
+					   is_write, ext_if->ctx);
+	}
 }
 
 /* Rebuild functions */

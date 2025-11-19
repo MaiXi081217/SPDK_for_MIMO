@@ -2029,7 +2029,6 @@ ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 	struct ec_bdev_io *ec_io = cb_arg;
 	struct ec_bdev *ec_bdev;
 	struct ec_base_bdev_info *base_info = NULL;
-	struct ec_bdev_extension_if *ext_if;
 	bool all_complete = false;
 
 	if (ec_io == NULL) {
@@ -2063,15 +2062,11 @@ ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 	}
 
 	/* Notify extension interface of I/O completion for wear level tracking */
-	if (success && base_info != NULL) {
-		ext_if = ec_bdev->extension_if;
-		if (ext_if != NULL && ext_if->notify_io_complete != NULL) {
-			ext_if->notify_io_complete(ext_if, ec_bdev, base_info,
-						   ec_io->offset_blocks,
-						   ec_io->num_blocks,
-						   ec_io->type == SPDK_BDEV_IO_TYPE_WRITE,
-						   ext_if->ctx);
-		}
+	if (success) {
+		ec_notify_extension_io_complete(ec_bdev, base_info,
+						ec_io->offset_blocks,
+						ec_io->num_blocks,
+						ec_io->type == SPDK_BDEV_IO_TYPE_WRITE);
 	}
 
 	spdk_bdev_free_io(bdev_io);

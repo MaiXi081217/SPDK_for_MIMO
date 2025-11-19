@@ -507,7 +507,9 @@ ec_decode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 		 unsigned char **recover_ptrs, uint8_t *frag_err_list, int nerrs, size_t len)
 {
 	struct ec_bdev_module_private *mp;
-	uint8_t k, p;
+	uint8_t k;
+
+	
 	uint8_t i;
 	unsigned char *decode_tbls = NULL;
 	int rc;
@@ -520,7 +522,6 @@ ec_decode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 
 	mp = ec_bdev->module_private;
 	k = ec_bdev->k;
-	p = ec_bdev->p;
 
 	/* Verify all data pointers are non-NULL */
 	for (i = 0; i < k; i++) {

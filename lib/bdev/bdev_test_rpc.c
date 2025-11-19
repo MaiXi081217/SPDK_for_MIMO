@@ -16,6 +16,7 @@
 #include "bdev_raid.h"
 #include "bdev_ec.h"
 #include "bdev_ec_internal.h"
+#include "wear_leveling_ext.h"
 #include "spdk/crc32.h"
 
 /* 测试结果结构 */
@@ -1161,6 +1162,406 @@ test_ec_io_mapping_logic(void)
 	test_free_fake_ec_bdev(ec_bdev);
 	add_test_result(test_name, test_passed,
 			test_passed ? NULL : err_msg);
+}
+
+/* ============================================================================
+ * 磨损均衡扩展模块测试
+ * ============================================================================ */
+
+/* 测试磨损均衡扩展模块的注册和注销 */
+static void
+test_wear_leveling_register_unregister(void)
+{
+	const char *test_name = "wear_leveling_register_unregister";
+	struct ec_bdev *ec_bdev = NULL;
+	int rc;
+	bool test_passed = true;
+	char err_msg[256] = {0};
+
+	SPDK_NOTICELOG("Starting test: %s\n", test_name);
+
+	/* 创建EC bdev用于测试 */
+	rc = test_create_ec_bdev("test_wl_register", 128, 2, 2, true, &ec_bdev);
+	if (rc != 0 || ec_bdev == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
+		add_test_result(test_name, false, err_msg);
+		return;
+	}
+
+	/* 测试1: 注册DISABLED模式 */
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_DISABLED);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "注册DISABLED模式失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 验证扩展已注册 */
+	if (ec_bdev->extension_if == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "扩展接口未注册");
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试2: 获取模式 */
+	int mode = wear_leveling_ext_get_mode(ec_bdev);
+	if (mode != WL_MODE_DISABLED) {
+		snprintf(err_msg, sizeof(err_msg), "模式不匹配: 期望=%d, 实际=%d", WL_MODE_DISABLED, mode);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试3: 注销扩展 */
+	wear_leveling_ext_unregister(ec_bdev);
+	if (ec_bdev->extension_if != NULL) {
+		snprintf(err_msg, sizeof(err_msg), "扩展接口未注销");
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试4: 重新注册SIMPLE模式 */
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_SIMPLE);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "注册SIMPLE模式失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	mode = wear_leveling_ext_get_mode(ec_bdev);
+	if (mode != WL_MODE_SIMPLE) {
+		snprintf(err_msg, sizeof(err_msg), "SIMPLE模式不匹配: 期望=%d, 实际=%d", WL_MODE_SIMPLE, mode);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试5: 注册FULL模式 */
+	rc = wear_leveling_ext_set_mode(ec_bdev, WL_MODE_FULL);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "切换到FULL模式失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	mode = wear_leveling_ext_get_mode(ec_bdev);
+	if (mode != WL_MODE_FULL) {
+		snprintf(err_msg, sizeof(err_msg), "FULL模式不匹配: 期望=%d, 实际=%d", WL_MODE_FULL, mode);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试6: 重复注册应该失败 */
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_DISABLED);
+	if (rc != -EEXIST) {
+		snprintf(err_msg, sizeof(err_msg), "重复注册应该失败，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+cleanup:
+	if (ec_bdev != NULL) {
+		wear_leveling_ext_unregister(ec_bdev);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+	}
+	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
+}
+
+/* 测试磨损均衡模式切换 */
+static void
+test_wear_leveling_mode_switching(void)
+{
+	const char *test_name = "wear_leveling_mode_switching";
+	struct ec_bdev *ec_bdev = NULL;
+	int rc;
+	bool test_passed = true;
+	char err_msg[256] = {0};
+
+	SPDK_NOTICELOG("Starting test: %s\n", test_name);
+
+	rc = test_create_ec_bdev("test_wl_mode", 128, 2, 2, true, &ec_bdev);
+	if (rc != 0 || ec_bdev == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
+		add_test_result(test_name, false, err_msg);
+		return;
+	}
+
+	/* 注册DISABLED模式 */
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_DISABLED);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "注册失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试模式切换序列 */
+	enum wear_leveling_mode modes[] = {WL_MODE_SIMPLE, WL_MODE_FULL, WL_MODE_DISABLED, WL_MODE_SIMPLE};
+	const char *mode_names[] = {"SIMPLE", "FULL", "DISABLED", "SIMPLE"};
+
+	for (int i = 0; i < 4; i++) {
+		rc = wear_leveling_ext_set_mode(ec_bdev, modes[i]);
+		if (rc != 0) {
+			snprintf(err_msg, sizeof(err_msg), "切换到%s模式失败: %d", mode_names[i], rc);
+			test_passed = false;
+			goto cleanup;
+		}
+
+		int current_mode = wear_leveling_ext_get_mode(ec_bdev);
+		if (current_mode != modes[i]) {
+			snprintf(err_msg, sizeof(err_msg), "模式切换后不匹配: 期望=%d (%s), 实际=%d",
+				 modes[i], mode_names[i], current_mode);
+			test_passed = false;
+			goto cleanup;
+		}
+	}
+
+	/* 测试无效模式 */
+	rc = wear_leveling_ext_set_mode(ec_bdev, 99);
+	if (rc != -EINVAL) {
+		snprintf(err_msg, sizeof(err_msg), "无效模式应该被拒绝，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+cleanup:
+	if (ec_bdev != NULL) {
+		wear_leveling_ext_unregister(ec_bdev);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+	}
+	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
+}
+
+/* 测试TBW设置 */
+static void
+test_wear_leveling_tbw_setting(void)
+{
+	const char *test_name = "wear_leveling_tbw_setting";
+	struct ec_bdev *ec_bdev = NULL;
+	int rc;
+	bool test_passed = true;
+	char err_msg[256] = {0};
+
+	SPDK_NOTICELOG("Starting test: %s\n", test_name);
+
+	rc = test_create_ec_bdev("test_wl_tbw", 128, 2, 2, true, &ec_bdev);
+	if (rc != 0 || ec_bdev == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
+		add_test_result(test_name, false, err_msg);
+		return;
+	}
+
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_FULL);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "注册失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试1: 设置有效的TBW值 */
+	rc = wear_leveling_ext_set_tbw(ec_bdev, 0, 180.0);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "设置TBW失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试2: 设置另一个base bdev的TBW */
+	rc = wear_leveling_ext_set_tbw(ec_bdev, 1, 200.0);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "设置第二个TBW失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试3: 无效的TBW值应该被拒绝 */
+	rc = wear_leveling_ext_set_tbw(ec_bdev, 0, -1.0);
+	if (rc != -EINVAL) {
+		snprintf(err_msg, sizeof(err_msg), "负TBW值应该被拒绝，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	rc = wear_leveling_ext_set_tbw(ec_bdev, 0, 0.0);
+	if (rc != -EINVAL) {
+		snprintf(err_msg, sizeof(err_msg), "零TBW值应该被拒绝，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	rc = wear_leveling_ext_set_tbw(ec_bdev, 0, 200000.0);
+	if (rc != -EINVAL) {
+		snprintf(err_msg, sizeof(err_msg), "超大TBW值应该被拒绝，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试4: 无效的索引应该被拒绝 */
+	rc = wear_leveling_ext_set_tbw(ec_bdev, 255, 180.0);
+	if (rc != -EINVAL) {
+		snprintf(err_msg, sizeof(err_msg), "无效索引应该被拒绝，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+cleanup:
+	if (ec_bdev != NULL) {
+		wear_leveling_ext_unregister(ec_bdev);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+	}
+	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
+}
+
+/* 测试预测参数设置 */
+static void
+test_wear_leveling_predict_params(void)
+{
+	const char *test_name = "wear_leveling_predict_params";
+	struct ec_bdev *ec_bdev = NULL;
+	int rc;
+	bool test_passed = true;
+	char err_msg[256] = {0};
+
+	SPDK_NOTICELOG("Starting test: %s\n", test_name);
+
+	rc = test_create_ec_bdev("test_wl_predict", 128, 2, 2, true, &ec_bdev);
+	if (rc != 0 || ec_bdev == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
+		add_test_result(test_name, false, err_msg);
+		return;
+	}
+
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_FULL);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "注册失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试1: 设置有效的预测参数 */
+	rc = wear_leveling_ext_set_predict_params(ec_bdev, 20971520ULL, 5, 30000000ULL);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "设置预测参数失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试2: 无效的百分比阈值应该被拒绝 */
+	rc = wear_leveling_ext_set_predict_params(ec_bdev, 20971520ULL, 0, 30000000ULL);
+	if (rc != -EINVAL) {
+		snprintf(err_msg, sizeof(err_msg), "零百分比阈值应该被拒绝，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	rc = wear_leveling_ext_set_predict_params(ec_bdev, 20971520ULL, 101, 30000000ULL);
+	if (rc != -EINVAL) {
+		snprintf(err_msg, sizeof(err_msg), "超过100的百分比阈值应该被拒绝，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试3: read_interval_us为0是允许的（用于调试） */
+	rc = wear_leveling_ext_set_predict_params(ec_bdev, 20971520ULL, 5, 0);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "read_interval_us=0应该被允许，但返回: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+cleanup:
+	if (ec_bdev != NULL) {
+		wear_leveling_ext_unregister(ec_bdev);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+	}
+	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
+}
+
+/* 测试磨损感知的base bdev选择（确定性测试） */
+static void
+test_wear_leveling_selection_deterministic(void)
+{
+	const char *test_name = "wear_leveling_selection_deterministic";
+	struct ec_bdev *ec_bdev = NULL;
+	int rc;
+	bool test_passed = true;
+	char err_msg[256] = {0};
+	uint8_t data_indices1[EC_MAX_K], parity_indices1[EC_MAX_P];
+	uint8_t data_indices2[EC_MAX_K], parity_indices2[EC_MAX_P];
+
+	SPDK_NOTICELOG("Starting test: %s\n", test_name);
+
+	rc = test_create_ec_bdev("test_wl_select", 128, 2, 2, true, &ec_bdev);
+	if (rc != 0 || ec_bdev == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
+		add_test_result(test_name, false, err_msg);
+		return;
+	}
+
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_SIMPLE);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "注册失败: %d", rc);
+		test_passed = false;
+		goto cleanup;
+	}
+
+	/* 测试确定性：同一stripe_index应该产生相同的结果 */
+	uint64_t stripe_index = 10;
+	uint64_t offset_blocks = stripe_index * ec_bdev->k * ec_bdev->strip_size;
+	uint32_t num_blocks = ec_bdev->strip_size;
+
+	/* 第一次选择 */
+	if (ec_bdev->extension_if != NULL && ec_bdev->extension_if->select_base_bdevs != NULL) {
+		rc = ec_bdev->extension_if->select_base_bdevs(ec_bdev->extension_if, ec_bdev,
+							      offset_blocks, num_blocks,
+							      data_indices1, parity_indices1,
+							      ec_bdev->extension_if->ctx);
+		if (rc != 0) {
+			snprintf(err_msg, sizeof(err_msg), "第一次选择失败: %d", rc);
+			test_passed = false;
+			goto cleanup;
+		}
+
+		/* 第二次选择（应该产生相同结果） */
+		rc = ec_bdev->extension_if->select_base_bdevs(ec_bdev->extension_if, ec_bdev,
+							      offset_blocks, num_blocks,
+							      data_indices2, parity_indices2,
+							      ec_bdev->extension_if->ctx);
+		if (rc != 0) {
+			snprintf(err_msg, sizeof(err_msg), "第二次选择失败: %d", rc);
+			test_passed = false;
+			goto cleanup;
+		}
+
+		/* 验证结果一致性 */
+		for (uint8_t i = 0; i < ec_bdev->k; i++) {
+			if (data_indices1[i] != data_indices2[i]) {
+				snprintf(err_msg, sizeof(err_msg),
+					 "数据索引不一致: stripe=%lu, idx=%u, 第一次=%u, 第二次=%u",
+					 stripe_index, i, data_indices1[i], data_indices2[i]);
+				test_passed = false;
+				goto cleanup;
+			}
+		}
+
+		for (uint8_t i = 0; i < ec_bdev->p; i++) {
+			if (parity_indices1[i] != parity_indices2[i]) {
+				snprintf(err_msg, sizeof(err_msg),
+					 "校验索引不一致: stripe=%lu, idx=%u, 第一次=%u, 第二次=%u",
+					 stripe_index, i, parity_indices1[i], parity_indices2[i]);
+				test_passed = false;
+				goto cleanup;
+			}
+		}
+	} else {
+		snprintf(err_msg, sizeof(err_msg), "扩展接口未正确注册");
+		test_passed = false;
+		goto cleanup;
+	}
+
+cleanup:
+	if (ec_bdev != NULL) {
+		wear_leveling_ext_unregister(ec_bdev);
+		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+	}
+	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
 
 /* ============================================================================
@@ -2534,6 +2935,15 @@ rpc_bdev_test_all(struct spdk_jsonrpc_request *request,
 	test_ec_wear_leveling_distribution();
 	test_ec_io_mapping_logic();
 	SPDK_DEBUGLOG(bdev_raid, "EC wear-leveling and IO tests completed\n");
+
+	/* 磨损均衡扩展模块测试 */
+	SPDK_NOTICELOG("Running wear leveling extension module tests...\n");
+	test_wear_leveling_register_unregister();
+	test_wear_leveling_mode_switching();
+	test_wear_leveling_tbw_setting();
+	test_wear_leveling_predict_params();
+	test_wear_leveling_selection_deterministic();
+	SPDK_DEBUGLOG(bdev_raid, "Wear leveling extension module tests completed\n");
 
 	/* RAID 重建场景测试 */
 	SPDK_NOTICELOG("Running RAID rebuild scenario tests...\n");

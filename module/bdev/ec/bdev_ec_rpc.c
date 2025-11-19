@@ -268,14 +268,23 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 		ctx->status = status;
 	}
 
-	/* Runtime check instead of assert (assert may be disabled in release builds) */
+	/* Handle error case: if remaining is already 0, it means all base bdevs failed
+	 * and we've already processed the error. This can happen when multiple base bdevs
+	 * fail synchronously. In this case, we should just return to avoid double processing.
+	 */
 	if (ctx->remaining == 0) {
-		SPDK_ERRLOG("Invalid state: remaining counter is 0 in callback\n");
+		/* This is expected when all base bdevs fail - error already handled */
+		if (ctx->status != 0) {
+			SPDK_DEBUGLOG(bdev_ec, "All base bdevs failed, error already handled\n");
+		} else {
+			SPDK_ERRLOG("Invalid state: remaining counter is 0 but no error status\n");
+		}
 		free_rpc_bdev_ec_create_ctx(ctx);
 		return;
 	}
 
 	if (--ctx->remaining > 0) {
+		/* Still waiting for more base bdevs to be added */
 		return;
 	}
 
@@ -326,16 +335,35 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 			}
 		}
 		
+		/* Send error response with detailed error reason */
 		if (ctx->status == -ENODEV) {
 			if (ctx->missing_base_bdev_name != NULL) {
 				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-							     "Failed to create EC bdev %s: base bdev '%s' not found",
+							     "Failed to create EC bdev %s: base bdev '%s' not found (device may not exist or not be registered)",
 							     ctx->req.name, ctx->missing_base_bdev_name);
 			} else {
 				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-							     "Failed to create EC bdev %s: base bdev not found",
+							     "Failed to create EC bdev %s: base bdev not found (device may not exist or not be registered)",
 							     ctx->req.name);
 			}
+		} else if (ctx->status == -EPERM) {
+			if (ctx->missing_base_bdev_name != NULL) {
+				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+							     "Failed to create EC bdev %s: base bdev '%s' is already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdev first",
+							     ctx->req.name, ctx->missing_base_bdev_name);
+			} else {
+				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+							     "Failed to create EC bdev %s: one or more base bdevs are already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdevs first",
+							     ctx->req.name);
+			}
+		} else if (ctx->status == -EINVAL) {
+			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+						     "Failed to create EC bdev %s: invalid parameter (check base bdev configuration, UUID mismatch, or other validation errors)",
+						     ctx->req.name);
+		} else if (ctx->status == -ENOMEM) {
+			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+						     "Failed to create EC bdev %s: out of memory",
+						     ctx->req.name);
 		} else {
 			/* ctx->status is negative errno, normalize for spdk_strerror */
 			int err = ctx->status;
@@ -343,9 +371,9 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 				err = -err;
 			}
 			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-						     "Failed to create EC bdev %s: %s",
+						     "Failed to create EC bdev %s: %s (error code: %d)",
 						     ctx->req.name,
-						     spdk_strerror(-err));
+						     spdk_strerror(-err), ctx->status);
 		}
     } else {
 		/* Register wear leveling extension if mode is not DISABLED */
@@ -455,9 +483,23 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 	rc = ec_bdev_create(req->name, req->strip_size_kb, req->k, req->p,
 		   req->superblock_enabled, &req->uuid, &ec_bdev);
 	if (rc != 0) {
-		spdk_jsonrpc_send_error_response_fmt(request, rc,
-					     "Failed to create EC bdev %s: %s",
-					     req->name, spdk_strerror(-rc));
+		if (rc == -EEXIST) {
+			spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "EC bdev with name '%s' already exists. Please delete the existing bdev first or use a different name",
+						     req->name);
+		} else if (rc == -EINVAL) {
+			spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "Failed to create EC bdev %s: invalid parameter (name too long, invalid strip_size, k/p values, or other validation errors)",
+						     req->name);
+		} else if (rc == -ENOMEM) {
+			spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "Failed to create EC bdev %s: out of memory",
+						     req->name);
+		} else {
+			spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "Failed to create EC bdev %s: %s (error code: %d)",
+						     req->name, spdk_strerror(-rc), rc);
+		}
 		goto cleanup;
 	}
 
@@ -488,10 +530,27 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 				if (ctx->missing_base_bdev_name == NULL) {
 					SPDK_ERRLOG("Failed to allocate memory for missing base bdev name\n");
 				}
+			} else if (rc == -EPERM) {
+				/* Base bdev is already claimed - fail immediately */
+				ctx->status = -EPERM;
+				/* Store the name of the claimed base bdev for error reporting */
+				if (ctx->missing_base_bdev_name == NULL) {
+					ctx->missing_base_bdev_name = strdup(base_bdev_name);
+					if (ctx->missing_base_bdev_name == NULL) {
+						SPDK_ERRLOG("Failed to allocate memory for claimed base bdev name\n");
+					}
+				}
 			} else {
 				/* Other errors */
 				if (ctx->status == 0) {
 					ctx->status = rc;
+				}
+				/* Store the name of the failed base bdev for error reporting if not already set */
+				if (ctx->missing_base_bdev_name == NULL) {
+					ctx->missing_base_bdev_name = strdup(base_bdev_name);
+					if (ctx->missing_base_bdev_name == NULL) {
+						SPDK_ERRLOG("Failed to allocate memory for failed base bdev name\n");
+					}
 				}
 			}
 			
@@ -508,9 +567,79 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 				ctx->remaining -= (uint8_t)remaining_to_cancel;
 			}
 			
-			/* Call callback to delete EC bdev and send error response.
-			 * This will handle cleanup and response. */
-			rpc_bdev_ec_create_add_base_bdev_cb(ctx, rc);
+			/* If remaining is now 0, we need to handle the error directly
+			 * because the callback will see remaining == 0 and return early.
+			 * Otherwise, call the callback which will handle it when remaining reaches 0.
+			 */
+			if (ctx->remaining == 0) {
+				/* All base bdevs failed - handle error directly */
+				if (ctx->ec_bdev != NULL) {
+					/* Cleanup EC bdev */
+					if (ctx->ec_bdev->state == EC_BDEV_STATE_CONFIGURING &&
+					    ctx->ec_bdev->num_base_bdevs_discovered == 0) {
+						struct ec_bdev *iter;
+						bool found = false;
+						TAILQ_FOREACH(iter, &g_ec_bdev_list, global_link) {
+							if (iter == ctx->ec_bdev) {
+								found = true;
+								break;
+							}
+						}
+						if (found) {
+							ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
+						} else {
+							ec_bdev_free(ctx->ec_bdev);
+						}
+					} else {
+						ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
+					}
+				}
+				
+				/* Send error response with detailed error reason */
+				if (ctx->status == -ENODEV) {
+					if (ctx->missing_base_bdev_name != NULL) {
+						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+									     "Failed to create EC bdev %s: base bdev '%s' not found (device may not exist or not be registered)",
+									     ctx->req.name, ctx->missing_base_bdev_name);
+					} else {
+						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+									     "Failed to create EC bdev %s: base bdev not found (device may not exist or not be registered)",
+									     ctx->req.name);
+					}
+				} else if (ctx->status == -EPERM) {
+					if (ctx->missing_base_bdev_name != NULL) {
+						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+									     "Failed to create EC bdev %s: base bdev '%s' is already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdev first",
+									     ctx->req.name, ctx->missing_base_bdev_name);
+					} else {
+						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+									     "Failed to create EC bdev %s: one or more base bdevs are already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdevs first",
+									     ctx->req.name);
+					}
+				} else if (ctx->status == -EINVAL) {
+					spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+								     "Failed to create EC bdev %s: invalid parameter (check base bdev configuration, UUID mismatch, or other validation errors)",
+								     ctx->req.name);
+				} else if (ctx->status == -ENOMEM) {
+					spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+								     "Failed to create EC bdev %s: out of memory",
+								     ctx->req.name);
+				} else {
+					int err = ctx->status;
+					if (err > 0) {
+						err = -err;
+					}
+					spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+								     "Failed to create EC bdev %s: %s (error code: %d)",
+								     ctx->req.name,
+								     spdk_strerror(-err), ctx->status);
+				}
+				
+				free_rpc_bdev_ec_create_ctx(ctx);
+			} else {
+				/* Call callback - it will handle when remaining reaches 0 */
+				rpc_bdev_ec_create_add_base_bdev_cb(ctx, rc);
+			}
 			break;
 		}
 		/* else: rc == 0, callback will be called asynchronously by ec_bdev_configure_base_bdev */
