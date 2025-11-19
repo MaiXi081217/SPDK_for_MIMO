@@ -1673,3 +1673,9 @@ def add_parser(subparsers):
     p.add_argument('-b', '--name', help='Name of the bdev', required=True)
     p.add_argument('-s', '--size', help='Size in bytes to wipe (default: 1MB)', type=int, default=0)
     p.set_defaults(func=bdev_wipe_superblock)
+
+    def bdev_test_all(args):
+        print_dict(args.client.bdev_test_all())
+    
+    p = subparsers.add_parser('bdev_test_all', help='Run all tests for RAID, EC, and rebuild scenarios')
+    p.set_defaults(func=bdev_test_all)

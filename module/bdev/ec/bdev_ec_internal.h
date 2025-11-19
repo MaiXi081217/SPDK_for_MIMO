@@ -9,6 +9,20 @@
 #include "bdev_ec.h"
 #include "spdk/vmd.h"
 
+/* Prefetch support - use compiler builtin if available, otherwise use inline asm */
+#ifdef __SSE__
+#include <emmintrin.h>
+#define EC_PREFETCH(addr, hint) _mm_prefetch((const char *)(addr), (hint))
+#elif defined(__GNUC__) || defined(__clang__)
+#define EC_PREFETCH(addr, hint) __builtin_prefetch((addr), 0, (hint))
+#else
+/* No prefetch support - define as no-op */
+#define EC_PREFETCH(addr, hint) do { (void)(addr); (void)(hint); } while (0)
+#endif
+
+/* ISA-L optimal alignment for SIMD operations */
+#define EC_ISAL_OPTIMAL_ALIGN	64
+
 /* Type identifier for module_private structures */
 enum ec_private_type {
 	EC_PRIVATE_TYPE_FULL_STRIPE,
@@ -182,6 +196,36 @@ int ec_decode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 int ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 				 uint8_t *data_indices, uint8_t *parity_indices);
 
+/* Extension interface helper - unified base bdev selection */
+static inline int
+ec_select_base_bdevs_with_extension(struct ec_bdev *ec_bdev,
+				    uint64_t offset_blocks,
+				    uint32_t num_blocks,
+				    uint64_t stripe_index,
+				    uint8_t *data_indices,
+				    uint8_t *parity_indices)
+{
+	struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
+	int rc;
+
+	/* Check if extension interface is available and has select callback */
+	if (ext_if != NULL && ext_if->select_base_bdevs != NULL) {
+		rc = ext_if->select_base_bdevs(ext_if, ec_bdev,
+						offset_blocks, num_blocks,
+						data_indices, parity_indices,
+						ext_if->ctx);
+		if (rc != 0) {
+			SPDK_ERRLOG("Extension interface failed to select base bdevs for EC bdev %s\n",
+				    ec_bdev->bdev.name);
+			return rc;
+		}
+		return 0;
+	}
+
+	/* Fall back to default selection */
+	return ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+}
+
 /* Rebuild functions */
 int ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_base_info,
 			  void (*done_cb)(void *ctx, int status), void *done_ctx);
@@ -199,6 +243,70 @@ void ec_bdev_set_healthy_disks_led(struct ec_bdev *ec_bdev, enum spdk_vmd_led_st
 /* RMW stripe buffer management */
 unsigned char *ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size);
 void ec_put_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, unsigned char *buf, uint32_t buf_size);
+
+/* Validation helper functions */
+static inline int
+ec_validate_encode_params(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
+			  unsigned char **parity_ptrs, size_t len)
+{
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("ec_bdev is NULL\n");
+		return -EINVAL;
+	}
+
+	if (data_ptrs == NULL || parity_ptrs == NULL) {
+		SPDK_ERRLOG("EC bdev %s: data_ptrs or parity_ptrs is NULL\n", ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	if (ec_bdev->module_private == NULL || ec_bdev->module_private->g_tbls == NULL) {
+		SPDK_ERRLOG("EC bdev %s: module_private or g_tbls is NULL\n", ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	if (len == 0) {
+		SPDK_ERRLOG("EC bdev %s: encoding length is zero\n", ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static inline int
+ec_validate_decode_params(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
+			  unsigned char **recover_ptrs, uint8_t *frag_err_list,
+			  int nerrs, size_t len)
+{
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("ec_bdev is NULL\n");
+		return -EINVAL;
+	}
+
+	if (data_ptrs == NULL || recover_ptrs == NULL || frag_err_list == NULL) {
+		SPDK_ERRLOG("EC bdev %s: data_ptrs, recover_ptrs or frag_err_list is NULL\n",
+			    ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	if (ec_bdev->module_private == NULL || ec_bdev->module_private->encode_matrix == NULL) {
+		SPDK_ERRLOG("EC bdev %s: module_private or encode_matrix is NULL\n",
+			    ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	if (nerrs == 0 || nerrs > ec_bdev->p) {
+		SPDK_ERRLOG("EC bdev %s: invalid nerrs %d (must be 1-%u)\n",
+			    ec_bdev->bdev.name, nerrs, ec_bdev->p);
+		return -EINVAL;
+	}
+
+	if (len == 0) {
+		SPDK_ERRLOG("EC bdev %s: decoding length is zero\n", ec_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
 
 #endif /* SPDK_BDEV_EC_INTERNAL_H */
 

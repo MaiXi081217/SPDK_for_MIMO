@@ -18,8 +18,6 @@
 extern struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev) __attribute__((weak));
 extern struct spdk_pci_device *spdk_nvme_ctrlr_get_pci_device(struct spdk_nvme_ctrlr *ctrlr) __attribute__((weak));
 
-#define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
-
 static bool g_shutdown_started = false;
 
 

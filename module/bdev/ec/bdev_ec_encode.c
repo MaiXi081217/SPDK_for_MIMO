@@ -12,17 +12,6 @@
 #include <isa-l/gf_vect_mul.h>
 #include <string.h>
 
-/* Prefetch support - use compiler builtin if available, otherwise use inline asm */
-#ifdef __SSE__
-#include <emmintrin.h>
-#define EC_PREFETCH(addr, hint) _mm_prefetch((const char *)(addr), (hint))
-#elif defined(__GNUC__) || defined(__clang__)
-#define EC_PREFETCH(addr, hint) __builtin_prefetch((addr), 0, (hint))
-#else
-/* No prefetch support - define as no-op */
-#define EC_PREFETCH(addr, hint) do { (void)(addr); (void)(hint); } while (0)
-#endif
-
 /*
  * brief:
  * ec_encode_stripe encodes data stripe using ISA-L
@@ -42,25 +31,14 @@ ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 	uint8_t k, p;
 	uint8_t i;
 	bool misaligned_warning = false;
-	const size_t isal_optimal_align = 64;  /* ISA-L optimal alignment for SIMD */
 
 	/* Validate input parameters */
-	if (ec_bdev == NULL) {
-		SPDK_ERRLOG("ec_bdev is NULL\n");
-		return -EINVAL;
-	}
-
-	if (data_ptrs == NULL || parity_ptrs == NULL) {
-		SPDK_ERRLOG("EC bdev %s: data_ptrs or parity_ptrs is NULL\n", ec_bdev->bdev.name);
-		return -EINVAL;
+	int rc = ec_validate_encode_params(ec_bdev, data_ptrs, parity_ptrs, len);
+	if (rc != 0) {
+		return rc;
 	}
 
 	mp = ec_bdev->module_private;
-	if (mp == NULL || mp->g_tbls == NULL) {
-		SPDK_ERRLOG("EC bdev %s: module_private or g_tbls is NULL\n", ec_bdev->bdev.name);
-		return -EINVAL;
-	}
-
 	/* Optimized: Cache k and p to reduce memory access */
 	k = ec_bdev->k;
 	p = ec_bdev->p;
@@ -77,7 +55,7 @@ ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 		/* Check alignment while validating - combine operations */
 		if (!misaligned_warning) {
 			uintptr_t addr = (uintptr_t)data_ptrs[i];
-			if ((addr % isal_optimal_align) != 0) {
+			if ((addr % EC_ISAL_OPTIMAL_ALIGN) != 0) {
 				misaligned_warning = true;
 			}
 		}
@@ -90,18 +68,14 @@ ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 		/* Check alignment while validating */
 		if (!misaligned_warning) {
 			uintptr_t addr = (uintptr_t)parity_ptrs[i];
-			if ((addr % isal_optimal_align) != 0) {
+			if ((addr % EC_ISAL_OPTIMAL_ALIGN) != 0) {
 				misaligned_warning = true;
 			}
 		}
 	}
 
-	/* Verify length is non-zero and check alignment */
-	if (len == 0) {
-		SPDK_ERRLOG("EC bdev %s: encoding length is zero\n", ec_bdev->bdev.name);
-		return -EINVAL;
-	}
-	if (!misaligned_warning && (len % isal_optimal_align) != 0) {
+	/* Check alignment */
+	if (!misaligned_warning && (len % EC_ISAL_OPTIMAL_ALIGN) != 0) {
 		misaligned_warning = true;
 	}
 
@@ -215,9 +189,10 @@ ec_encode_stripe_update(struct ec_bdev *ec_bdev, uint8_t vec_i,
 	uint8_t k, p;
 	uint8_t i;
 	unsigned char *delta_data = NULL;
-	const size_t isal_optimal_align = 64;
 
-	if (mp == NULL || mp->g_tbls == NULL) {
+	if (ec_bdev == NULL || mp == NULL || mp->g_tbls == NULL) {
+		SPDK_ERRLOG("EC bdev %s: ec_bdev, module_private or g_tbls is NULL\n",
+			    ec_bdev ? ec_bdev->bdev.name : "NULL");
 		return -EINVAL;
 	}
 
@@ -233,7 +208,7 @@ ec_encode_stripe_update(struct ec_bdev *ec_bdev, uint8_t vec_i,
 	if (old_data != NULL && new_data != NULL) {
 		/* Allocate temporary buffer for delta if needed */
 		/* For optimal performance, delta should be aligned */
-		delta_data = spdk_dma_malloc(len, isal_optimal_align, NULL);
+		delta_data = spdk_dma_malloc(len, EC_ISAL_OPTIMAL_ALIGN, NULL);
 		if (delta_data == NULL) {
 			SPDK_ERRLOG("Failed to allocate delta buffer for incremental update\n");
 			/* Fall back to full re-encode if delta allocation fails */
@@ -538,37 +513,14 @@ ec_decode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 	int rc;
 
 	/* Validate input parameters */
-	if (ec_bdev == NULL) {
-		SPDK_ERRLOG("ec_bdev is NULL\n");
-		return -EINVAL;
-	}
-
-	if (data_ptrs == NULL || recover_ptrs == NULL || frag_err_list == NULL) {
-		SPDK_ERRLOG("EC bdev %s: data_ptrs, recover_ptrs or frag_err_list is NULL\n",
-			    ec_bdev->bdev.name);
-		return -EINVAL;
+	rc = ec_validate_decode_params(ec_bdev, data_ptrs, recover_ptrs, frag_err_list, nerrs, len);
+	if (rc != 0) {
+		return rc;
 	}
 
 	mp = ec_bdev->module_private;
-	if (mp == NULL || mp->encode_matrix == NULL) {
-		SPDK_ERRLOG("EC bdev %s: module_private or encode_matrix is NULL\n",
-			    ec_bdev->bdev.name);
-		return -EINVAL;
-	}
-
 	k = ec_bdev->k;
 	p = ec_bdev->p;
-
-	if (nerrs == 0 || nerrs > p) {
-		SPDK_ERRLOG("EC bdev %s: invalid nerrs %d (must be 1-%u)\n",
-			    ec_bdev->bdev.name, nerrs, p);
-		return -EINVAL;
-	}
-
-	if (len == 0) {
-		SPDK_ERRLOG("EC bdev %s: decoding length is zero\n", ec_bdev->bdev.name);
-		return -EINVAL;
-	}
 
 	/* Verify all data pointers are non-NULL */
 	for (i = 0; i < k; i++) {

@@ -15,8 +15,6 @@
 #include <string.h>
 #include <errno.h>
 
-#define RPC_MAX_BASE_BDEVS 255
-
 /*
  * Input structure for bdev_ec_get_bdevs RPC
  */
@@ -119,7 +117,7 @@ struct rpc_bdev_ec_create_base_bdevs {
 	size_t                        num_base_bdevs;
 
 	/* List of base bdevs with their roles */
-	struct rpc_bdev_ec_base_bdev  base_bdevs[RPC_MAX_BASE_BDEVS];
+	struct rpc_bdev_ec_base_bdev  base_bdevs[EC_RPC_MAX_BASE_BDEVS];
 };
 
 /*
@@ -195,7 +193,7 @@ decode_ec_base_bdevs(const struct spdk_json_val *val, void *out)
 	int rc;
 
 	rc = spdk_json_decode_array(val, decode_ec_base_bdev_entry, base_bdevs->base_bdevs,
-				    RPC_MAX_BASE_BDEVS, &base_bdevs->num_base_bdevs,
+				    EC_RPC_MAX_BASE_BDEVS, &base_bdevs->num_base_bdevs,
 				    sizeof(struct rpc_bdev_ec_base_bdev));
 	if (rc != 0) {
 		return rc;
@@ -206,7 +204,7 @@ decode_ec_base_bdevs(const struct spdk_json_val *val, void *out)
 		return -EINVAL; /* Empty array is invalid - need at least one base bdev */
 	}
 
-	if (base_bdevs->num_base_bdevs > RPC_MAX_BASE_BDEVS) {
+	if (base_bdevs->num_base_bdevs > EC_RPC_MAX_BASE_BDEVS) {
 		/* This should not happen as spdk_json_decode_array enforces the limit,
 		 * but check for safety */
 		return -EINVAL;
