@@ -97,6 +97,8 @@ spdk_tgt_started(void *arg1)
 	} else {
 		SPDK_WARNLOG("Failed to send startup notification (rc=%d)\n", notify_rc);
 	}
+
+	/* Physical device removal notifications are handled in bdev_nvme module's remove_cb */
 }
 
 int

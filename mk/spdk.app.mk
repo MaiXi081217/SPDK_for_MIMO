@@ -4,6 +4,7 @@
 #
 
 include $(SPDK_ROOT_DIR)/mk/spdk.app_vars.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
 # Applications in app/ go into build/bin/.
 # Applications in examples/ go into build/examples/.
@@ -34,6 +35,15 @@ uninstall: empty_rule
 # To avoid overwriting warning
 empty_rule:
 	@:
+
+# Build Go notification bridge shared library before linking
+# (required by bdev_nvme module which is part of BLOCKDEV_MODULES_LIST)
+$(APP): $(GO_NOTIFY_LIB)
+
+$(GO_NOTIFY_LIB):
+	@echo "  GO BUILD $(notdir $@)"
+	$(Q)mkdir -p $(GO_NOTIFY_LIB_DIR)
+	$(Q)cd $(GO_NOTIFY_SRC_DIR) && go build -buildmode=c-shared -o $(GO_NOTIFY_LIB) .
 
 $(APP) : $(OBJS) $(SPDK_LIB_FILES) $(ENV_LIBS)
 	$(LINK_C)

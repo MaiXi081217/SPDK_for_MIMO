@@ -31,6 +31,7 @@
 
 #include "spdk_internal/usdt.h"
 #include "spdk_internal/trace_defs.h"
+#include "spdk_go_notify.h"
 
 #define NVME_CTRLR_LOG_FMT "%s%s%s:%s,cntlid:%u"
 #define NVME_CTRLR_LOG_ARGS(nvme_ctrlr) \
@@ -6225,7 +6226,71 @@ static void
 remove_cb(void *cb_ctx, struct spdk_nvme_ctrlr *ctrlr)
 {
 	struct nvme_ctrlr *nvme_ctrlr = cb_ctx;
+	struct nvme_ns *ns, *tmp_ns;
+	char payload[1024];
+	char bdev_list[512] = "";
+	int payload_len = 0;
+	int bdev_count = 0;
+	const struct spdk_nvme_transport_id *trid;
 
+	/* Collect information about removed controller and its bdevs */
+	if (nvme_ctrlr->active_path_id) {
+		trid = &nvme_ctrlr->active_path_id->trid;
+	} else {
+		trid = NULL;
+	}
+
+	/* Collect all bdev names associated with this controller */
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	RB_FOREACH_SAFE(ns, nvme_ns_tree, &nvme_ctrlr->namespaces, tmp_ns) {
+		if (ns->bdev) {
+			if (bdev_count > 0) {
+				strncat(bdev_list, "\",\"", sizeof(bdev_list) - strlen(bdev_list) - 1);
+			} else {
+				strncat(bdev_list, "\"", sizeof(bdev_list) - strlen(bdev_list) - 1);
+			}
+			strncat(bdev_list, ns->bdev->disk.name,
+				sizeof(bdev_list) - strlen(bdev_list) - 1);
+			bdev_count++;
+		}
+	}
+	if (bdev_count > 0) {
+		strncat(bdev_list, "\"", sizeof(bdev_list) - strlen(bdev_list) - 1);
+	}
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+
+	/* Build notification payload */
+	if (trid && trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
+		payload_len = snprintf(payload, sizeof(payload),
+				       "{\"traddr\":\"%s\",\"ctrlr_name\":\"%s\",\"bdev_count\":%d",
+				       trid->traddr,
+				       nvme_ctrlr->nbdev_ctrlr ? nvme_ctrlr->nbdev_ctrlr->name : "unknown",
+				       bdev_count);
+	} else if (trid) {
+		payload_len = snprintf(payload, sizeof(payload),
+				       "{\"traddr\":\"%s\",\"ctrlr_name\":\"%s\",\"bdev_count\":%d",
+				       trid->traddr,
+				       nvme_ctrlr->nbdev_ctrlr ? nvme_ctrlr->nbdev_ctrlr->name : "unknown",
+				       bdev_count);
+	} else {
+		payload_len = snprintf(payload, sizeof(payload),
+				       "{\"ctrlr_name\":\"%s\",\"bdev_count\":%d",
+				       nvme_ctrlr->nbdev_ctrlr ? nvme_ctrlr->nbdev_ctrlr->name : "unknown",
+				       bdev_count);
+	}
+
+	if (bdev_count > 0 && strlen(bdev_list) > 0) {
+		snprintf(payload + payload_len, sizeof(payload) - payload_len,
+			 ",\"bdevs\":[%s]}", bdev_list);
+	} else {
+		strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
+	}
+
+	/* Send notification about physical device removal */
+	NotifyEvent("nvme_ctrlr_physically_removed", payload);
+	NVME_CTRLR_INFOLOG(nvme_ctrlr, "Physical removal notification sent: %s\n", payload);
+
+	/* Continue with normal removal process */
 	bdev_nvme_delete_ctrlr(nvme_ctrlr, true);
 }
 

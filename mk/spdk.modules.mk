@@ -87,6 +87,13 @@ BLOCKDEV_MODULES_LIST += bdev_daos
 BLOCKDEV_MODULES_PRIVATE_LIBS += -ldaos -ldaos_common -ldfs -lgurt -luuid -ldl
 endif
 
+# Go notification bridge library (required by bdev_nvme module)
+GO_NOTIFY_LIB_DIR := $(SPDK_ROOT_DIR)/build/lib
+GO_NOTIFY_LIB := $(GO_NOTIFY_LIB_DIR)/libspdk_go_notify.so
+GO_NOTIFY_SRC_DIR := $(SPDK_ROOT_DIR)/go/notifybridge
+BLOCKDEV_MODULES_PRIVATE_LIBS += -L$(GO_NOTIFY_LIB_DIR) -lspdk_go_notify -Wl,-rpath=$(GO_NOTIFY_LIB_DIR)
+COMMON_CFLAGS += -I$(SPDK_ROOT_DIR)/include
+
 SOCK_MODULES_LIST = sock_posix
 
 ifeq ($(OS), Linux)
