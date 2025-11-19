@@ -31,66 +31,106 @@ static int ec_submit_decode_read(struct ec_bdev_io *ec_io, uint64_t stripe_index
 				 uint32_t strip_idx_in_stripe, uint32_t offset_in_strip);
 
 /*
- * Get parity buffer from pool or allocate new one
+ * Generic buffer pool get function - extracts common logic
+ * Returns buffer from pool or allocates new one
  */
 static unsigned char *
-ec_get_parity_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size)
+ec_get_buf_from_pool(struct ec_parity_buf_entry **pool_head,
+		     uint32_t *pool_size, uint32_t *pool_count,
+		     uint32_t expected_size, uint32_t requested_size,
+		     struct ec_bdev *ec_bdev, const char *pool_name)
 {
 	struct ec_parity_buf_entry *entry;
 	unsigned char *buf;
 	size_t align;
 
+	if (pool_head == NULL) {
+		return NULL;
+	}
+
+	/* Use ec_bdev alignment if available, otherwise default */
+	align = (ec_bdev != NULL && ec_bdev->buf_alignment > 0) ?
+		ec_bdev->buf_alignment : EC_BDEV_DEFAULT_BUF_ALIGNMENT;
+
+	/* Fast path - check pool first */
+	entry = SLIST_FIRST((SLIST_HEAD(, ec_parity_buf_entry) *)pool_head);
+	if (spdk_likely(entry != NULL && *pool_size == requested_size)) {
+		SLIST_REMOVE_HEAD((SLIST_HEAD(, ec_parity_buf_entry) *)pool_head, link);
+		if (spdk_likely(*pool_count > 0)) {
+			(*pool_count)--;
+		} else {
+			SPDK_WARNLOG("%s pool count is 0 but pool is not empty\n", pool_name);
+		}
+		buf = entry->buf;
+		free(entry);
+		return buf;
+	} else if (entry != NULL) {
+		/* Size mismatch - clean up */
+		SPDK_WARNLOG("Buffer size mismatch in %s pool: expected %u, requested %u\n",
+			     pool_name, *pool_size, requested_size);
+		SLIST_REMOVE_HEAD((SLIST_HEAD(, ec_parity_buf_entry) *)pool_head, link);
+		if (*pool_count > 0) {
+			(*pool_count)--;
+		} else {
+			SPDK_WARNLOG("%s pool count is 0 but pool is not empty (size mismatch)\n", pool_name);
+		}
+		spdk_dma_free(entry->buf);
+		free(entry);
+	}
+
+	/* Allocate new buffer */
+	buf = spdk_dma_malloc(requested_size, align, NULL);
+	return buf;
+}
+
+/*
+ * Generic buffer pool put function - extracts common logic
+ * Returns buffer to pool or frees it
+ */
+static void
+ec_put_buf_to_pool(struct ec_parity_buf_entry **pool_head,
+		   uint32_t *pool_size, uint32_t *pool_count,
+		   uint32_t buf_size, uint32_t max_pool_size,
+		   unsigned char *buf, const char *pool_name)
+{
+	struct ec_parity_buf_entry *entry;
+
+	if (buf == NULL || pool_head == NULL) {
+		return;
+	}
+
+	/* Only pool buffers of the correct size, limit pool size */
+	if (*pool_size == buf_size && *pool_count < max_pool_size) {
+		entry = malloc(sizeof(*entry));
+		if (entry != NULL) {
+			entry->buf = buf;
+			SLIST_INSERT_HEAD((SLIST_HEAD(, ec_parity_buf_entry) *)pool_head, entry, link);
+			(*pool_count)++;
+			return;
+		}
+	}
+
+	/* Pool full or allocation failed - free the buffer */
+	spdk_dma_free(buf);
+}
+
+/*
+ * Get parity buffer from pool or allocate new one
+ */
+static unsigned char *
+ec_get_parity_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size)
+{
 	if (ec_ch == NULL) {
 		return NULL;
 	}
 
-	/* Use ec_bdev alignment if available, otherwise default to 4KB */
-	align = (ec_bdev != NULL && ec_bdev->buf_alignment > 0) ? 
-		ec_bdev->buf_alignment : 0x1000;
-
-	/* Optimized: Fast path - check pool first
-	 * Most common case: buffer is available in pool
-	 * Use branch prediction hints for better performance
-	 */
-	entry = SLIST_FIRST(&ec_ch->parity_buf_pool);
-	if (spdk_likely(entry != NULL && ec_ch->parity_buf_size == buf_size)) {
-		SLIST_REMOVE_HEAD(&ec_ch->parity_buf_pool, link);
-		/* Prevent counter underflow */
-		if (spdk_likely(ec_ch->parity_buf_count > 0)) {
-			ec_ch->parity_buf_count--;
-		} else {
-			SPDK_WARNLOG("parity_buf_count is 0 but pool is not empty\n");
-		}
-		buf = entry->buf;
-		/* Free the entry structure - we only need the buffer */
-		free(entry);
-		return buf;
-	} else if (entry != NULL) {
-		/* Size mismatch - this shouldn't happen if pool is used correctly,
-		 * but clean it up to avoid memory leak */
-		SPDK_WARNLOG("Buffer size mismatch in parity pool: expected %u, requested %u\n",
-			     ec_ch->parity_buf_size, buf_size);
-		/* Remove mismatched entry and free it */
-		SLIST_REMOVE_HEAD(&ec_ch->parity_buf_pool, link);
-		/* Prevent counter underflow */
-		if (ec_ch->parity_buf_count > 0) {
-			ec_ch->parity_buf_count--;
-		} else {
-			SPDK_WARNLOG("parity_buf_count is 0 but pool is not empty (size mismatch)\n");
-		}
-		spdk_dma_free(entry->buf);
-		free(entry);
-		/* Continue to allocate new buffer */
-	}
-
-	/* Allocate new buffer - use malloc instead of zmalloc for better performance */
-	/* Parity buffers don't need to be zero-initialized as they will be overwritten by encoding */
-	buf = spdk_dma_malloc(buf_size, align, NULL);
-	if (buf == NULL) {
-		return NULL;
-	}
-
-	return buf;
+	return ec_get_buf_from_pool((struct ec_parity_buf_entry **)&ec_ch->parity_buf_pool,
+				    &ec_ch->parity_buf_size,
+				    &ec_ch->parity_buf_count,
+				    ec_ch->parity_buf_size,
+				    buf_size,
+				    ec_bdev,
+				    "parity");
 }
 
 /*
@@ -99,28 +139,17 @@ ec_get_parity_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uin
 static void
 ec_put_parity_buf(struct ec_bdev_io_channel *ec_ch, unsigned char *buf, uint32_t buf_size)
 {
-	struct ec_parity_buf_entry *entry;
-
-	if (buf == NULL || ec_ch == NULL) {
+	if (ec_ch == NULL) {
 		return;
 	}
 
-	/* Only pool buffers of the correct size, limit pool size to avoid memory waste */
-	/* Optimized: Increased pool size to 128 for better concurrency and stability */
-	if (ec_ch->parity_buf_size == buf_size && ec_ch->parity_buf_count < 128) {
-		/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
-		entry = malloc(sizeof(*entry));
-		if (entry != NULL) {
-			entry->buf = buf;
-			SLIST_INSERT_HEAD(&ec_ch->parity_buf_pool, entry, link);
-			ec_ch->parity_buf_count++;
-			return;
-		}
-		/* Entry allocation failed - fall through to free buffer */
-	}
-
-	/* Pool full or allocation failed - free the buffer */
-	spdk_dma_free(buf);
+	ec_put_buf_to_pool((struct ec_parity_buf_entry **)&ec_ch->parity_buf_pool,
+			   &ec_ch->parity_buf_size,
+			   &ec_ch->parity_buf_count,
+			   buf_size,
+			   EC_BDEV_PARITY_BUF_POOL_MAX,
+			   buf,
+			   "parity");
 }
 
 /*
@@ -129,57 +158,17 @@ ec_put_parity_buf(struct ec_bdev_io_channel *ec_ch, unsigned char *buf, uint32_t
 unsigned char *
 ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size)
 {
-	struct ec_parity_buf_entry *entry;
-	unsigned char *buf;
-	size_t align;
-
 	if (ec_ch == NULL) {
 		return NULL;
 	}
 
-	/* Use ec_bdev alignment if available, otherwise default to 4KB */
-	align = (ec_bdev != NULL && ec_bdev->buf_alignment > 0) ? 
-		ec_bdev->buf_alignment : 0x1000;
-
-	/* Optimized: Fast path - check pool first */
-	entry = SLIST_FIRST(&ec_ch->rmw_stripe_buf_pool);
-	if (spdk_likely(entry != NULL && ec_ch->rmw_buf_size == buf_size)) {
-		SLIST_REMOVE_HEAD(&ec_ch->rmw_stripe_buf_pool, link);
-		/* Prevent counter underflow */
-		if (spdk_likely(ec_ch->rmw_buf_count > 0)) {
-			ec_ch->rmw_buf_count--;
-		} else {
-			SPDK_WARNLOG("rmw_buf_count is 0 but pool is not empty\n");
-		}
-		buf = entry->buf;
-		/* Free the entry structure - we only need the buffer */
-		free(entry);
-		return buf;
-	} else if (entry != NULL) {
-		/* Size mismatch - this shouldn't happen if pool is used correctly,
-		 * but clean it up to avoid memory leak */
-		SPDK_WARNLOG("Buffer size mismatch in RMW stripe pool: expected %u, requested %u\n",
-			     ec_ch->rmw_buf_size, buf_size);
-		/* Remove mismatched entry and free it */
-		SLIST_REMOVE_HEAD(&ec_ch->rmw_stripe_buf_pool, link);
-		/* Prevent counter underflow */
-		if (ec_ch->rmw_buf_count > 0) {
-			ec_ch->rmw_buf_count--;
-		} else {
-			SPDK_WARNLOG("rmw_buf_count is 0 but pool is not empty (size mismatch)\n");
-		}
-		spdk_dma_free(entry->buf);
-		free(entry);
-		/* Continue to allocate new buffer */
-	}
-
-	/* Allocate new buffer - use malloc instead of zmalloc */
-	buf = spdk_dma_malloc(buf_size, align, NULL);
-	if (buf == NULL) {
-		return NULL;
-	}
-
-	return buf;
+	return ec_get_buf_from_pool((struct ec_parity_buf_entry **)&ec_ch->rmw_stripe_buf_pool,
+				    &ec_ch->rmw_buf_size,
+				    &ec_ch->rmw_buf_count,
+				    ec_ch->rmw_buf_size,
+				    buf_size,
+				    ec_bdev,
+				    "RMW stripe");
 }
 
 /*
@@ -188,28 +177,17 @@ ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev,
 void
 ec_put_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, unsigned char *buf, uint32_t buf_size)
 {
-	struct ec_parity_buf_entry *entry;
-
-	if (buf == NULL || ec_ch == NULL) {
+	if (ec_ch == NULL) {
 		return;
 	}
 
-	/* Only pool buffers of the correct size, limit pool size */
-	/* Optimized: Increased pool size to 64 for better concurrency and stability */
-	if (ec_ch->rmw_buf_size == buf_size && ec_ch->rmw_buf_count < 64) {
-		/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
-		entry = malloc(sizeof(*entry));
-		if (entry != NULL) {
-			entry->buf = buf;
-			SLIST_INSERT_HEAD(&ec_ch->rmw_stripe_buf_pool, entry, link);
-			ec_ch->rmw_buf_count++;
-			return;
-		}
-		/* Entry allocation failed - fall through to free buffer */
-	}
-
-	/* Pool full or allocation failed - free the buffer */
-	spdk_dma_free(buf);
+	ec_put_buf_to_pool((struct ec_parity_buf_entry **)&ec_ch->rmw_stripe_buf_pool,
+			   &ec_ch->rmw_buf_size,
+			   &ec_ch->rmw_buf_count,
+			   buf_size,
+			   EC_BDEV_RMW_BUF_POOL_MAX,
+			   buf,
+			   "RMW stripe");
 }
 
 /*
@@ -307,16 +285,16 @@ ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 
 	/* Select data and parity indices based on round-robin distribution
 	 * Optimize: use bitmap for parity position lookup (O(1) instead of O(p))
-	 * For p <= 64, use uint64_t bitmap; otherwise fall back to array lookup
+	 * For p <= EC_BDEV_BITMAP_SIZE_LIMIT, use uint64_t bitmap; otherwise fall back to array lookup
 	 */
 	uint64_t parity_bitmap = 0;
 	uint8_t parity_positions[EC_MAX_P];
 	
-	/* Pre-calculate parity positions and build bitmap if p <= 64 */
+	/* Pre-calculate parity positions and build bitmap if p <= limit */
 	for (uint8_t p_idx = 0; p_idx < ec_bdev->p; p_idx++) {
 		uint8_t pos = (parity_start + p_idx) % n;
 		parity_positions[p_idx] = pos;
-		if (ec_bdev->p <= 64 && pos < 64) {
+		if (ec_bdev->p <= EC_BDEV_BITMAP_SIZE_LIMIT && pos < EC_BDEV_BITMAP_SIZE_LIMIT) {
 			parity_bitmap |= (1ULL << pos);
 		}
 	}
@@ -334,7 +312,7 @@ ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 
 		/* Check if this position is a parity position - optimized lookup */
 		bool is_parity_pos = false;
-		if (ec_bdev->p <= 64 && i < 64) {
+		if (ec_bdev->p <= EC_BDEV_BITMAP_SIZE_LIMIT && i < EC_BDEV_BITMAP_SIZE_LIMIT) {
 			/* Fast bitmap lookup for small p */
 			is_parity_pos = (parity_bitmap & (1ULL << i)) != 0;
 		} else {
@@ -1713,7 +1691,6 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		/* Optimized: Cache frequently accessed values */
 		uint32_t strip_size = ec_bdev->strip_size;
 		uint32_t strip_size_shift = ec_bdev->strip_size_shift;
-		struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
 
 		start_strip = ec_io->offset_blocks >> strip_size_shift;
 		end_strip = (ec_io->offset_blocks + ec_io->num_blocks - 1) >> strip_size_shift;
@@ -1729,26 +1706,17 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		stripe_index = start_strip / k;
 		offset_in_strip = ec_io->offset_blocks & (strip_size - 1);
 
-		/* Optimized: Check ext_if once and cache the result */
-		bool use_ext_if = (ext_if != NULL && ext_if->select_base_bdevs != NULL);
-		if (use_ext_if) {
-			rc = ext_if->select_base_bdevs(ext_if, ec_bdev,
-						      ec_io->offset_blocks,
-						      ec_io->num_blocks,
-						      data_indices, parity_indices,
-						      ext_if->ctx);
-			if (rc != 0) {
-				SPDK_ERRLOG("Extension interface failed to select base bdevs\n");
-				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-				return;
-			}
-		} else {
-			rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
-			if (rc != 0) {
-				SPDK_ERRLOG("Failed to select base bdevs\n");
-				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-				return;
-			}
+		/* Select base bdevs using extension interface or default */
+		rc = ec_select_base_bdevs_with_extension(ec_bdev,
+							  ec_io->offset_blocks,
+							  ec_io->num_blocks,
+							  stripe_index,
+							  data_indices, parity_indices);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to select base bdevs for EC bdev %s\n",
+				    ec_bdev->bdev.name);
+			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
 		}
 
 		/* Optimized: Check conditions in order of likelihood to fail early */
@@ -1850,7 +1818,6 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		uint32_t offset_in_strip;
 		uint8_t strip_idx_in_stripe;
 		uint8_t target_data_idx;
-		struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
 
 		start_strip = ec_io->offset_blocks >> ec_bdev->strip_size_shift;
 		end_strip = (ec_io->offset_blocks + ec_io->num_blocks - 1) >>
@@ -1909,29 +1876,19 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 
 		uint8_t data_indices[EC_MAX_K];
 		uint8_t parity_indices[EC_MAX_P];
-		/* Optimized: Check ext_if once and cache the result */
-		bool use_ext_if = (ext_if != NULL && ext_if->select_base_bdevs != NULL);
-		if (use_ext_if) {
-			rc = ext_if->select_base_bdevs(ext_if, ec_bdev,
-						      ec_io->offset_blocks,
-						      ec_io->num_blocks,
-						      data_indices, parity_indices,
-						      ext_if->ctx);
-			if (rc != 0) {
-				SPDK_ERRLOG("Extension interface failed to select base bdevs\n");
-				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-				return;
-			}
-			target_data_idx = data_indices[strip_idx_in_stripe];
-		} else {
-			rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
-			if (rc != 0) {
-				SPDK_ERRLOG("Failed to select base bdevs\n");
-				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-				return;
-			}
-			target_data_idx = data_indices[strip_idx_in_stripe];
+		/* Select base bdevs using extension interface or default */
+		rc = ec_select_base_bdevs_with_extension(ec_bdev,
+							  ec_io->offset_blocks,
+							  ec_io->num_blocks,
+							  stripe_index,
+							  data_indices, parity_indices);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to select base bdevs for EC bdev %s\n",
+				    ec_bdev->bdev.name);
+			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
 		}
+		target_data_idx = data_indices[strip_idx_in_stripe];
 
 		base_info = &ec_bdev->base_bdev_info[target_data_idx];
 		if (base_info->desc == NULL || base_info->is_failed ||
@@ -2105,14 +2062,16 @@ ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 		ec_bdev_fail_base_bdev(base_info);
 	}
 
-	if (success && ec_bdev->extension_if != NULL &&
-	    ec_bdev->extension_if->notify_io_complete != NULL && base_info != NULL) {
+	/* Notify extension interface of I/O completion for wear level tracking */
+	if (success && base_info != NULL) {
 		ext_if = ec_bdev->extension_if;
-		ext_if->notify_io_complete(ext_if, ec_bdev, base_info,
-					   ec_io->offset_blocks,
-					   ec_io->num_blocks,
-					   ec_io->type == SPDK_BDEV_IO_TYPE_WRITE,
-					   ext_if->ctx);
+		if (ext_if != NULL && ext_if->notify_io_complete != NULL) {
+			ext_if->notify_io_complete(ext_if, ec_bdev, base_info,
+						   ec_io->offset_blocks,
+						   ec_io->num_blocks,
+						   ec_io->type == SPDK_BDEV_IO_TYPE_WRITE,
+						   ext_if->ctx);
+		}
 	}
 
 	spdk_bdev_free_io(bdev_io);
@@ -2210,4 +2169,5 @@ ec_base_bdev_reset_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 				 SPDK_BDEV_IO_STATUS_SUCCESS :
 				 SPDK_BDEV_IO_STATUS_FAILED);
 }
+
 

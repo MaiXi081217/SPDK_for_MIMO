@@ -10,10 +10,6 @@
 #include "spdk/string.h"
 #include "spdk/log.h"
 #include "spdk/env.h"
-#include "spdk/crc32.h"
-#include "spdk/uuid.h"
-#include <string.h>
-#include <inttypes.h>
 
 #define RPC_MAX_BASE_BDEVS 255
 
