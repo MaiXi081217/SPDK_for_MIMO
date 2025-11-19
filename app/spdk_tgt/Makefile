@@ -36,22 +36,7 @@ ifeq ($(CONFIG_FSDEV),y)
 SPDK_LIB_LIST += event_fsdev
 endif
 
-# Add Go notification bridge shared library
-GO_NOTIFY_LIB_DIR := $(SPDK_ROOT_DIR)/build/lib
-GO_NOTIFY_LIB := $(GO_NOTIFY_LIB_DIR)/libspdk_go_notify.so
-GO_NOTIFY_SRC_DIR := $(SPDK_ROOT_DIR)/go/notifybridge
-SYS_LIBS += -L$(GO_NOTIFY_LIB_DIR) -lspdk_go_notify -Wl,-rpath=$(GO_NOTIFY_LIB_DIR)
-CFLAGS += -I$(SPDK_ROOT_DIR)/include
-
 include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
-
-# Build Go notification bridge shared library before linking
-$(GO_NOTIFY_LIB):
-	@echo "  GO BUILD $(notdir $@)"
-	$(Q)mkdir -p $(GO_NOTIFY_LIB_DIR)
-	$(Q)cd $(GO_NOTIFY_SRC_DIR) && go build -buildmode=c-shared -o $(GO_NOTIFY_LIB) .
-
-$(APP): $(GO_NOTIFY_LIB)
 
 install: $(APP)
 	$(INSTALL_APP)
