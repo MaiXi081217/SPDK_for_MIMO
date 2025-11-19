@@ -8,12 +8,14 @@
 #include "spdk/config.h"
 #include "spdk/env.h"
 #include "spdk/event.h"
+#include "spdk/log.h"
 #if defined(SPDK_CONFIG_VHOST)
 #include "spdk/vhost.h"
 #endif
 #if defined(SPDK_CONFIG_VFIO_USER)
 #include "spdk/vfu_target.h"
 #endif
+#include "spdk_go_notify.h"
 
 #if defined(SPDK_CONFIG_VHOST) || defined(SPDK_CONFIG_VFIO_USER)
 #define SPDK_SOCK_PATH "S:"
@@ -75,6 +77,9 @@ spdk_tgt_parse_arg(int ch, char *arg)
 static void
 spdk_tgt_started(void *arg1)
 {
+	int notify_rc;
+	char payload[128];
+
 	if (g_pid_path) {
 		spdk_tgt_save_pid(g_pid_path);
 	}
@@ -82,6 +87,15 @@ spdk_tgt_started(void *arg1)
 	if (getenv("MEMZONE_DUMP") != NULL) {
 		spdk_memzone_dump(stdout);
 		fflush(stdout);
+	}
+
+	/* Send startup notification */
+	snprintf(payload, sizeof(payload), "{\"pid\": %d, \"name\": \"mimo_tgt\"}", getpid());
+	notify_rc = NotifyEvent("mimo_tgt_started", payload);
+	if (notify_rc == 0) {
+		SPDK_NOTICELOG("Startup notification sent: event=mimo_tgt_started, payload=%s\n", payload);
+	} else {
+		SPDK_WARNLOG("Failed to send startup notification (rc=%d)\n", notify_rc);
 	}
 }
 
