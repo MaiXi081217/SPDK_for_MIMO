@@ -1,0 +1,9 @@
+{
+  "endpoint": "http://127.0.0.1:9090/spdk/events",
+  "method": "POST",
+  "timeout": "2s",
+  "source": "spdk_nvmf",
+  "retry": 3,
+  "retry_backoff_ms": 100
+}
+
