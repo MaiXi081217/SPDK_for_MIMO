@@ -417,7 +417,7 @@ rpc_spdk_get_version(struct spdk_jsonrpc_request *request, const struct spdk_jso
 
 	if (params != NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "spdk_get_version method requires no parameters");
+						 "mimo_get_version method requires no parameters");
 		return;
 	}
 

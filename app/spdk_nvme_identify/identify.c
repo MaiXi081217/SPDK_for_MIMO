@@ -2728,7 +2728,7 @@ usage(const char *program_name)
 	printf("\t-V         enumerate VMD\n");
 	printf("\t-S         socket implementation, e.g. -S uring (default is posix)\n");
 	printf("\t-s         memory size in MB for DPDK\n");
-	printf("\t--no-huge  SPDK is run without hugepages\n");
+	printf("\t--no-huge  MIMO is run without hugepages\n");
 	printf("\t-H         show this usage\n");
 }
 
@@ -2895,7 +2895,7 @@ main(int argc, char **argv)
 		opts.no_pci = true;
 	}
 	if (spdk_env_init(&opts) < 0) {
-		fprintf(stderr, "Unable to initialize SPDK env\n");
+		fprintf(stderr, "Unable to initialize MIMO env\n");
 		return 1;
 	}
 

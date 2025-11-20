@@ -1,4 +1,3 @@
-module github.com/spdk/spdk/go/notifybridge
+module notifybridge
 
-go 1.21
-
+go 1.25.0

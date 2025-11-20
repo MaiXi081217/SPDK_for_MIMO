@@ -21,7 +21,7 @@
 #include <rte_errno.h>
 #include <rte_vfio.h>
 
-#define SPDK_ENV_DPDK_DEFAULT_NAME		"spdk"
+#define SPDK_ENV_DPDK_DEFAULT_NAME		"mimo"
 #define SPDK_ENV_DPDK_DEFAULT_SHM_ID		-1
 #define SPDK_ENV_DPDK_DEFAULT_MEM_SIZE		-1
 #define SPDK_ENV_DPDK_DEFAULT_MAIN_CORE		-1
@@ -580,13 +580,13 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 	}
 
 	if (opts->shm_id < 0) {
-		args = push_arg(args, &argcount, _sprintf_alloc("--file-prefix=spdk_pid%d",
+		args = push_arg(args, &argcount, _sprintf_alloc("--file-prefix=mimo_pid%d",
 				getpid()));
 		if (args == NULL) {
 			return -1;
 		}
 	} else {
-		args = push_arg(args, &argcount, _sprintf_alloc("--file-prefix=spdk%d",
+		args = push_arg(args, &argcount, _sprintf_alloc("--file-prefix=mimo%d",
 				opts->shm_id));
 		if (args == NULL) {
 			return -1;
@@ -693,9 +693,8 @@ spdk_env_init(const struct spdk_env_opts *opts_user)
 	struct spdk_env_opts opts_local = {};
 	struct spdk_env_opts *opts = &opts_local;
 	char **dpdk_args = NULL;
-	char *args_print = NULL, *args_tmp = NULL;
 	OPENSSL_INIT_SETTINGS *settings;
-	int i, rc;
+	int rc;
 	int orig_optind;
 	bool legacy_mem;
 	size_t min_opts_size, user_opts_size;

@@ -591,12 +591,12 @@ setup_exit_signal_handler(void)
 static void
 usage(void)
 {
-	printf("\n%s is used to record all SPDK generated trace entries\n", g_exe_name);
-	printf("from SPDK trace shared-memory to specified file.\n\n");
+	printf("\n%s is used to record all MIMO generated trace entries\n", g_exe_name);
+	printf("from MIMO trace shared-memory to specified file.\n\n");
 	printf("usage:\n");
 	printf("   %s <option>\n", g_exe_name);
 	printf("        option = '-q' to disable verbose mode\n");
-	printf("                 '-s' to specify spdk_trace shm name for a\n");
+	printf("                 '-s' to specify mimo_trace shm name for a\n");
 	printf("                      currently running process\n");
 	printf("                 '-i' to specify the shared memory ID\n");
 	printf("                 '-p' to specify the trace PID\n");

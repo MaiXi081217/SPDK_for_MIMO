@@ -623,7 +623,7 @@ spdk_fio_setup(struct thread_data *td)
 		g_spdk_apptag_mask = (uint16_t)fio_options->apptag_mask;
 		parse_prchk_flags(fio_options->pi_chk);
 		if (spdk_env_init(&opts) < 0) {
-			SPDK_ERRLOG("Unable to initialize SPDK env\n");
+			SPDK_ERRLOG("Unable to initialize MIMO env\n");
 			free(fio_thread->iocq);
 			free(fio_thread);
 			fio_thread = NULL;
@@ -729,7 +729,7 @@ spdk_fio_setup(struct thread_data *td)
 		} else {
 			/* Enumerate all of the controllers */
 			if (spdk_nvme_probe(&trid, &ctx, probe_cb, attach_cb, NULL) != 0) {
-				SPDK_ERRLOG("spdk_nvme_probe() failed\n");
+				SPDK_ERRLOG("NVMe probe failed\n");
 				continue;
 			}
 		}
@@ -1983,7 +1983,7 @@ static struct fio_option options[] = {
 
 /* FIO imports this structure using dlsym */
 struct ioengine_ops ioengine = {
-	.name			= "spdk",
+	.name			= "mimo",
 	.version		= FIO_IOOPS_VERSION,
 	.queue			= spdk_fio_queue,
 	.getevents		= spdk_fio_getevents,

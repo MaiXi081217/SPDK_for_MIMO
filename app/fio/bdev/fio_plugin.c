@@ -392,7 +392,7 @@ spdk_init_thread_poll(void *arg)
 	}
 
 	if (spdk_env_init(&opts) < 0) {
-		SPDK_ERRLOG("Unable to initialize SPDK env\n");
+		SPDK_ERRLOG("Unable to initialize MIMO env\n");
 		rc = EINVAL;
 		goto err_exit;
 	}
