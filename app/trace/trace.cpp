@@ -398,7 +398,7 @@ usage(void)
 	fprintf(stderr, "   %s <option> <lcore#>\n", g_exe_name);
 	fprintf(stderr, "                 '-c' to display single lcore history\n");
 	fprintf(stderr, "                 '-t' to display TSC offset for each event\n");
-	fprintf(stderr, "                 '-s' to specify spdk_trace shm name for a\n");
+	fprintf(stderr, "                 '-s' to specify mimo_trace shm name for a\n");
 	fprintf(stderr, "                      currently running process\n");
 	fprintf(stderr, "                 '-i' to specify the shared memory ID\n");
 	fprintf(stderr, "                 '-p' to specify the trace PID\n");

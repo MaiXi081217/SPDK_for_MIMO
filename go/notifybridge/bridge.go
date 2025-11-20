@@ -38,10 +38,10 @@ var (
 	onceInit       sync.Once
 	initErr        error
 	defaultConfig  = notifyConfig{
-		Endpoint:       "http://127.0.0.1:9090/spdk/events",
+		Endpoint:       "http://127.0.0.1:9988/mimo/events",
 		Method:         http.MethodPost,
 		Timeout:        2 * time.Second,
-		Source:         "spdk",
+		Source:         "mimo",
 		Retry:          2,
 		RetryBackoffMs: 100,
 	}

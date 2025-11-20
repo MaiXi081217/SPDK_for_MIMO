@@ -110,7 +110,7 @@ avahi_entry_group_add_listeners(AvahiEntryGroup *avahi_entry_group,
 				struct spdk_nvmf_subsystem *subsystem)
 {
 	struct spdk_nvmf_subsystem_listener *listener;
-	const char *name_base = "spdk";
+	const char *name_base = "mimo";
 	const char *type_base = "_nvme-disc";
 	const char *domain = "local";
 	char *protocol;
@@ -126,7 +126,7 @@ avahi_entry_group_add_listeners(AvahiEntryGroup *avahi_entry_group,
 		if (listener->trid->trtype == SPDK_NVME_TRANSPORT_TCP) {
 			protocol = "tcp";
 		} else if (listener->trid->trtype == SPDK_NVME_TRANSPORT_RDMA) {
-			SPDK_ERRLOG("Current SPDK doesn't distinguish RoCE(udp) and iWARP(tcp). Skip adding listener id %d to avahi entry",
+			SPDK_ERRLOG("Current MIMO doesn't distinguish RoCE(udp) and iWARP(tcp). Skip adding listener id %d to avahi entry",
 				    listener->id);
 			continue;
 		} else {

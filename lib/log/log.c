@@ -58,7 +58,7 @@ spdk_log_get_print_level(void) {
 static void
 log_open(void *ctx)
 {
-	openlog("spdk", LOG_PID, LOG_LOCAL7);
+	openlog("mimo", LOG_PID, LOG_LOCAL7);
 }
 
 static void
@@ -139,6 +139,34 @@ get_timestamp_prefix(char *buf, int buf_size)
 	snprintf(buf, buf_size, "[%s.%06ld] ", date, usec);
 }
 
+/* Filter function name to replace "spdk_" prefix with "mimo_" for user-visible output */
+static const char *
+filter_func_name(const char *func)
+{
+	static char filtered_name[256];
+	const char *prefix = "spdk_";
+	const char *mimo_prefix = "mimo_";
+	size_t prefix_len = strlen(prefix);
+
+	if (func == NULL) {
+		return NULL;
+	}
+
+	/* Check if function name starts with "spdk_" */
+	if (strncmp(func, prefix, prefix_len) == 0) {
+		size_t remaining_len = strlen(func + prefix_len);
+		size_t total_len = strlen(mimo_prefix) + remaining_len;
+
+		if (total_len < sizeof(filtered_name)) {
+			snprintf(filtered_name, sizeof(filtered_name), "%s%s", mimo_prefix, func + prefix_len);
+			return filtered_name;
+		}
+	}
+
+	/* Return original if no replacement needed or buffer too small */
+	return func;
+}
+
 void
 spdk_log(enum spdk_log_level level, const char *file, const int line, const char *func,
 	 const char *format, ...)
@@ -216,7 +244,8 @@ spdk_vlog(enum spdk_log_level level, const char *file, const int line, const cha
 	if (level <= g_spdk_log_print_level) {
 		get_timestamp_prefix(timestamp, sizeof(timestamp));
 		if (file) {
-			fprintf(stderr, "%s%s:%4d:%s: *%s*: %s", timestamp, file, line, func, spdk_level_names[level], buf);
+			const char *filtered_func = filter_func_name(func);
+			fprintf(stderr, "%s%s:%4d:%s: *%s*: %s", timestamp, file, line, filtered_func, spdk_level_names[level], buf);
 		} else {
 			fprintf(stderr, "%s%s", timestamp, buf);
 		}
@@ -224,7 +253,8 @@ spdk_vlog(enum spdk_log_level level, const char *file, const int line, const cha
 
 	if (level <= g_spdk_log_level) {
 		if (file) {
-			syslog(severity, "%s:%4d:%s: *%s*: %s", file, line, func, spdk_level_names[level], buf);
+			const char *filtered_func = filter_func_name(func);
+			syslog(severity, "%s:%4d:%s: *%s*: %s", file, line, filtered_func, spdk_level_names[level], buf);
 		} else {
 			syslog(severity, "%s", buf);
 		}
@@ -245,7 +275,8 @@ spdk_vflog(FILE *fp, const char *file, const int line, const char *func,
 	get_timestamp_prefix(timestamp, sizeof(timestamp));
 
 	if (file) {
-		fprintf(fp, "%s%s:%4d:%s: %s", timestamp, file, line, func, buf);
+		const char *filtered_func = filter_func_name(func);
+		fprintf(fp, "%s%s:%4d:%s: %s", timestamp, file, line, filtered_func, buf);
 	} else {
 		fprintf(fp, "%s%s", timestamp, buf);
 	}

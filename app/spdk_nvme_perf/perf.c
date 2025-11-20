@@ -1862,7 +1862,7 @@ usage(char *program_name)
 	printf("==== ADVANCED OPTIONS ====\n\n");
 	printf("\t--use-every-core for each namespace, I/Os are submitted from all cores\n");
 	printf("\t--io-queue-size <val> size of NVMe IO queue. Default: maximum allowed by controller\n");
-	printf("\t-O, --io-unit-size io unit size in bytes (4-byte aligned) for SPDK driver. default: same as io size\n");
+	printf("\t-O, --io-unit-size io unit size in bytes (4-byte aligned) for MIMO driver. default: same as io size\n");
 	printf("\t-P, --num-qpairs <val> number of io queues per namespace. default: 1\n");
 	printf("\t-U, --num-unused-qpairs <val> number of unused io queues per controller. default: 0\n");
 	printf("\t-A, --buffer-alignment IO buffer alignment. Must be power of 2 and not less than cache line (%u)\n",
@@ -1886,7 +1886,7 @@ usage(char *program_name)
 	printf("\t-R, --enable-uring enable using liburing to drive kernel devices (Default: libaio)\n");
 #endif
 	printf("\t--iova-mode <mode> specify DPDK IOVA mode: va|pa\n");
-	printf("\t--no-huge, SPDK is run without hugepages\n");
+	printf("\t--no-huge, MIMO is run without hugepages\n");
 	spdk_trace_mask_usage(stdout, "-y");
 	printf("\n");
 
@@ -1904,7 +1904,7 @@ usage(char *program_name)
 	printf("\t--enable-ktls enable Kernel TLS. Only valid for ssl impl\n");
 	printf("\t--tls-version <val> TLS version to use. Only valid for ssl impl. Default: 0 (auto-negotiation)\n");
 	printf("\t--psk-path <val> Path to PSK file (only applies when sock_impl == ssl)\n");
-	printf("\t--psk-identity <val> Default PSK ID, e.g. psk.spdk.io (only applies when sock_impl == ssl)\n");
+	printf("\t--psk-identity <val> Default PSK ID, e.g. psk.mimo.io (only applies when sock_impl == ssl)\n");
 	printf("\t--dhchap-key <val> Path to DH-HMAC-CHAP key file (required if controller key is specified)\n");
 	printf("\t--dhchap-ctrlr-key <val> Path to DH-HMAC-CHAP controller key file\n");
 	printf("\t--zerocopy-threshold <val> data is sent with MSG_ZEROCOPY if size is greater than this val. Default: 0 to disable it\n");
@@ -3227,7 +3227,7 @@ main(int argc, char **argv)
 		return -1;
 	}
 	if (spdk_env_init(&opts) < 0) {
-		fprintf(stderr, "Unable to initialize SPDK env\n");
+		fprintf(stderr, "Unable to initialize MIMO env\n");
 		pthread_mutex_destroy(&g_stats_mutex);
 		free_key(&g_psk);
 		free_key(&g_dhchap);

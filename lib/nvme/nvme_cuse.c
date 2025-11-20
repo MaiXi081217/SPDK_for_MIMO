@@ -1108,7 +1108,7 @@ nvme_cuse_claim(struct cuse_device *ctrlr_device, uint32_t index)
 	};
 
 	snprintf(ctrlr_device->lock_name, sizeof(ctrlr_device->lock_name),
-		 "/var/tmp/spdk_nvme_cuse_lock_%" PRIu32, index);
+		 "/var/tmp/mimo_nvme_cuse_lock_%" PRIu32, index);
 
 	dev_fd = open(ctrlr_device->lock_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
 	if (dev_fd == -1) {
@@ -1269,7 +1269,7 @@ nvme_cuse_start(struct spdk_nvme_ctrlr *ctrlr)
 		ctrlr_device->index++;
 	}
 	spdk_bit_array_set(g_ctrlr_started, ctrlr_device->index);
-	snprintf(ctrlr_device->dev_name, sizeof(ctrlr_device->dev_name), "spdk/nvme%d",
+	snprintf(ctrlr_device->dev_name, sizeof(ctrlr_device->dev_name), "mimo/nvme%d",
 		 ctrlr_device->index);
 
 	rv = cuse_session_create(ctrlr_device);

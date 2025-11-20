@@ -5785,7 +5785,7 @@ bdev_nvme_remove_poller(void *ctx)
 	spdk_nvme_trid_populate_transport(&trid_pcie, SPDK_NVME_TRANSPORT_PCIE);
 
 	if (spdk_nvme_scan_attached(&trid_pcie)) {
-		SPDK_ERRLOG_RATELIMIT("spdk_nvme_scan_attached() failed\n");
+		SPDK_ERRLOG_RATELIMIT("NVMe scan attached failed\n");
 	}
 
 	return SPDK_POLLER_BUSY;
@@ -8223,7 +8223,7 @@ bdev_nvme_verify_pi_error(struct nvme_bdev_io *bio)
 		SPDK_ERRLOG("DIF error detected. type=%d, offset=%" PRIu32 "\n",
 			    err_blk.err_type, err_blk.err_offset);
 	} else {
-		SPDK_ERRLOG("Hardware reported PI error but SPDK could not find any.\n");
+		SPDK_ERRLOG("Hardware reported PI error but MIMO could not find any.\n");
 	}
 }
 

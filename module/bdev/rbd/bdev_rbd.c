@@ -1065,13 +1065,13 @@ rbd_thread_set_cpumask(struct spdk_cpuset *set)
 
 	/* change current thread core mask */
 	if (sched_setaffinity(0, sizeof(mask), &mask) < 0) {
-		SPDK_ERRLOG("Set non SPDK thread cpu mask error (errno=%d)\n", errno);
+		SPDK_ERRLOG("Set non MIMO thread cpu mask error (errno=%d)\n", errno);
 		return -1;
 	}
 
 	return 0;
 #else
-	SPDK_ERRLOG("SPDK non spdk thread cpumask setup supports only Linux platform now.\n");
+	SPDK_ERRLOG("MIMO non-MIMO thread cpumask setup supports only Linux platform now.\n");
 	return -ENOTSUP;
 #endif
 }
