@@ -1,6 +1,6 @@
-# SPDK Go 通知桥接
+# MIMO Go 通知桥接
 
-一个简单的通知框架，允许在 SPDK C 代码中通过一行函数调用，向本地 Web 后端发送 JSON 事件通知。
+一个简单的通知框架，允许在 MIMO C 代码中通过一行函数调用，向本地 Web 后端发送 JSON 事件通知。
 
 ## 快速开始
 
@@ -62,8 +62,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{\"status\":\"ok\"}')
 
-httpd = HTTPServer(('127.0.0.1', 9090), Handler)
-print('监听 http://127.0.0.1:9090/spdk/events')
+httpd = HTTPServer(('127.0.0.1', 9988), Handler)
+print('监听 http://127.0.0.1:9988/mimo/events')
 httpd.serve_forever()
 "
 ```
@@ -73,14 +73,14 @@ httpd.serve_forever()
 from flask import Flask, request
 app = Flask(__name__)
 
-@app.post("/spdk/events")
+@app.post("/mimo/events")
 def receive():
     data = request.json
     print(f"收到通知: {data}")
     return {"status": "ok"}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=9090)
+    app.run(host="127.0.0.1", port=9988)
 ```
 
 ## JSON 格式说明
@@ -117,15 +117,117 @@ if __name__ == "__main__":
 
 ## 配置
 
-默认配置（无需修改）：
-- **接收地址**: `http://127.0.0.1:9090/spdk/events`
+### 默认配置
+
+如果未找到配置文件，将使用以下默认配置：
+- **接收地址**: `http://127.0.0.1:9988/mimo/events`
 - **请求方法**: `POST`
 - **超时时间**: `2秒`
 - **重试次数**: `2次`（带指数退避）
+- **重试退避**: `100毫秒`（指数增长）
 
-如需修改，可编辑 `bridge.go` 中的 `defaultConfig`。
+### 通过 JSON 文件配置
 
-## 在 SPDK 代码中添加通知
+所有配置项都可以通过 JSON 配置文件进行设置，无需修改代码。
+
+#### 配置文件查找顺序
+
+系统会按以下顺序查找配置文件：
+
+1. **环境变量** `MIMO_NOTIFY_CONFIG` 指定的路径
+2. `/etc/mimo/notify_config.json`（系统级配置）
+3. `/usr/local/etc/mimo/notify_config.json`（本地系统配置）
+4. `./notify_config.json`（当前目录）
+5. `./config/notify_config.json`（config 子目录）
+
+如果找到配置文件，将使用配置文件中的设置；如果未找到，则使用默认配置。
+
+#### 配置文件格式
+
+创建配置文件（例如 `/etc/mimo/notify_config.json`）：
+
+```json
+{
+  "endpoint": "http://127.0.0.1:9988/mimo/events",
+  "method": "POST",
+  "timeout": "2s",
+  "source": "mimo",
+  "retry": 2,
+  "retry_backoff_ms": 100
+}
+```
+
+**配置字段说明：**
+
+- `endpoint` (string): 接收通知的 HTTP 端点 URL
+- `method` (string): HTTP 请求方法，默认为 "POST"
+- `timeout` (string): 请求超时时间，支持 Go duration 格式（如 "2s", "500ms", "1m"）
+- `source` (string): 事件源标识（可选，用于日志）
+- `retry` (int): 失败重试次数，默认为 2
+- `retry_backoff_ms` (int): 重试退避时间（毫秒），每次重试会指数增长
+
+#### 使用示例
+
+**方法 1：通过环境变量指定配置文件**
+
+```bash
+export MIMO_NOTIFY_CONFIG=/path/to/notify_config.json
+./build/bin/mimo_tgt
+```
+
+**方法 2：使用系统级配置文件**
+
+```bash
+# 创建配置文件
+sudo mkdir -p /etc/mimo
+sudo cp go/notifybridge/config.example.json /etc/mimo/notify_config.json
+
+# 编辑配置（可选）
+sudo nano /etc/mimo/notify_config.json
+
+# 运行应用（自动读取配置）
+./build/bin/mimo_tgt
+```
+
+**方法 3：使用本地配置文件**
+
+```bash
+# 在当前目录创建配置文件
+cp go/notifybridge/config.example.json ./notify_config.json
+
+# 编辑配置
+nano notify_config.json
+
+# 运行应用
+./build/bin/mimo_tgt
+```
+
+#### 配置示例
+
+**自定义端口和路径：**
+
+```json
+{
+  "endpoint": "http://192.168.1.100:8080/api/notifications",
+  "method": "POST",
+  "timeout": "5s",
+  "retry": 3,
+  "retry_backoff_ms": 200
+}
+```
+
+**增加超时时间和重试次数：**
+
+```json
+{
+  "endpoint": "http://127.0.0.1:9988/mimo/events",
+  "timeout": "10s",
+  "retry": 5,
+  "retry_backoff_ms": 500
+}
+```
+
+## 在 MIMO 代码中添加通知
 
 ### 示例 1：在 bdev 创建时通知
 
@@ -170,25 +272,29 @@ NotifyEvent("system_ready", NULL);
 
 ## 特性
 
-- ✅ **零配置**：首次调用自动初始化
-- ✅ **异步发送**：不阻塞调用线程
-- ✅ **自动重试**：网络失败时自动重试
-- ✅ **线程安全**：可在多线程环境安全使用
-- ✅ **简单易用**：只需一行代码
+-  **零配置**：首次调用自动初始化，无需手动设置
+-  **JSON 配置**：支持通过配置文件灵活配置所有参数
+-  **自动查找**：自动在多个位置查找配置文件
+-  **环境变量**：支持通过环境变量指定配置文件路径
+-  **异步发送**：不阻塞调用线程
+-  **自动重试**：网络失败时自动重试（带指数退避）
+-  **线程安全**：可在多线程环境安全使用
+-  **简单易用**：只需一行代码
 
 ## 目录结构
 
 ```
 SPDK_for_MIMO/
 ├── go/notifybridge/
-│   ├── bridge.go          # Go 实现
+│   ├── bridge.go              # Go 实现
 │   ├── go.mod
+│   ├── config.example.json    # 配置文件示例
 │   └── README.md
 ├── include/
-│   └── spdk_go_notify.h   # C 头文件
+│   └── spdk_go_notify.h       # C 头文件
 └── app/spdk_tgt/
-    ├── spdk_tgt.c         # 已集成示例
-    └── Makefile           # 已配置构建
+    ├── spdk_tgt.c             # 已集成示例
+    └── Makefile               # 已配置构建
 ```
 
 ## 故障排查
@@ -197,15 +303,23 @@ SPDK_for_MIMO/
 
 1. **检查 Web 服务器是否运行**
    ```bash
-   curl http://127.0.0.1:9090/spdk/events
+   curl http://127.0.0.1:9988/mimo/events
    ```
 
 2. **检查日志**
-   - 查看 SPDK 日志中是否有 "Failed to send startup notification"
+   - 查看 MIMO 日志中是否有 "Failed to send startup notification"
    - 检查 Web 服务器日志
 
-3. **检查防火墙**
-   - 确保 9090 端口未被阻止
+3. **检查配置文件**
+   - 确认配置文件路径正确
+   - 验证 JSON 格式是否正确
+   ```bash
+   # 验证 JSON 格式
+   python3 -m json.tool /etc/mimo/notify_config.json
+   ```
+
+4. **检查防火墙**
+   - 确保 9988 端口未被阻止
 
 ### 编译错误
 

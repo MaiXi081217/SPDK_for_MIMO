@@ -1,8 +1,8 @@
 {
-  "endpoint": "http://127.0.0.1:9988/mimo/event",
+  "endpoint": "http://127.0.0.1:9988/mimo/events",
   "method": "POST",
   "timeout": "2s",
-  "source": "spdk_nvmf",
-  "retry": 3,
+  "source": "mimo",
+  "retry": 2,
   "retry_backoff_ms": 100
 }
