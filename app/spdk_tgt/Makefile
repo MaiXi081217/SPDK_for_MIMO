@@ -9,7 +9,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
 APP = mimo_tgt
 
-C_SRCS := spdk_tgt.c
+C_SRCS := mimo_tgt.c
 
 SPDK_LIB_LIST = $(ALL_MODULES_LIST)
 

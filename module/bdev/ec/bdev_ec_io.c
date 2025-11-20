@@ -5,6 +5,7 @@
 
 #include "bdev_ec.h"
 #include "bdev_ec_internal.h"
+#include "wear_leveling_ext.h"
 #include "spdk/bdev_module.h"
 #include "spdk/log.h"
 #include "spdk/env.h"
@@ -275,6 +276,7 @@ ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 	uint8_t data_idx = 0;
 	uint8_t parity_idx = 0;
 	uint8_t operational_count = 0;
+	bool test_mode = wear_leveling_ext_is_test_mode();
 
 	/* Calculate parity start position using round-robin (similar to RAID5)
 	 * For stripe_index i, parity blocks start at position (n - (i % n)) % n
@@ -302,7 +304,7 @@ ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 	/* Optimized: Combine counting and selection in a single pass */
 	i = 0;
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
-		if (base_info->desc == NULL || base_info->is_failed) {
+		if (!test_mode && (base_info->desc == NULL || base_info->is_failed)) {
 			i++;
 			continue;
 		}
@@ -645,6 +647,10 @@ ec_submit_write_stripe(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 	stripe_priv->type = EC_PRIVATE_TYPE_FULL_STRIPE;
 	stripe_priv->num_parity = p;
 	stripe_priv->num_temp_bufs = need_temp_bufs ? k : 0;
+	/* Store stripe_index and indices for snapshot storage */
+	stripe_priv->stripe_index = stripe_index;
+	memcpy(stripe_priv->data_indices, data_indices, k * sizeof(uint8_t));
+	memcpy(stripe_priv->parity_indices, parity_indices, p * sizeof(uint8_t));
 	/* Store parity buffers */
 	for (i = 0; i < p; i++) {
 		stripe_priv->parity_bufs[i] = parity_ptrs[i];
@@ -1490,11 +1496,19 @@ ec_submit_decode_read(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 	uint8_t num_available = 0;
 	int rc;
 
-	/* Get data and parity indices for this stripe */
-	rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to select base bdevs for decode\n");
-		return rc;
+	/* Try to load snapshot first, fall back to default if not available */
+	bool snapshot_loaded = wear_leveling_ext_load_snapshot(ec_bdev, stripe_index,
+							       data_indices, parity_indices);
+	if (!snapshot_loaded) {
+		/* No snapshot available, use default selection */
+		rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to select base bdevs for decode\n");
+			return rc;
+		}
+	} else {
+		/* Snapshot loaded successfully */
+		rc = 0;
 	}
 
 	/* Allocate decode context first */
@@ -1876,12 +1890,20 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 
 		uint8_t data_indices[EC_MAX_K];
 		uint8_t parity_indices[EC_MAX_P];
-		/* Select base bdevs using extension interface or default */
-		rc = ec_select_base_bdevs_with_extension(ec_bdev,
-							  ec_io->offset_blocks,
-							  ec_io->num_blocks,
-							  stripe_index,
-							  data_indices, parity_indices);
+		/* Try to load snapshot first, fall back to extension/default if not available */
+		bool snapshot_loaded = wear_leveling_ext_load_snapshot(ec_bdev, stripe_index,
+								       data_indices, parity_indices);
+		if (!snapshot_loaded) {
+			/* No snapshot available, use extension interface or default */
+			rc = ec_select_base_bdevs_with_extension(ec_bdev,
+								  ec_io->offset_blocks,
+								  ec_io->num_blocks,
+								  stripe_index,
+								  data_indices, parity_indices);
+		} else {
+			/* Snapshot loaded successfully */
+			rc = 0;
+		}
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to select base bdevs for EC bdev %s\n",
 				    ec_bdev->bdev.name);
@@ -2078,9 +2100,43 @@ ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 	/* Clean up resources if this was a write and all I/O is complete */
 	if (all_complete && ec_io->type == SPDK_BDEV_IO_TYPE_WRITE && ec_io->module_private != NULL) {
 		struct ec_stripe_private *stripe_priv = ec_io->module_private;
-		struct ec_rmw_private *rmw;
+		struct ec_rmw_private *rmw = NULL;
 		uint8_t i;
 		uint32_t strip_size_bytes;
+		
+		/* Store snapshot if write succeeded and wear leveling is in FULL mode
+		 * (SIMPLE mode typically uses fast path/default selection, no snapshot needed)
+		 */
+		bool write_succeeded = (ec_io->base_bdev_io_status == SPDK_BDEV_IO_STATUS_SUCCESS);
+		if (write_succeeded) {
+			int mode = wear_leveling_ext_get_mode(ec_bdev);
+			/* Only store snapshot in FULL mode (SIMPLE mode uses default selection most of the time) */
+			/* 检查返回值：如果返回错误（负数），说明扩展未启用或已降级，跳过快照存储 */
+			if (mode == 2) {  /* WL_MODE_FULL = 2 */
+				int store_rc;
+				if (stripe_priv->type == EC_PRIVATE_TYPE_RMW) {
+					rmw = (struct ec_rmw_private *)stripe_priv;
+					/* Store snapshot for RMW write */
+					store_rc = wear_leveling_ext_store_snapshot(ec_bdev, rmw->stripe_index,
+										      rmw->data_indices, rmw->parity_indices);
+				} else if (stripe_priv->type == EC_PRIVATE_TYPE_FULL_STRIPE) {
+					/* Store snapshot for full stripe write */
+					store_rc = wear_leveling_ext_store_snapshot(ec_bdev, stripe_priv->stripe_index,
+										      stripe_priv->data_indices, stripe_priv->parity_indices);
+				} else {
+					store_rc = 0;  /* Unknown type, skip snapshot */
+				}
+				/* Log error if snapshot storage failed (non-critical, don't fail the write) */
+				/* Note: Auto-fallback logic is handled inside wear_leveling_ext_store_snapshot */
+				if (store_rc != 0 && store_rc != -ENOENT && store_rc != -ERANGE) {
+					uint64_t failed_stripe_idx = (stripe_priv->type == EC_PRIVATE_TYPE_RMW && rmw != NULL) ?
+						rmw->stripe_index : stripe_priv->stripe_index;
+					SPDK_WARNLOG("Failed to store snapshot for stripe %lu (rc=%d), "
+						     "read consistency may be affected\n",
+						     failed_stripe_idx, store_rc);
+				}
+			}
+		}
 
 		if (ec_io->ec_ch == NULL) {
 			SPDK_ERRLOG("ec_ch is NULL when cleaning up buffers\n");

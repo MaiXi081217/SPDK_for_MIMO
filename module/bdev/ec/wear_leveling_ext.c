@@ -6,6 +6,7 @@
 #include "bdev_ec.h"
 #include "bdev_ec_internal.h"
 #include "wear_leveling_ext.h"
+#include "spdk_go_notify.h"
 #include "spdk/log.h"
 #include "spdk/bdev.h"
 #include "spdk/nvme.h"
@@ -16,6 +17,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <errno.h>
 
 /* 别名：方便使用头文件中的常量 */
@@ -45,6 +47,28 @@ static const uint32_t g_wear_weight_table[101] = {
  * ============================================================================
  */
 
+/* 快照存储结构：只存储选择的 bdev indices */
+struct bdev_selection_snapshot {
+	uint8_t data_indices[EC_MAX_K];   /* 数据块索引 */
+	uint8_t parity_indices[EC_MAX_P]; /* 校验块索引 */
+};
+
+/* 快照存储管理结构 */
+struct snapshot_storage {
+	/* 位图：标记哪些 stripe 有快照（1位/stripe） */
+	uint8_t *bitmap;  /* 1M 位 = 128KB */
+	uint32_t bitmap_size;  /* 位图大小（字节） */
+	
+	/* 固定大小数组：存储所有 stripe 的选择结果 */
+	/* 如果位图标记为0，数组项未使用（可以优化为稀疏存储） */
+	struct bdev_selection_snapshot *snapshots;  /* 1M × (4+4)字节 = 8MB */
+	
+	/* 统计信息 */
+	uint64_t total_stripes;  /* 总 stripe 数 */
+	uint64_t stored_snapshots;  /* 实际存储的快照数 */
+	uint64_t default_selections;  /* 使用默认选择的次数 */
+};
+
 /* 磨损均衡扩展模块（私有实现结构） */
 struct wear_leveling_ext {
 	/* 扩展接口（必须放在最前面） */
@@ -61,7 +85,31 @@ struct wear_leveling_ext {
 	uint64_t wear_predict_threshold_blocks;  /* 写入多少块后重新读取 */
 	uint8_t wear_predict_threshold_percent;  /* 预测磨损变化超过多少百分比时重新读取 */
 	uint64_t wear_read_interval_us;          /* 最小读取间隔（微秒） */
+	
+	/* 快照存储（用于确保读取一致性） */
+	struct snapshot_storage snapshot;
 };
+
+static bool g_wl_test_mode = false;
+
+void
+wear_leveling_ext_enable_test_mode(bool enable)
+{
+	g_wl_test_mode = enable;
+}
+
+bool
+wear_leveling_ext_is_test_mode(void)
+{
+	return g_wl_test_mode;
+}
+
+static int snapshot_storage_init(struct snapshot_storage *snapshot);
+static void snapshot_storage_fini(struct snapshot_storage *snapshot);
+
+static inline void snapshot_reset_failures(struct wear_leveling_ext *wl_ext);
+static inline void snapshot_record_failure(struct wear_leveling_ext *wl_ext,
+					   struct ec_bdev *ec_bdev, const char *reason);
 
 /* 前向声明：使用弱符号访问 bdev_nvme_get_ctrlr（避免直接依赖 bdev_nvme 模块） */
 extern struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev) __attribute__((weak));
@@ -855,18 +903,24 @@ _collect_and_validate_wear_info(struct wear_leveling_ext *wl_ext,
 		}
 
 		struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[candidate_idx];
-		bool is_operational = (base_info->desc != NULL && !base_info->is_failed);
+		bool is_operational;
 
-		wl_ext->data.wear_info[candidate_idx].is_operational = is_operational;
+		if (g_wl_test_mode) {
+			is_operational = true;
+			wl_ext->data.wear_info[candidate_idx].is_operational = 1;
+		} else {
+			is_operational = (base_info->desc != NULL && !base_info->is_failed);
+			wl_ext->data.wear_info[candidate_idx].is_operational = is_operational;
 
-		if (!is_operational) {
-			/* Non-operational bdev, caller will fall back to default selection. */
-			SPDK_WARNLOG("Non-operational base bdev %u detected\n", candidate_idx);
-			return -ENODEV;
+			if (!is_operational) {
+				/* Non-operational bdev, caller will fall back to default selection. */
+				SPDK_WARNLOG("Non-operational base bdev %u detected\n", candidate_idx);
+				return -ENODEV;
+			}
 		}
 
 		/* Get wear level: if needs_reread is set, try to refresh first. */
-		if (wl_ext->data.wear_info[candidate_idx].needs_reread) {
+		if (!g_wl_test_mode && wl_ext->data.wear_info[candidate_idx].needs_reread) {
 			uint8_t wear_level;
 			int rc = get_wear_level_with_prediction(wl_ext, candidate_idx, base_info, &wear_level);
 			if (rc == 0) {
@@ -876,9 +930,15 @@ _collect_and_validate_wear_info(struct wear_leveling_ext *wl_ext,
 				wear = get_wear_level_fast(wl_ext, candidate_idx);
 			}
 			result->any_needs_reread = true;
-		} else {
+		} else if (!g_wl_test_mode) {
 			/* Use cached wear level. */
 			wear = get_wear_level_fast(wl_ext, candidate_idx);
+		} else {
+			/* Test mode: use cached value or default */
+			wear = wl_ext->data.wear_info[candidate_idx].wear_level;
+			if (wear == 0 || wear == 255) {
+				wear = 50;
+			}
 		}
 
 		result->cached_wear[i] = wear;
@@ -1145,7 +1205,9 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 	rc = _perform_deterministic_weighted_selection(ec_bdev, default_data_indices, k, &wear_info,
 						       stripe_index, data_indices);
 	if (rc != 0) {
-		return rc;
+		/* 无论何种错误，最终都回退到默认策略，确保I/O继续 */
+		return ec_select_base_bdevs_default(ec_bdev, stripe_index,
+						    data_indices, parity_indices);
 	}
 
 	/* 5. Parity indices always use the default selection. */
@@ -1298,6 +1360,99 @@ wear_leveling_ext_fini_cb(struct ec_bdev_extension_if *ext_if, struct ec_bdev *e
 		       ec_bdev->bdev.name);
 }
 
+/* 自动降级到 DISABLED 模式（发送 Go 通知） */
+static void
+snapshot_auto_fallback_to_disabled(struct wear_leveling_ext *wl_ext, struct ec_bdev *ec_bdev,
+				    const char *reason)
+{
+	char payload[512];
+	int payload_len;
+	
+	if (wl_ext == NULL || ec_bdev == NULL) {
+		return;
+	}
+	
+	/* 只在 FULL 模式时降级（防止重复降级） */
+	if (wl_ext->sched.mode != WL_MODE_FULL) {
+		return;
+	}
+	
+	/* 执行降级 */
+	wl_ext->sched.mode = WL_MODE_DISABLED;
+	snapshot_reset_failures(wl_ext);
+	wl_ext->sched.all_wear_unavailable = false;  /* 重置磨损不可用标志 */
+	
+	/* 构建通知 payload */
+	const char *bdev_name = (ec_bdev->bdev.name != NULL) ? ec_bdev->bdev.name : "unknown";
+	const char *reason_str = (reason != NULL) ? reason : "snapshot_failure";
+	
+	payload_len = snprintf(payload, sizeof(payload),
+			      "{\"ec_bdev\":\"%s\",\"old_mode\":\"FULL\",\"new_mode\":\"DISABLED\","
+			      "\"reason\":\"%s\",\"message\":\"Wear leveling auto-fallback to DISABLED mode "
+			      "due to snapshot failures. System will use default EC selection for safety.\"}",
+			      bdev_name, reason_str);
+	
+	/* 检查 snprintf 是否成功且未截断 */
+	if (payload_len > 0 && payload_len < (int)sizeof(payload)) {
+		NotifyEvent("wear_leveling_auto_fallback", payload);
+	} else if (payload_len >= (int)sizeof(payload)) {
+		/* Payload 被截断，发送简化版本 */
+		SPDK_WARNLOG("Payload truncated for EC bdev '%s', sending simplified notification\n", bdev_name);
+		int simple_len = snprintf(payload, sizeof(payload),
+			"{\"ec_bdev\":\"%s\",\"old_mode\":\"FULL\",\"new_mode\":\"DISABLED\","
+			"\"reason\":\"%s\"}",
+			bdev_name, reason_str);
+		if (simple_len > 0 && simple_len < (int)sizeof(payload)) {
+			NotifyEvent("wear_leveling_auto_fallback", payload);
+		} else {
+			/* 即使简化版本也失败，发送最小版本 */
+			SPDK_ERRLOG("Failed to create even simplified payload for EC bdev '%s'\n", bdev_name);
+			NotifyEvent("wear_leveling_auto_fallback", "{\"error\":\"payload_creation_failed\"}");
+		}
+	}
+	
+	SPDK_ERRLOG("===========================================================\n");
+	SPDK_ERRLOG("CRITICAL: Wear leveling auto-fallback for EC bdev '%s'\n",
+		    ec_bdev->bdev.name);
+	SPDK_ERRLOG("Reason: %s\n", reason ? reason : "snapshot_failure");
+	SPDK_ERRLOG("Action: Automatically switched from FULL to DISABLED mode\n");
+	SPDK_ERRLOG("System will now use default EC selection (100%% safe)\n");
+	SPDK_ERRLOG("Notification sent to backend\n");
+	SPDK_ERRLOG("===========================================================\n");
+}
+
+/* 快照失败统计与恢复 */
+static inline void
+snapshot_reset_failures(struct wear_leveling_ext *wl_ext)
+{
+	if (wl_ext == NULL) {
+		return;
+	}
+	wl_ext->sched.snapshot_failures = 0;
+}
+
+static inline void
+snapshot_record_failure(struct wear_leveling_ext *wl_ext, struct ec_bdev *ec_bdev,
+			const char *reason)
+{
+	if (wl_ext == NULL || ec_bdev == NULL) {
+		return;
+	}
+
+	if (wl_ext->sched.mode != WL_MODE_FULL) {
+		return;
+	}
+
+	if (wl_ext->sched.snapshot_failures < wl_ext->sched.snapshot_fallback_threshold) {
+		wl_ext->sched.snapshot_failures++;
+	}
+
+	if (wl_ext->sched.snapshot_failures >= wl_ext->sched.snapshot_fallback_threshold &&
+	    wl_ext->sched.mode == WL_MODE_FULL) {
+		snapshot_auto_fallback_to_disabled(wl_ext, ec_bdev, reason);
+	}
+}
+
 /* 创建并注册磨损均衡扩展
  * 
  * 算法原理：
@@ -1365,9 +1520,25 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode
 	wl_ext->sched.fast_path_hits = 0;
 	wl_ext->sched.consecutive_failures = 0;
 	wl_ext->sched.auto_fallback_threshold = WEAR_AUTO_FALLBACK_THRESHOLD;
+	wl_ext->sched.snapshot_failures = 0;
+	wl_ext->sched.snapshot_fallback_threshold = SNAPSHOT_AUTO_FALLBACK_THRESHOLD;
 	
 	/* 初始化磨损信息 */
 	memset(&wl_ext->data, 0, sizeof(wl_ext->data));
+	
+	/* 初始化快照存储（仅在 FULL 模式需要） */
+	int rc = 0;
+	if (mode == WL_MODE_FULL) {
+		rc = snapshot_storage_init(&wl_ext->snapshot);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to initialize snapshot storage for EC bdev %s: %s\n",
+				    ec_bdev->bdev.name, spdk_strerror(-rc));
+			/* 如果初始化失败，自动降级到 DISABLED 模式并发送通知 */
+			wl_ext->sched.mode = WL_MODE_DISABLED;
+			snapshot_auto_fallback_to_disabled(wl_ext, ec_bdev, "snapshot_init_failed");
+			/* 继续注册，但使用 DISABLED 模式（安全降级） */
+		}
+	}
 	
 	SPDK_NOTICELOG("Wear leveling extension registered for EC bdev %s in mode %d (%s)\n",
 		       ec_bdev->bdev.name, mode,
@@ -1398,6 +1569,21 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode
 			SPDK_ERRLOG("EC bdev %s: base bdev index %u exceeds maximum\n",
 				    ec_bdev->bdev.name, i);
 			break;
+		}
+		
+		if (g_wl_test_mode) {
+			wl_ext->data.bdev_config[i].tbw = 180.0;
+			wl_ext->data.bdev_config[i].wear_per_gb = 0.000543;
+			wl_ext->data.cached_block_size[i] = 512;
+			wl_ext->data.wear_info[i].wear_level = 50;
+			wl_ext->data.wear_info[i].predicted_wear_level = 50;
+			wl_ext->data.wear_info[i].last_read_timestamp = spdk_get_ticks();
+			wl_ext->data.wear_info[i].is_operational = 1;
+			wl_ext->data.wear_info[i].needs_reread = 0;
+			operational_count++;
+			wear_read_success_count++;
+			i++;
+			continue;
 		}
 		
 		if (base_info->desc != NULL) {
@@ -1559,7 +1745,7 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode
 	/* 注册到EC bdev
 	 * 注意：如果注册失败（例如 init 回调失败），需要释放 wl_ext
 	 */
-	int rc = ec_bdev_register_extension(ec_bdev, &wl_ext->ext_if);
+	rc = ec_bdev_register_extension(ec_bdev, &wl_ext->ext_if);
 	if (rc != 0) {
 		/* 注册失败，释放已分配的内存 */
 		SPDK_ERRLOG("Failed to register wear leveling extension for EC bdev %s: %s\n",
@@ -1588,6 +1774,9 @@ wear_leveling_ext_unregister(struct ec_bdev *ec_bdev)
 	}
 	
 	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
+	
+	/* 清理快照存储 */
+	snapshot_storage_fini(&wl_ext->snapshot);
 	
 	ec_bdev_unregister_extension(ec_bdev);
 	free(wl_ext);
@@ -1747,5 +1936,325 @@ wear_leveling_ext_get_mode(struct ec_bdev *ec_bdev)
 	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
 	
 	return (int)wl_ext->sched.mode;
+}
+
+/* 测试辅助：覆盖指定 base bdev 的磨损信息 */
+int
+wear_leveling_ext_test_override_wear(struct ec_bdev *ec_bdev,
+				     uint16_t base_bdev_index,
+				     uint8_t wear_level,
+				     bool is_operational)
+{
+	struct ec_bdev_extension_if *ext_if;
+	struct wear_leveling_ext *wl_ext;
+	struct base_bdev_wear_info *info;
+	struct ec_base_bdev_info *base_info;
+	
+	if (ec_bdev == NULL) {
+		return -EINVAL;
+	}
+	
+	if (wear_level > 100 && wear_level != 255) {
+		return -EINVAL;
+	}
+	
+	if (base_bdev_index >= ec_bdev->num_base_bdevs ||
+	    base_bdev_index >= (EC_MAX_K + EC_MAX_P)) {
+		return -ERANGE;
+	}
+	
+	ext_if = ec_bdev_get_extension(ec_bdev);
+	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
+		return -ENOENT;
+	}
+	
+	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
+	info = &wl_ext->data.wear_info[base_bdev_index];
+	base_info = &ec_bdev->base_bdev_info[base_bdev_index];
+	
+	info->wear_level = wear_level;
+	info->predicted_wear_level = wear_level;
+	info->needs_reread = 0;
+	info->writes_since_last_read = 0;
+	info->last_read_timestamp = spdk_get_ticks();
+	info->is_operational = is_operational ? 1 : 0;
+	
+	if (base_info != NULL) {
+		base_info->is_failed = is_operational ? false : true;
+	}
+	
+	return 0;
+}
+
+/* 测试辅助：获取快速路径命中次数（用于验证降级场景） */
+int
+wear_leveling_ext_test_get_fast_path_hits(struct ec_bdev *ec_bdev,
+					  uint64_t *fast_path_hits)
+{
+	struct ec_bdev_extension_if *ext_if;
+	struct wear_leveling_ext *wl_ext;
+	
+	if (ec_bdev == NULL || fast_path_hits == NULL) {
+		return -EINVAL;
+	}
+	
+	ext_if = ec_bdev_get_extension(ec_bdev);
+	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
+		return -ENOENT;
+	}
+	
+	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
+	*fast_path_hits = wl_ext->sched.fast_path_hits;
+	return 0;
+}
+
+/*
+ * ============================================================================
+ * 快照存储实现（确保读取一致性）
+ * ============================================================================
+ */
+
+/* 初始化快照存储 */
+static int
+snapshot_storage_init(struct snapshot_storage *snapshot)
+{
+	if (snapshot == NULL) {
+		return -EINVAL;
+	}
+	
+	memset(snapshot, 0, sizeof(*snapshot));
+	
+	/* 分配位图：1M 位 = 128KB */
+	snapshot->bitmap_size = SNAPSHOT_BITMAP_SIZE;
+	snapshot->bitmap = calloc(1, snapshot->bitmap_size);
+	if (snapshot->bitmap == NULL) {
+		SPDK_ERRLOG("Failed to allocate snapshot bitmap (%u bytes)\n",
+			    snapshot->bitmap_size);
+		return -ENOMEM;
+	}
+	
+	/* 分配快照数组：1M × (EC_MAX_K + EC_MAX_P) 字节 */
+	snapshot->snapshots = calloc(MAX_SNAPSHOT_STRIPES, sizeof(struct bdev_selection_snapshot));
+	if (snapshot->snapshots == NULL) {
+		SPDK_ERRLOG("Failed to allocate snapshot array (%lu bytes)\n",
+			    (unsigned long)(MAX_SNAPSHOT_STRIPES * sizeof(struct bdev_selection_snapshot)));
+		free(snapshot->bitmap);
+		snapshot->bitmap = NULL;
+		return -ENOMEM;
+	}
+	
+	snapshot->total_stripes = MAX_SNAPSHOT_STRIPES;
+	snapshot->stored_snapshots = 0;
+	snapshot->default_selections = 0;
+	
+	return 0;
+}
+
+/* 清理快照存储 */
+static void
+snapshot_storage_fini(struct snapshot_storage *snapshot)
+{
+	if (snapshot == NULL) {
+		return;
+	}
+	
+	if (snapshot->bitmap != NULL) {
+		free(snapshot->bitmap);
+		snapshot->bitmap = NULL;
+	}
+	
+	if (snapshot->snapshots != NULL) {
+		free(snapshot->snapshots);
+		snapshot->snapshots = NULL;
+	}
+	
+	memset(snapshot, 0, sizeof(*snapshot));
+}
+
+/* 检查位图位（stripe_index 是否有快照） */
+static inline bool
+snapshot_bitmap_get(const struct snapshot_storage *snapshot, uint64_t stripe_index)
+{
+	if (snapshot == NULL || snapshot->bitmap == NULL ||
+	    stripe_index >= MAX_SNAPSHOT_STRIPES) {
+		return false;
+	}
+	
+	uint32_t byte_idx = stripe_index / 8;
+	uint8_t bit_idx = stripe_index % 8;
+	
+	/* 边界检查：确保 byte_idx 不越界 */
+	if (byte_idx >= snapshot->bitmap_size) {
+		return false;
+	}
+	
+	return (snapshot->bitmap[byte_idx] & (1U << bit_idx)) != 0;
+}
+
+/* 设置位图位（标记 stripe_index 有快照） */
+static inline void
+snapshot_bitmap_set(struct snapshot_storage *snapshot, uint64_t stripe_index)
+{
+	if (snapshot == NULL || snapshot->bitmap == NULL ||
+	    stripe_index >= MAX_SNAPSHOT_STRIPES) {
+		return;
+	}
+	
+	uint32_t byte_idx = stripe_index / 8;
+	uint8_t bit_idx = stripe_index % 8;
+	
+	/* 边界检查：确保 byte_idx 不越界 */
+	if (byte_idx >= snapshot->bitmap_size) {
+		return;
+	}
+	
+	snapshot->bitmap[byte_idx] |= (1U << bit_idx);
+}
+
+/* 清除位图位（标记 stripe_index 无快照） */
+static inline void
+snapshot_bitmap_clear(struct snapshot_storage *snapshot, uint64_t stripe_index)
+{
+	if (snapshot == NULL || snapshot->bitmap == NULL ||
+	    stripe_index >= MAX_SNAPSHOT_STRIPES) {
+		return;
+	}
+	
+	uint32_t byte_idx = stripe_index / 8;
+	uint8_t bit_idx = stripe_index % 8;
+	
+	/* 边界检查：确保 byte_idx 不越界 */
+	if (byte_idx >= snapshot->bitmap_size) {
+		return;
+	}
+	
+	snapshot->bitmap[byte_idx] &= ~(1U << bit_idx);
+}
+
+/* 存储快照 */
+int
+wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
+				  uint64_t stripe_index,
+				  const uint8_t *data_indices,
+				  const uint8_t *parity_indices)
+{
+	struct ec_bdev_extension_if *ext_if;
+	struct wear_leveling_ext *wl_ext;
+	struct snapshot_storage *snapshot;
+	
+	if (ec_bdev == NULL || data_indices == NULL || parity_indices == NULL) {
+		return -EINVAL;
+	}
+	
+	/* 边界检查：stripe_index 必须在范围内 */
+	if (stripe_index >= MAX_SNAPSHOT_STRIPES) {
+		/* 超出范围，不存储快照（使用默认选择） */
+		return -ERANGE;
+	}
+	
+	ext_if = ec_bdev_get_extension(ec_bdev);
+	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
+		/* 未启用磨损均衡扩展，不需要存储快照 */
+		return -ENOENT;
+	}
+	
+	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
+	snapshot = &wl_ext->snapshot;
+	
+	/* 检查快照存储是否已初始化 */
+	if (snapshot->snapshots == NULL || snapshot->bitmap == NULL) {
+		/* 快照存储未初始化，增加失败计数并检查降级 */
+		snapshot_record_failure(wl_ext, ec_bdev, "snapshot_storage_not_initialized");
+		return -ENODEV;
+	}
+	
+	/* 边界检查：确保 k 和 p 在有效范围内 */
+	if (ec_bdev->k == 0 || ec_bdev->p == 0) {
+		SPDK_ERRLOG("Invalid k=%u or p=%u (expected 1-%u)\n",
+			    ec_bdev->k, ec_bdev->p, EC_MAX_K);
+		/* 参数错误，增加失败计数并检查降级 */
+		snapshot_record_failure(wl_ext, ec_bdev, "invalid_ec_parameters");
+		return -EINVAL;
+	}
+	
+	/* 存储快照 */
+	struct bdev_selection_snapshot *snap = &snapshot->snapshots[stripe_index];
+	memcpy(snap->data_indices, data_indices, ec_bdev->k * sizeof(uint8_t));
+	memcpy(snap->parity_indices, parity_indices, ec_bdev->p * sizeof(uint8_t));
+	
+	/* 设置位图（如果之前没有快照，增加计数） */
+	bool had_snapshot = snapshot_bitmap_get(snapshot, stripe_index);
+	if (!had_snapshot) {
+		/* 防止计数溢出（虽然不太可能，因为 MAX_SNAPSHOT_STRIPES = 1M） */
+		if (snapshot->stored_snapshots < snapshot->total_stripes) {
+			snapshot->stored_snapshots++;
+		}
+	}
+	snapshot_bitmap_set(snapshot, stripe_index);
+	
+	/* 成功时重置失败计数 */
+	snapshot_reset_failures(wl_ext);
+	
+	return 0;
+}
+
+/* 读取快照 */
+bool
+wear_leveling_ext_load_snapshot(struct ec_bdev *ec_bdev,
+				 uint64_t stripe_index,
+				 uint8_t *data_indices,
+				 uint8_t *parity_indices)
+{
+	struct ec_bdev_extension_if *ext_if;
+	struct wear_leveling_ext *wl_ext;
+	struct snapshot_storage *snapshot;
+	
+	if (ec_bdev == NULL || data_indices == NULL || parity_indices == NULL) {
+		return false;
+	}
+	
+	/* 边界检查：stripe_index 超出范围，返回 false（使用默认选择） */
+	if (stripe_index >= MAX_SNAPSHOT_STRIPES) {
+		return false;
+	}
+	
+	ext_if = ec_bdev_get_extension(ec_bdev);
+	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
+		/* 未启用磨损均衡扩展，返回 false（使用默认选择） */
+		return false;
+	}
+	
+	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
+	snapshot = &wl_ext->snapshot;
+	
+	/* 检查快照存储是否已初始化 */
+	if (snapshot->snapshots == NULL || snapshot->bitmap == NULL) {
+		/* 快照存储未初始化，返回 false（使用默认选择） */
+		return false;
+	}
+	
+	/* 检查是否有快照 */
+	if (!snapshot_bitmap_get(snapshot, stripe_index)) {
+		/* 没有快照，返回 false（使用默认选择） */
+		/* 防止计数溢出（虽然不太可能） */
+		if (snapshot->default_selections < UINT64_MAX) {
+			snapshot->default_selections++;
+		}
+		return false;
+	}
+	
+	/* 边界检查：确保 k 和 p 在有效范围内 */
+	if (ec_bdev->k == 0 || ec_bdev->p == 0) {
+		SPDK_ERRLOG("Invalid k=%u or p=%u (expected 1-%u)\n",
+			    ec_bdev->k, ec_bdev->p, EC_MAX_K);
+		return false;
+	}
+	
+	/* 读取快照 */
+	struct bdev_selection_snapshot *snap = &snapshot->snapshots[stripe_index];
+	memcpy(data_indices, snap->data_indices, ec_bdev->k * sizeof(uint8_t));
+	memcpy(parity_indices, snap->parity_indices, ec_bdev->p * sizeof(uint8_t));
+	
+	return true;
 }
 

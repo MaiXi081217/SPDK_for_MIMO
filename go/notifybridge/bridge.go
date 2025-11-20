@@ -47,7 +47,7 @@ var (
 	onceInit       sync.Once
 	initErr        error
 	defaultConfig  = notifyConfigInternal{
-		Endpoint:       "http://127.0.0.1:9988/mimo/events",
+		Endpoint:       "http://127.0.0.1:9987/mimo/events",
 		Method:         http.MethodPost,
 		Timeout:        2 * time.Second,
 		Source:         "mimo",

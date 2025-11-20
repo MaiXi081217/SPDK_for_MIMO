@@ -42,8 +42,13 @@
 #define WEAR_DEFAULT_THRESHOLD_PERCENT (5)           /* 5% */
 #define WEAR_DEFAULT_READ_INTERVAL_US (30000000ULL)  /* 30秒 */
 
+/* 快照存储配置 */
+#define MAX_SNAPSHOT_STRIPES 1048576  /* 2^20 = 1M 个 stripe，覆盖常用范围 */
+#define SNAPSHOT_BITMAP_SIZE (MAX_SNAPSHOT_STRIPES / 8)  /* 位图大小（字节） */
+
 /* 自动降级阈值 */
 #define WEAR_AUTO_FALLBACK_THRESHOLD (5)  /* 连续失败5次触发自动降级 */
+#define SNAPSHOT_AUTO_FALLBACK_THRESHOLD (3)  /* 快照连续失败3次触发自动降级 */
 
 /*
  * ============================================================================
@@ -108,6 +113,10 @@ struct wear_scheduler_state {
 	/* 健康检测和自动降级相关 */
 	uint32_t consecutive_failures;     /* 连续失败次数 */
 	uint32_t auto_fallback_threshold;  /* 自动降级阈值 */
+	
+	/* 快照失败计数（仅FULL模式） */
+	uint32_t snapshot_failures;        /* 快照连续失败次数 */
+	uint32_t snapshot_fallback_threshold;  /* 快照自动降级阈值 */
 };
 
 /*
@@ -188,5 +197,55 @@ int wear_leveling_ext_set_mode(struct ec_bdev *ec_bdev,
  * @return 当前模式（0-2），失败返回负数（-EINVAL, -ENOENT）
  */
 int wear_leveling_ext_get_mode(struct ec_bdev *ec_bdev);
+
+/*
+ * ============================================================================
+ * 快照存储 API（内部使用，确保读取一致性）
+ * ============================================================================
+ */
+
+/**
+ * @brief 存储 stripe 的 bdev 选择快照（仅在写入成功后调用）
+ * 
+ * @param ec_bdev EC bdev 实例
+ * @param stripe_index Stripe 索引
+ * @param data_indices 数据块索引数组（k个）
+ * @param parity_indices 校验块索引数组（p个）
+ * @return 0 成功，负数失败（-EINVAL, -ENOENT, -ERANGE）
+ */
+int wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
+				     uint64_t stripe_index,
+				     const uint8_t *data_indices,
+				     const uint8_t *parity_indices);
+
+/**
+ * @brief 从快照读取 stripe 的 bdev 选择（读取时调用）
+ * 
+ * @param ec_bdev EC bdev 实例
+ * @param stripe_index Stripe 索引
+ * @param data_indices 输出：数据块索引数组（k个）
+ * @param parity_indices 输出：校验块索引数组（p个）
+ * @return true 快照存在且读取成功，false 快照不存在（应使用默认选择）
+ */
+bool wear_leveling_ext_load_snapshot(struct ec_bdev *ec_bdev,
+				     uint64_t stripe_index,
+				     uint8_t *data_indices,
+				     uint8_t *parity_indices);
+
+/*
+ * ============================================================================
+ * 测试辅助 API（仅用于单元测试 / RPC 场景）
+ * ============================================================================
+ */
+void wear_leveling_ext_enable_test_mode(bool enable);
+bool wear_leveling_ext_is_test_mode(void);
+
+int wear_leveling_ext_test_override_wear(struct ec_bdev *ec_bdev,
+					 uint16_t base_bdev_index,
+					 uint8_t wear_level,
+					 bool is_operational);
+
+int wear_leveling_ext_test_get_fast_path_hits(struct ec_bdev *ec_bdev,
+					      uint64_t *fast_path_hits);
 
 #endif /* WEAR_LEVELING_EXT_H */
