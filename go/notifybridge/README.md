@@ -293,7 +293,7 @@ SPDK_for_MIMO/
 ├── include/
 │   └── spdk_go_notify.h       # C 头文件
 └── app/spdk_tgt/
-    ├── spdk_tgt.c             # 已集成示例
+    ├── mimo_tgt.c             # 已集成示例
     └── Makefile               # 已配置构建
 ```
 

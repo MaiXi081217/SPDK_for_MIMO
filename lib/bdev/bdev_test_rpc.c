@@ -1181,10 +1181,9 @@ test_wear_leveling_register_unregister(void)
 	SPDK_NOTICELOG("Starting test: %s\n", test_name);
 
 	/* 创建EC bdev用于测试 */
-	rc = test_create_ec_bdev("test_wl_register", 128, 2, 2, true, &ec_bdev);
-	if (rc != 0 || ec_bdev == NULL) {
-		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
-		add_test_result(test_name, false, err_msg);
+	ec_bdev = test_alloc_fake_ec_bdev(2, 2);
+	if (ec_bdev == NULL) {
+		add_test_result(test_name, false, "无法分配EC bdev用于测试");
 		return;
 	}
 
@@ -1260,7 +1259,7 @@ test_wear_leveling_register_unregister(void)
 cleanup:
 	if (ec_bdev != NULL) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+		test_free_fake_ec_bdev(ec_bdev);
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
@@ -1277,10 +1276,9 @@ test_wear_leveling_mode_switching(void)
 
 	SPDK_NOTICELOG("Starting test: %s\n", test_name);
 
-	rc = test_create_ec_bdev("test_wl_mode", 128, 2, 2, true, &ec_bdev);
-	if (rc != 0 || ec_bdev == NULL) {
-		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
-		add_test_result(test_name, false, err_msg);
+	ec_bdev = test_alloc_fake_ec_bdev(2, 2);
+	if (ec_bdev == NULL) {
+		add_test_result(test_name, false, "无法分配EC bdev用于测试");
 		return;
 	}
 
@@ -1305,7 +1303,7 @@ test_wear_leveling_mode_switching(void)
 		}
 
 		int current_mode = wear_leveling_ext_get_mode(ec_bdev);
-		if (current_mode != modes[i]) {
+		if ((enum wear_leveling_mode)current_mode != modes[i]) {
 			snprintf(err_msg, sizeof(err_msg), "模式切换后不匹配: 期望=%d (%s), 实际=%d",
 				 modes[i], mode_names[i], current_mode);
 			test_passed = false;
@@ -1324,7 +1322,7 @@ test_wear_leveling_mode_switching(void)
 cleanup:
 	if (ec_bdev != NULL) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+		test_free_fake_ec_bdev(ec_bdev);
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
@@ -1341,10 +1339,9 @@ test_wear_leveling_tbw_setting(void)
 
 	SPDK_NOTICELOG("Starting test: %s\n", test_name);
 
-	rc = test_create_ec_bdev("test_wl_tbw", 128, 2, 2, true, &ec_bdev);
-	if (rc != 0 || ec_bdev == NULL) {
-		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
-		add_test_result(test_name, false, err_msg);
+	ec_bdev = test_alloc_fake_ec_bdev(2, 2);
+	if (ec_bdev == NULL) {
+		add_test_result(test_name, false, "无法分配EC bdev用于测试");
 		return;
 	}
 
@@ -1404,7 +1401,7 @@ test_wear_leveling_tbw_setting(void)
 cleanup:
 	if (ec_bdev != NULL) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+		test_free_fake_ec_bdev(ec_bdev);
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
@@ -1421,10 +1418,9 @@ test_wear_leveling_predict_params(void)
 
 	SPDK_NOTICELOG("Starting test: %s\n", test_name);
 
-	rc = test_create_ec_bdev("test_wl_predict", 128, 2, 2, true, &ec_bdev);
-	if (rc != 0 || ec_bdev == NULL) {
-		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
-		add_test_result(test_name, false, err_msg);
+	ec_bdev = test_alloc_fake_ec_bdev(2, 2);
+	if (ec_bdev == NULL) {
+		add_test_result(test_name, false, "无法分配EC bdev用于测试");
 		return;
 	}
 
@@ -1469,7 +1465,7 @@ test_wear_leveling_predict_params(void)
 cleanup:
 	if (ec_bdev != NULL) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+		test_free_fake_ec_bdev(ec_bdev);
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
@@ -1488,10 +1484,9 @@ test_wear_leveling_selection_deterministic(void)
 
 	SPDK_NOTICELOG("Starting test: %s\n", test_name);
 
-	rc = test_create_ec_bdev("test_wl_select", 128, 2, 2, true, &ec_bdev);
-	if (rc != 0 || ec_bdev == NULL) {
-		snprintf(err_msg, sizeof(err_msg), "创建EC bdev失败: %d", rc);
-		add_test_result(test_name, false, err_msg);
+	ec_bdev = test_alloc_fake_ec_bdev(2, 2);
+	if (ec_bdev == NULL) {
+		add_test_result(test_name, false, "无法分配EC bdev用于测试");
 		return;
 	}
 
@@ -1559,8 +1554,135 @@ test_wear_leveling_selection_deterministic(void)
 cleanup:
 	if (ec_bdev != NULL) {
 		wear_leveling_ext_unregister(ec_bdev);
-		ec_bdev_delete(ec_bdev, false, NULL, NULL);
+		test_free_fake_ec_bdev(ec_bdev);
 	}
+	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
+}
+
+/* 测试磨损均衡在磨损变化及不可用场景下的完整行为 */
+static void
+test_wear_leveling_wear_variation(void)
+{
+	const char *test_name = "wear_leveling_wear_variation";
+	struct ec_bdev *ec_bdev = NULL;
+	int rc;
+	bool test_passed = false;
+	char err_msg[256] = {0};
+	uint8_t data_indices[EC_MAX_K] = {0};
+	uint8_t parity_indices[EC_MAX_P] = {0};
+	uint8_t target_idx = 0;
+	uint64_t fast_hits_before = 0, fast_hits_after = 0;
+	uint64_t blocks_per_strip;
+	uint64_t offset_blocks;
+	
+	ec_bdev = test_alloc_fake_ec_bdev(2, 2);
+	if (ec_bdev == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "无法分配EC bdev用于测试");
+		goto result;
+	}
+	
+	rc = wear_leveling_ext_register(ec_bdev, WL_MODE_FULL);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "注册磨损均衡扩展失败: %d", rc);
+		goto cleanup;
+	}
+	
+	if (ec_bdev->extension_if == NULL ||
+	    ec_bdev->extension_if->select_base_bdevs == NULL) {
+		snprintf(err_msg, sizeof(err_msg), "磨损均衡扩展未正确初始化");
+		goto cleanup;
+	}
+	
+	blocks_per_strip = ec_bdev->strip_size ? ec_bdev->strip_size : 1;
+	
+	/* 基准选择（stripe 0） */
+	rc = ec_bdev->extension_if->select_base_bdevs(ec_bdev->extension_if, ec_bdev,
+						      0, (uint32_t)blocks_per_strip,
+						      data_indices, parity_indices,
+						      ec_bdev->extension_if->ctx);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "基准选择失败: %d", rc);
+		goto cleanup;
+	}
+	target_idx = data_indices[0];
+	
+	/* Step1: 模拟正常的磨损变化（高磨损但可用） */
+	rc = wear_leveling_ext_test_override_wear(ec_bdev, target_idx, 80, true);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "覆盖磨损信息失败: %d", rc);
+		goto cleanup;
+	}
+	offset_blocks = (uint64_t)ec_bdev->k * blocks_per_strip;
+	rc = ec_bdev->extension_if->select_base_bdevs(ec_bdev->extension_if, ec_bdev,
+						      offset_blocks, (uint32_t)blocks_per_strip,
+						      data_indices, parity_indices,
+						      ec_bdev->extension_if->ctx);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "磨损变化后选择失败: %d", rc);
+		goto cleanup;
+	}
+	
+	/* Step2: 将磨损设置为无效值，期望快速路径命中增加 */
+	rc = wear_leveling_ext_test_get_fast_path_hits(ec_bdev, &fast_hits_before);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "获取fast_path_hits失败: %d", rc);
+		goto cleanup;
+	}
+	rc = wear_leveling_ext_test_override_wear(ec_bdev, target_idx, 255, true);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "设置无效磨损失败: %d", rc);
+		goto cleanup;
+	}
+	offset_blocks = 2 * (uint64_t)ec_bdev->k * blocks_per_strip;
+	rc = ec_bdev->extension_if->select_base_bdevs(ec_bdev->extension_if, ec_bdev,
+						      offset_blocks, (uint32_t)blocks_per_strip,
+						      data_indices, parity_indices,
+						      ec_bdev->extension_if->ctx);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "无效磨损回退失败: %d", rc);
+		goto cleanup;
+	}
+	rc = wear_leveling_ext_test_get_fast_path_hits(ec_bdev, &fast_hits_after);
+	if (rc != 0 || fast_hits_after <= fast_hits_before) {
+		snprintf(err_msg, sizeof(err_msg), "fast_path_hits未增加");
+		goto cleanup;
+	}
+	
+	/* Step3: 将设备标记为不可用，验证再次回退 */
+	rc = wear_leveling_ext_test_override_wear(ec_bdev, target_idx, 10, false);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "设置设备不可用失败: %d", rc);
+		goto cleanup;
+	}
+	rc = wear_leveling_ext_test_get_fast_path_hits(ec_bdev, &fast_hits_before);
+	if (rc != 0) {
+		snprintf(err_msg, sizeof(err_msg), "获取fast_path_hits失败: %d", rc);
+		goto cleanup;
+	}
+	offset_blocks = 3 * (uint64_t)ec_bdev->k * blocks_per_strip;
+	rc = ec_bdev->extension_if->select_base_bdevs(ec_bdev->extension_if, ec_bdev,
+						      offset_blocks, (uint32_t)blocks_per_strip,
+						      data_indices, parity_indices,
+						      ec_bdev->extension_if->ctx);
+	if (rc != 0 && rc != -ENODEV) {
+		snprintf(err_msg, sizeof(err_msg), "不可用设备回退失败: %d", rc);
+		goto cleanup;
+	}
+	rc = wear_leveling_ext_test_get_fast_path_hits(ec_bdev, &fast_hits_after);
+	if (rc != 0 || fast_hits_after <= fast_hits_before) {
+		snprintf(err_msg, sizeof(err_msg), "不可用设备回退未记录fast_path_hits");
+		goto cleanup;
+	}
+	
+	test_passed = true;
+
+cleanup:
+	if (ec_bdev != NULL) {
+		wear_leveling_ext_unregister(ec_bdev);
+		test_free_fake_ec_bdev(ec_bdev);
+	}
+
+result:
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
 
@@ -2938,11 +3060,14 @@ rpc_bdev_test_all(struct spdk_jsonrpc_request *request,
 
 	/* 磨损均衡扩展模块测试 */
 	SPDK_NOTICELOG("Running wear leveling extension module tests...\n");
+	wear_leveling_ext_enable_test_mode(true);
 	test_wear_leveling_register_unregister();
 	test_wear_leveling_mode_switching();
 	test_wear_leveling_tbw_setting();
 	test_wear_leveling_predict_params();
 	test_wear_leveling_selection_deterministic();
+	test_wear_leveling_wear_variation();
+	wear_leveling_ext_enable_test_mode(false);
 	SPDK_DEBUGLOG(bdev_raid, "Wear leveling extension module tests completed\n");
 
 	/* RAID 重建场景测试 */

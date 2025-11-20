@@ -38,6 +38,10 @@ struct ec_stripe_private {
 	/* Temporary buffers for cross-iov data (only used when need_temp_bufs is true) */
 	unsigned char *temp_data_bufs[EC_MAX_K];
 	uint8_t num_temp_bufs;  /* Number of temp buffers allocated (0 if not needed) */
+	/* Base bdev indices (for snapshot storage) */
+	uint64_t stripe_index;
+	uint8_t data_indices[EC_MAX_K];
+	uint8_t parity_indices[EC_MAX_P];
 };
 
 /* RMW state enumeration */
