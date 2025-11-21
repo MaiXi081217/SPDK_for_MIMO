@@ -20,6 +20,12 @@ extern struct spdk_pci_device *spdk_nvme_ctrlr_get_pci_device(struct spdk_nvme_c
 
 static bool g_shutdown_started = false;
 
+/* Global zero buffer for reuse (similar to FTL's g_ftl_write_buf/g_ftl_read_buf)
+ * This reduces allocation overhead for operations requiring zero data (e.g., superblock wipe)
+ * Size: 1MB (0x100000) - same as FTL_ZERO_BUFFER_SIZE
+ */
+#define EC_ZERO_BUFFER_SIZE 0x100000
+void *g_ec_zero_buf = NULL;
 
 /* List of all EC bdevs */
 struct ec_all_tailq g_ec_bdev_list = TAILQ_HEAD_INITIALIZER(g_ec_bdev_list);
@@ -150,24 +156,36 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 	/* Initialize buffer pools */
 	SLIST_INIT(&ec_ch->parity_buf_pool);
 	SLIST_INIT(&ec_ch->rmw_stripe_buf_pool);
+	SLIST_INIT(&ec_ch->temp_data_buf_pool);
 	ec_ch->parity_buf_count = 0;
 	ec_ch->rmw_buf_count = 0;
+	ec_ch->temp_data_buf_count = 0;
 	ec_ch->parity_buf_size = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
 	ec_ch->rmw_buf_size = ec_ch->parity_buf_size * ec_bdev->k;
+	ec_ch->temp_data_buf_size = ec_ch->parity_buf_size;  /* Same size as parity buffers */
+	
+	/* Optimized: Cache alignment value to avoid repeated lookups from ec_bdev
+	 * This reduces memory access overhead in hot path (buffer allocation)
+	 */
+	ec_ch->cached_alignment = (ec_bdev->buf_alignment > 0) ?
+		ec_bdev->buf_alignment : EC_BDEV_DEFAULT_BUF_ALIGNMENT;
 
 	/* Pre-allocate buffers for better performance and stability */
 	/* Optimized: Pre-allocate more buffers to reduce allocation overhead during I/O */
 	/* Aggressive pre-allocation for maximum performance and stability */
 	/* This reduces performance variance by avoiding dynamic allocation during hot path */
-	size_t align = ec_bdev->buf_alignment > 0 ? ec_bdev->buf_alignment : 0x1000;
+	/* Use cached alignment value (already initialized above) */
+	size_t align = ec_ch->cached_alignment;
 	struct ec_parity_buf_entry *entry;
 	unsigned char *buf;
 	uint8_t j;
 	/* Optimized: Aggressive pre-allocation - pre-allocate more buffers for high concurrency */
 	/* Pre-allocate p*8 parity buffers (8x parity count) for high concurrency scenarios */
 	/* Pre-allocate 16 RMW buffers for concurrent partial stripe writes */
+	/* Pre-allocate k*2 temporary data buffers for cross-iov data scenarios */
 	uint8_t parity_prealloc = ec_bdev->p * 8;  /* 8x parity count for high concurrency */
 	uint8_t rmw_prealloc = 16;  /* 16 RMW buffers for high concurrency */
+	uint8_t temp_data_prealloc = ec_bdev->k * 2;  /* 2x data count for cross-iov scenarios */
 	
 	/* Cap pre-allocation to pool limits */
 	if (parity_prealloc > 128) {
@@ -175,6 +193,9 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 	}
 	if (rmw_prealloc > 64) {
 		rmw_prealloc = 64;
+	}
+	if (temp_data_prealloc > 32) {
+		temp_data_prealloc = 32;
 	}
 
 	/* Pre-allocate parity buffers */
@@ -203,6 +224,22 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 				entry->buf = buf;
 				SLIST_INSERT_HEAD(&ec_ch->rmw_stripe_buf_pool, entry, link);
 				ec_ch->rmw_buf_count++;
+			} else {
+				spdk_dma_free(buf);
+			}
+		}
+	}
+
+	/* Optimized: Pre-allocate temporary data buffers for cross-iov scenarios */
+	/* Use malloc instead of calloc - entry only needs buf pointer */
+	for (j = 0; j < temp_data_prealloc && ec_ch->temp_data_buf_count < 32; j++) {
+		buf = spdk_dma_malloc(ec_ch->temp_data_buf_size, align, NULL);
+		if (buf != NULL) {
+			entry = malloc(sizeof(*entry));
+			if (entry != NULL) {
+				entry->buf = buf;
+				SLIST_INSERT_HEAD(&ec_ch->temp_data_buf_pool, entry, link);
+				ec_ch->temp_data_buf_count++;
 			} else {
 				spdk_dma_free(buf);
 			}
@@ -276,6 +313,16 @@ ec_bdev_destroy_cb(void *io_device, void *ctx_buf)
 		free(buf_entry);
 	}
 	ec_ch->rmw_buf_count = 0;
+	
+	/* Optimized: Free temporary data buffer pool */
+	SLIST_FOREACH_SAFE(buf_entry, &ec_ch->temp_data_buf_pool, link, buf_entry_tmp) {
+		SLIST_REMOVE(&ec_ch->temp_data_buf_pool, buf_entry, ec_parity_buf_entry, link);
+		if (buf_entry->buf != NULL) {
+			spdk_dma_free(buf_entry->buf);
+		}
+		free(buf_entry);
+	}
+	ec_ch->temp_data_buf_count = 0;
 
 	if (ec_ch->base_channel == NULL) {
 		return;
@@ -1841,6 +1888,12 @@ ec_bdev_exit(void)
 {
 	/* All EC bdevs should have been deleted by now */
 	assert(TAILQ_EMPTY(&g_ec_bdev_list));
+
+	/* Free global zero buffer */
+	if (g_ec_zero_buf != NULL) {
+		spdk_free(g_ec_zero_buf);
+		g_ec_zero_buf = NULL;
+	}
 }
 
 /*
@@ -1854,6 +1907,16 @@ ec_bdev_exit(void)
 static int
 ec_bdev_init(void)
 {
+	/* Allocate global zero buffer for reuse (similar to FTL)
+	 * This reduces allocation overhead for operations requiring zero data
+	 */
+	g_ec_zero_buf = spdk_zmalloc(EC_ZERO_BUFFER_SIZE, EC_ZERO_BUFFER_SIZE, NULL,
+				     SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (!g_ec_zero_buf) {
+		SPDK_ERRLOG("Failed to allocate global zero buffer\n");
+		return -ENOMEM;
+	}
+
 	return 0;
 }
 

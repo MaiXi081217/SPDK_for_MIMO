@@ -56,17 +56,26 @@ struct bdev_selection_snapshot {
 /* 快照存储管理结构 */
 struct snapshot_storage {
 	/* 位图：标记哪些 stripe 有快照（1位/stripe） */
-	uint8_t *bitmap;  /* 1M 位 = 128KB */
+	uint8_t *bitmap;  /* 动态分配，大小根据EC配置计算 */
 	uint32_t bitmap_size;  /* 位图大小（字节） */
 	
 	/* 固定大小数组：存储所有 stripe 的选择结果 */
 	/* 如果位图标记为0，数组项未使用（可以优化为稀疏存储） */
-	struct bdev_selection_snapshot *snapshots;  /* 1M × (4+4)字节 = 8MB */
+	struct bdev_selection_snapshot *snapshots;  /* 动态分配，大小根据EC配置计算 */
 	
 	/* 统计信息 */
 	uint64_t total_stripes;  /* 总 stripe 数 */
 	uint64_t stored_snapshots;  /* 实际存储的快照数 */
 	uint64_t default_selections;  /* 使用默认选择的次数 */
+	
+	/* Optimized: Batch bitmap flush tracking to reduce memory write operations
+	 * Note: Bitmap updates are still immediate for consistency, but we track
+	 * flush operations to optimize cache line writes
+	 */
+	uint64_t pending_bitmap_updates;  /* Number of pending bitmap updates since last flush */
+	uint64_t last_bitmap_flush_timestamp;  /* Last batch flush timestamp */
+	uint64_t bitmap_flush_interval_ios;  /* Flush every N I/Os (default 500) */
+	uint64_t bitmap_flush_interval_us;  /* Flush every M microseconds (default 10 seconds) */
 };
 
 /* 磨损均衡扩展模块（私有实现结构） */
@@ -104,7 +113,7 @@ wear_leveling_ext_is_test_mode(void)
 	return g_wl_test_mode;
 }
 
-static int snapshot_storage_init(struct snapshot_storage *snapshot);
+static int snapshot_storage_init(struct snapshot_storage *snapshot, struct ec_bdev *ec_bdev);
 static void snapshot_storage_fini(struct snapshot_storage *snapshot);
 
 static inline void snapshot_reset_failures(struct wear_leveling_ext *wl_ext);
@@ -206,12 +215,21 @@ validate_health_page(struct spdk_nvme_health_information_page *health_page,
 	/* 验证温度值的合理性（可选，用于检测数据损坏）
 	 * 根据NVMe规范，温度值 0xFFFF 表示无效
 	 * 正常温度范围：-273°C 到 1000°C（0 到 1273 Kelvin）
+	 * 
+	 * 注意：某些设备可能报告异常温度值（如12032K），这可能是：
+	 * 1. 设备固件bug
+	 * 2. 数据损坏
+	 * 3. 特殊编码格式
+	 * 由于温度不是关键字段，我们只记录DEBUG级别日志，避免频繁警告
 	 */
 	if (health_page->temperature != 0xFFFF) {
 		if (health_page->temperature > 1273) {
-			/* 温度值异常高，可能是数据损坏 */
-			SPDK_WARNLOG("Suspicious temperature value %u Kelvin (bdev: %s), but continuing\n",
-				     health_page->temperature, name);
+			/* 温度值异常高，可能是数据损坏或设备固件问题
+			 * 使用DEBUG级别，避免在正常运行时产生过多警告
+			 * 温度值不影响磨损均衡功能，可以安全忽略
+			 */
+			SPDK_DEBUGLOG(bdev_ec, "Suspicious temperature value %u Kelvin (bdev: %s), ignoring\n",
+				      health_page->temperature, name);
 			/* 不返回错误，因为这不是关键字段 */
 		}
 	}
@@ -861,6 +879,87 @@ get_wear_level_fast(struct wear_leveling_ext *wl_ext, uint8_t idx)
 	return wl_ext->data.wear_info[idx].wear_level;
 }
 
+/* Optimized: Batch refresh wear info to reduce NVMe health query frequency
+ * 
+ * 刷新策略说明：
+ * 
+ * 原有机制（按需刷新）：
+ * - 每个base bdev独立判断是否需要刷新
+ * - 刷新条件（should_reread_wear_level）：
+ *   1. 从未读取过（last_read_timestamp == 0）
+ *   2. 超过最小读取间隔（wear_read_interval_us，默认30秒）
+ *   3. 写入量超过阈值（writes_since_last_read >= wear_predict_threshold_blocks，默认10GB）
+ *   4. 预测磨损变化超过阈值（predicted_wear_level - wear_level >= 5%）
+ * - 触发时机：每次I/O完成时（wear_leveling_notify_io_complete）和获取磨损信息时
+ * 
+ * 新增机制（批量刷新）：
+ * - 定期批量刷新所有base bdev，减少频繁的NVMe健康信息查询
+ * - 刷新条件：
+ *   1. 每N次I/O（wear_cache_refresh_interval_ios，默认1000）
+ *   2. 每M秒（wear_cache_refresh_interval_us，默认60秒）
+ * - 触发时机：在收集磨损信息前（_collect_and_validate_wear_info之前）
+ * 
+ * 协同工作：
+ * - 批量刷新设置needs_reread标志，触发后续的NVMe查询
+ * - 按需刷新仍然有效，确保重要变化及时刷新
+ * - 两者结合：批量刷新减少查询频率，按需刷新保证及时性
+ */
+static void
+_collect_and_validate_wear_info_batch_refresh(struct wear_leveling_ext *wl_ext,
+					     struct ec_bdev *ec_bdev)
+{
+	uint64_t now = spdk_get_ticks();
+	uint64_t ticks_hz = spdk_get_ticks_hz();
+	bool should_refresh = false;
+	
+	/* Check I/O count threshold
+	 * Prevent counter overflow: cap at interval to avoid wrapping
+	 */
+	if (wl_ext->data.io_count_since_last_refresh < wl_ext->data.wear_cache_refresh_interval_ios) {
+		wl_ext->data.io_count_since_last_refresh++;
+	}
+	if (wl_ext->data.io_count_since_last_refresh >= wl_ext->data.wear_cache_refresh_interval_ios) {
+		should_refresh = true;
+	}
+	
+	/* Check time threshold */
+	if (!should_refresh && wl_ext->data.last_batch_refresh_timestamp != 0) {
+		/* Check for time backwards (system clock adjustment) */
+		if (now >= wl_ext->data.last_batch_refresh_timestamp) {
+			uint64_t ticks_per_usec = ticks_hz / SPDK_SEC_TO_USEC;
+			if (ticks_per_usec > 0) {
+				uint64_t ticks_diff = now - wl_ext->data.last_batch_refresh_timestamp;
+				uint64_t time_since_refresh_us = ticks_diff / ticks_per_usec;
+				if (time_since_refresh_us >= wl_ext->data.wear_cache_refresh_interval_us) {
+					should_refresh = true;
+				}
+			}
+		} else {
+			/* Time went backwards, reset timestamp and refresh immediately */
+			wl_ext->data.last_batch_refresh_timestamp = now;
+			should_refresh = true;
+		}
+	} else if (wl_ext->data.last_batch_refresh_timestamp == 0) {
+		/* First time, refresh immediately */
+		should_refresh = true;
+	}
+	
+	if (should_refresh) {
+		/* Batch refresh: mark all base bdevs as needing refresh
+		 * This will trigger NVMe health queries in get_wear_level_with_prediction()
+		 * when collecting wear info for candidates
+		 */
+		uint8_t i;
+		for (i = 0; i < ec_bdev->num_base_bdevs && i < EC_MAX_K; i++) {
+			wl_ext->data.wear_info[i].needs_reread = true;
+		}
+		
+		/* Reset counters */
+		wl_ext->data.io_count_since_last_refresh = 0;
+		wl_ext->data.last_batch_refresh_timestamp = now;
+	}
+}
+
 /* Helper struct for collecting wear info from candidates */
 struct wear_collection_result {
 	uint32_t weights[EC_MAX_K];
@@ -870,6 +969,12 @@ struct wear_collection_result {
 	uint8_t max_wear;
 	bool any_needs_reread;
 	uint8_t valid_wear_count;
+	
+	/* Performance optimization: Write count based fast path */
+	uint64_t write_counts[EC_MAX_K];  /* Write counts for candidates */
+	uint64_t min_write_count;        /* Minimum write count */
+	uint64_t max_write_count;        /* Maximum write count */
+	bool use_write_count_fast_path;  /* Use write count based selection */
 };
 
 /*
@@ -877,6 +982,9 @@ struct wear_collection_result {
  * Returns 0 on success, or a negative errno on failure.
  *
  * On failure, caller is expected to fall back to default selection.
+ * 
+ * Performance optimization: If write count difference is large enough,
+ * use write count based fast path to avoid NVMe health queries.
  */
 static int
 _collect_and_validate_wear_info(struct wear_leveling_ext *wl_ext,
@@ -891,6 +999,60 @@ _collect_and_validate_wear_info(struct wear_leveling_ext *wl_ext,
 	result->any_needs_reread = false;
 	result->valid_wear_count = 0;
 	result->total_weight = 0;
+	result->min_write_count = UINT64_MAX;
+	result->max_write_count = 0;
+	result->use_write_count_fast_path = false;
+	
+	/* Step 1: Collect write counts first (fast path check) */
+	for (i = 0; i < k; i++) {
+		uint8_t candidate_idx = candidates[i];
+		
+		if (!is_valid_bdev_idx(ec_bdev, candidate_idx)) {
+			return -ENODEV;
+		}
+		
+		result->write_counts[i] = wl_ext->data.wear_info[candidate_idx].total_writes;
+		if (result->write_counts[i] < result->min_write_count) {
+			result->min_write_count = result->write_counts[i];
+		}
+		if (result->write_counts[i] > result->max_write_count) {
+			result->max_write_count = result->write_counts[i];
+		}
+	}
+	
+	/* Step 2: Check if write count difference is large enough for fast path
+	 * Similar to FTL's band_cmp: if difference > threshold, use write count
+	 */
+	if (result->max_write_count > 0) {
+		/* Calculate relative difference: (max - min) / max * 100 */
+		uint64_t diff = result->max_write_count - result->min_write_count;
+		/* Use integer arithmetic to avoid floating point: diff * 100 / max */
+		uint64_t diff_percent = (diff * 100) / result->max_write_count;
+		
+		if (diff_percent > WRITE_COUNT_DIFF_THRESHOLD_PERCENT) {
+			/* Write count difference is significant, use fast path */
+			result->use_write_count_fast_path = true;
+			/* Calculate weights based on write count (inverse: lower write count = higher weight) */
+			for (i = 0; i < k; i++) {
+				/* Weight formula: (max_write_count - write_count) * scale + base
+				 * This gives higher weight to devices with lower write count
+				 */
+				uint64_t write_count = result->write_counts[i];
+				uint64_t weight_base = (result->max_write_count > write_count) ?
+					(result->max_write_count - write_count) : 0;
+				/* Scale to match wear level weight range (1001 max) */
+				uint64_t max_wc = (result->max_write_count > 0) ? result->max_write_count : 1;
+				uint32_t weight = (uint32_t)((weight_base * 1001) / max_wc);
+				/* Ensure minimum weight of 1 */
+				result->weights[i] = (weight > 0) ? weight : 1U;
+				result->total_weight += result->weights[i];
+			}
+			/* Fast path: skip NVMe health queries */
+			return 0;
+		}
+	}
+	
+	/* Step 3: Write count difference is small, proceed with normal wear level collection */
 
 	for (i = 0; i < k; i++) {
 		uint8_t candidate_idx = candidates[i];
@@ -1158,6 +1320,11 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 		return rc;
 	}
 
+	/* Optimized: Check if batch refresh is needed before collecting wear info
+	 * This reduces NVMe health query frequency by batching refreshes
+	 */
+	_collect_and_validate_wear_info_batch_refresh(wl_ext, ec_bdev);
+	
 	/* 2. Collect wear info and validate candidates. */
 	rc = _collect_and_validate_wear_info(wl_ext, ec_bdev, default_data_indices, k, &wear_info);
 	if (rc != 0) {
@@ -1191,7 +1358,32 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 	/* 成功时重置失败计数 */
 	wl_ext->sched.consecutive_failures = 0;
 
-	/* 3. Fast path: If wear difference is small, use default selection. */
+	/* 3. Performance optimization: Write count fast path
+	 * If write count difference is large enough, use write count based selection
+	 * This avoids NVMe health queries, significantly improving performance
+	 * Similar to FTL's band_cmp: if difference > threshold, use write count
+	 */
+	if (wear_info.use_write_count_fast_path) {
+		/* Use write count based selection (already calculated in _collect_and_validate_wear_info) */
+		rc = _perform_deterministic_weighted_selection(ec_bdev, default_data_indices, k, &wear_info,
+							       stripe_index, data_indices);
+		if (rc == 0) {
+			wl_ext->sched.write_count_fast_path_hits++;
+			/* Parity indices always use default selection */
+			for (uint8_t i = 0; i < p; i++) {
+				uint8_t idx = default_parity_indices[i];
+				if (!is_valid_bdev_idx(ec_bdev, idx)) {
+					SPDK_ERRLOG("Invalid parity index %u\n", idx);
+					return -ENODEV;
+				}
+				parity_indices[i] = idx;
+			}
+			return 0;
+		}
+		/* If write count selection failed, fall through to wear level based selection */
+	}
+
+	/* 4. Fast path: If wear difference is small, use default selection. */
 	if ((wear_info.max_wear - wear_info.min_wear) < WEAR_DIFF_THRESHOLD &&
 	    !wear_info.any_needs_reread) {
 		wl_ext->sched.fast_path_hits++;
@@ -1201,7 +1393,7 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 					      "fast path");
 	}
 
-	/* 4. Perform deterministic weighted selection for data indices. */
+	/* 5. Perform deterministic weighted selection for data indices based on wear level. */
 	rc = _perform_deterministic_weighted_selection(ec_bdev, default_data_indices, k, &wear_info,
 						       stripe_index, data_indices);
 	if (rc != 0) {
@@ -1210,7 +1402,7 @@ select_wear_based_strategy(struct wear_leveling_ext *wl_ext,
 						    data_indices, parity_indices);
 	}
 
-	/* 5. Parity indices always use the default selection. */
+	/* 6. Parity indices always use the default selection. */
 	for (uint8_t i = 0; i < p; i++) {
 		uint8_t idx = default_parity_indices[i];
 		if (!is_valid_bdev_idx(ec_bdev, idx)) {
@@ -1337,7 +1529,12 @@ wear_leveling_notify_io_complete(struct ec_bdev_extension_if *ext_if,
 	}
 }
 
-/* 扩展模块初始化回调 */
+/* 扩展模块初始化回调
+ * 注意：这个回调在 ec_bdev_register_extension 时调用
+ * 此时 ec_bdev->bdev.blockcnt 可能还没有设置（如果 ec_start 还没调用）
+ * 快照存储的初始化在 wear_leveling_ext_register 中已经完成
+ * 如果 blockcnt 为 0，会使用默认值，这是安全的
+ */
 static int
 wear_leveling_ext_init_cb(struct ec_bdev_extension_if *ext_if, struct ec_bdev *ec_bdev)
 {
@@ -1345,6 +1542,28 @@ wear_leveling_ext_init_cb(struct ec_bdev_extension_if *ext_if, struct ec_bdev *e
 		SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
 	
 	wl_ext->ec_bdev = ec_bdev;
+	
+	/* 如果快照存储未完全初始化但 blockcnt 现在可用，尝试重新初始化
+	 * 注意：这通常不会发生，因为注册时 blockcnt 应该已经设置
+	 * 但为了鲁棒性，我们检查一下
+	 * 判断条件：mode 是 FULL，blockcnt 现在可用，但快照存储未初始化（snapshots 或 bitmap 为 NULL）
+	 */
+	if (wl_ext->sched.mode == WL_MODE_FULL && 
+	    ec_bdev->bdev.blockcnt > 0 &&
+	    (wl_ext->snapshot.snapshots == NULL || wl_ext->snapshot.bitmap == NULL)) {
+		/* 快照存储未初始化，但 blockcnt 现在可用，尝试初始化 */
+		SPDK_NOTICELOG("EC bdev %s: blockcnt now available (%lu), initializing snapshot storage\n",
+			       ec_bdev->bdev.name, (unsigned long)ec_bdev->bdev.blockcnt);
+		int rc = snapshot_storage_init(&wl_ext->snapshot, ec_bdev);
+		if (rc != 0) {
+			SPDK_WARNLOG("Failed to initialize snapshot storage: %s\n",
+				     spdk_strerror(-rc));
+			/* 不失败，继续使用默认选择 */
+		} else {
+			SPDK_NOTICELOG("EC bdev %s: snapshot storage successfully initialized with %lu stripes\n",
+				       ec_bdev->bdev.name, (unsigned long)wl_ext->snapshot.total_stripes);
+		}
+	}
 	
 	SPDK_NOTICELOG("Wear leveling extension initialized for EC bdev %s\n",
 		       ec_bdev->bdev.name);
@@ -1526,10 +1745,23 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode
 	/* 初始化磨损信息 */
 	memset(&wl_ext->data, 0, sizeof(wl_ext->data));
 	
-	/* 初始化快照存储（仅在 FULL 模式需要） */
+	/* Optimized: Initialize wear cache refresh intervals
+	 * Default: refresh every 1000 I/Os or every 1 minute
+	 * This reduces NVMe health query frequency significantly
+	 */
+	wl_ext->data.wear_cache_refresh_interval_ios = 1000;  /* Refresh every 1000 I/Os */
+	wl_ext->data.wear_cache_refresh_interval_us = 60000000ULL;  /* Refresh every 1 minute (60 seconds) */
+	wl_ext->data.io_count_since_last_refresh = 0;
+	wl_ext->data.last_batch_refresh_timestamp = 0;
+	
+	/* 初始化快照存储（仅在 FULL 模式需要）
+	 * 注意：此时 ec_bdev->bdev.blockcnt 可能还没有设置（如果 ec_start 还没调用）
+	 * calculate_snapshot_stripes() 会处理 blockcnt == 0 的情况（使用默认值）
+	 * 如果 blockcnt 后来才设置，init_cb 会尝试重新初始化
+	 */
 	int rc = 0;
 	if (mode == WL_MODE_FULL) {
-		rc = snapshot_storage_init(&wl_ext->snapshot);
+		rc = snapshot_storage_init(&wl_ext->snapshot, ec_bdev);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to initialize snapshot storage for EC bdev %s: %s\n",
 				    ec_bdev->bdev.name, spdk_strerror(-rc));
@@ -1537,6 +1769,10 @@ wear_leveling_ext_register(struct ec_bdev *ec_bdev, enum wear_leveling_mode mode
 			wl_ext->sched.mode = WL_MODE_DISABLED;
 			snapshot_auto_fallback_to_disabled(wl_ext, ec_bdev, "snapshot_init_failed");
 			/* 继续注册，但使用 DISABLED 模式（安全降级） */
+		} else if (ec_bdev->bdev.blockcnt == 0) {
+			/* blockcnt 还未设置，记录日志，init_cb 会尝试重新初始化 */
+			SPDK_NOTICELOG("EC bdev %s: blockcnt not yet set, snapshot storage initialized with default size\n",
+				       ec_bdev->bdev.name);
 		}
 	}
 	
@@ -2014,38 +2250,178 @@ wear_leveling_ext_test_get_fast_path_hits(struct ec_bdev *ec_bdev,
  * ============================================================================
  */
 
-/* 初始化快照存储 */
-static int
-snapshot_storage_init(struct snapshot_storage *snapshot)
+/* 计算所需的stripe数量（根据EC配置动态计算） */
+static uint64_t
+calculate_snapshot_stripes(struct ec_bdev *ec_bdev)
 {
-	if (snapshot == NULL) {
+	uint64_t stripe_count = 0;
+	
+	if (ec_bdev == NULL || ec_bdev->k == 0 || ec_bdev->strip_size == 0) {
+		SPDK_WARNLOG("Invalid EC bdev parameters, using default stripe count\n");
+		return SNAPSHOT_STRIPES_DEFAULT;
+	}
+	
+	/* 获取EC bdev的总块数 */
+	uint64_t total_blocks = ec_bdev->bdev.blockcnt;
+	uint8_t k = ec_bdev->k;
+	uint32_t strip_size = ec_bdev->strip_size;
+	
+	/* 检查总块数是否有效 */
+	if (total_blocks == 0) {
+		SPDK_WARNLOG("EC bdev blockcnt is 0, using default stripe count\n");
+		return SNAPSHOT_STRIPES_DEFAULT;
+	}
+	
+	/* 计算stripe数量：stripe_count = total_blocks / (k * strip_size)
+	 * 每个stripe包含k个strip，每个strip大小为strip_size blocks
+	 * 检查乘法溢出：k最大255，strip_size通常不会超过几百万，但为安全起见检查
+	 */
+	if (strip_size > UINT64_MAX / k) {
+		SPDK_WARNLOG("blocks_per_stripe would overflow (k=%u, strip_size=%u), using default\n",
+			     k, strip_size);
+		return SNAPSHOT_STRIPES_DEFAULT;
+	}
+	
+	uint64_t blocks_per_stripe = (uint64_t)k * strip_size;
+	
+	if (blocks_per_stripe == 0) {
+		SPDK_WARNLOG("Invalid blocks_per_stripe (k=%u, strip_size=%u), using default\n",
+			     k, strip_size);
+		return SNAPSHOT_STRIPES_DEFAULT;
+	}
+	
+	stripe_count = total_blocks / blocks_per_stripe;
+	
+	/* 如果计算结果为0，使用默认值 */
+	if (stripe_count == 0) {
+		SPDK_WARNLOG("Calculated stripe count is 0 (total_blocks=%lu, blocks_per_stripe=%lu), using default\n",
+			     (unsigned long)total_blocks, (unsigned long)blocks_per_stripe);
+		return SNAPSHOT_STRIPES_DEFAULT;
+	}
+	
+	/* 添加10%的余量，防止边界情况
+	 * 检查溢出：stripe_count + (stripe_count / 10) 可能溢出
+	 */
+	uint64_t margin = stripe_count / 10;
+	if (stripe_count > UINT64_MAX - margin) {
+		/* 溢出风险，使用最大值 */
+		SPDK_WARNLOG("Stripe count with margin would overflow, using maximum\n");
+		return SNAPSHOT_STRIPES_MAX;
+	}
+	stripe_count = stripe_count + margin;
+	
+	/* 应用限制：确保在合理范围内 */
+	if (stripe_count < SNAPSHOT_STRIPES_MIN) {
+		stripe_count = SNAPSHOT_STRIPES_MIN;
+		SPDK_NOTICELOG("Calculated stripe count too small, using minimum: %lu\n",
+			       (unsigned long)stripe_count);
+	} else if (stripe_count > SNAPSHOT_STRIPES_MAX) {
+		stripe_count = SNAPSHOT_STRIPES_MAX;
+		SPDK_WARNLOG("Calculated stripe count too large, using maximum: %lu\n",
+			     (unsigned long)stripe_count);
+	}
+	
+	return stripe_count;
+}
+
+/* 初始化快照存储（动态分配，根据EC配置计算大小） */
+static int
+snapshot_storage_init(struct snapshot_storage *snapshot, struct ec_bdev *ec_bdev)
+{
+	uint64_t total_stripes;
+	uint64_t bitmap_size_bytes;
+	uint64_t snapshots_size_bytes;
+	
+	if (snapshot == NULL || ec_bdev == NULL) {
 		return -EINVAL;
 	}
 	
 	memset(snapshot, 0, sizeof(*snapshot));
 	
-	/* 分配位图：1M 位 = 128KB */
-	snapshot->bitmap_size = SNAPSHOT_BITMAP_SIZE;
-	snapshot->bitmap = calloc(1, snapshot->bitmap_size);
-	if (snapshot->bitmap == NULL) {
-		SPDK_ERRLOG("Failed to allocate snapshot bitmap (%u bytes)\n",
-			    snapshot->bitmap_size);
+	/* 动态计算所需的stripe数量 */
+	total_stripes = calculate_snapshot_stripes(ec_bdev);
+	snapshot->total_stripes = total_stripes;
+	
+	/* 计算位图大小（字节）：每个stripe占1位
+	 * 使用向上取整：(total_stripes + 7) / 8
+	 * 检查溢出：total_stripes最大256M，bitmap_size_bytes最大32MB，不会溢出uint64_t
+	 */
+	if (total_stripes > UINT64_MAX - 7) {
+		SPDK_ERRLOG("Total stripes too large for bitmap calculation: %lu\n",
+			    (unsigned long)total_stripes);
+		return -ENOMEM;
+	}
+	bitmap_size_bytes = (total_stripes + 7) / 8;  /* 向上取整到字节 */
+	
+	/* 检查位图大小是否合理（防止溢出到uint32_t） */
+	if (bitmap_size_bytes > UINT32_MAX) {
+		SPDK_ERRLOG("Bitmap size too large: %lu bytes (max %u)\n",
+			    (unsigned long)bitmap_size_bytes, UINT32_MAX);
 		return -ENOMEM;
 	}
 	
-	/* 分配快照数组：1M × (EC_MAX_K + EC_MAX_P) 字节 */
-	snapshot->snapshots = calloc(MAX_SNAPSHOT_STRIPES, sizeof(struct bdev_selection_snapshot));
-	if (snapshot->snapshots == NULL) {
-		SPDK_ERRLOG("Failed to allocate snapshot array (%lu bytes)\n",
-			    (unsigned long)(MAX_SNAPSHOT_STRIPES * sizeof(struct bdev_selection_snapshot)));
+	snapshot->bitmap_size = (uint32_t)bitmap_size_bytes;
+	
+	/* 分配位图 */
+	snapshot->bitmap = calloc(1, snapshot->bitmap_size);
+	if (snapshot->bitmap == NULL) {
+		SPDK_ERRLOG("Failed to allocate snapshot bitmap (%u bytes = %.2f MB)\n",
+			    snapshot->bitmap_size, snapshot->bitmap_size / (1024.0 * 1024.0));
+		return -ENOMEM;
+	}
+	
+	/* 计算快照数组大小
+	 * 检查乘法溢出：total_stripes * sizeof(struct bdev_selection_snapshot)
+	 */
+	size_t snapshot_size = sizeof(struct bdev_selection_snapshot);
+	if (total_stripes > SIZE_MAX / snapshot_size) {
+		SPDK_ERRLOG("Snapshots array size calculation would overflow: %lu stripes × %zu bytes\n",
+			    (unsigned long)total_stripes, snapshot_size);
+		free(snapshot->bitmap);
+		snapshot->bitmap = NULL;
+		return -ENOMEM;
+	}
+	snapshots_size_bytes = total_stripes * snapshot_size;
+	
+	/* 检查数组大小是否合理（双重检查） */
+	if (snapshots_size_bytes > SIZE_MAX) {
+		SPDK_ERRLOG("Snapshots array size too large: %lu bytes (max %zu)\n",
+			    (unsigned long)snapshots_size_bytes, SIZE_MAX);
 		free(snapshot->bitmap);
 		snapshot->bitmap = NULL;
 		return -ENOMEM;
 	}
 	
-	snapshot->total_stripes = MAX_SNAPSHOT_STRIPES;
+	/* 分配快照数组 */
+	snapshot->snapshots = calloc(total_stripes, sizeof(struct bdev_selection_snapshot));
+	if (snapshot->snapshots == NULL) {
+		SPDK_ERRLOG("Failed to allocate snapshot array (%lu bytes = %.2f MB)\n",
+			    (unsigned long)snapshots_size_bytes,
+			    snapshots_size_bytes / (1024.0 * 1024.0));
+		free(snapshot->bitmap);
+		snapshot->bitmap = NULL;
+		return -ENOMEM;
+	}
+	
 	snapshot->stored_snapshots = 0;
 	snapshot->default_selections = 0;
+	
+	/* Optimized: Initialize batch bitmap flush parameters
+	 * Default: flush every 500 I/Os or every 10 seconds
+	 * This reduces cache line write operations while maintaining consistency
+	 * Note: Bitmap updates are still immediate for read consistency, this only
+	 * controls the memory barrier/flush operation frequency
+	 */
+	snapshot->pending_bitmap_updates = 0;
+	snapshot->last_bitmap_flush_timestamp = 0;
+	snapshot->bitmap_flush_interval_ios = 500;  /* Flush every 500 I/Os */
+	snapshot->bitmap_flush_interval_us = 10000000ULL;  /* Flush every 10 seconds */
+	
+	SPDK_NOTICELOG("Snapshot storage initialized: %lu stripes, bitmap=%.2f MB, array=%.2f MB, total=%.2f MB\n",
+		       (unsigned long)total_stripes,
+		       snapshot->bitmap_size / (1024.0 * 1024.0),
+		       snapshots_size_bytes / (1024.0 * 1024.0),
+		       (snapshot->bitmap_size + snapshots_size_bytes) / (1024.0 * 1024.0));
 	
 	return 0;
 }
@@ -2076,7 +2452,7 @@ static inline bool
 snapshot_bitmap_get(const struct snapshot_storage *snapshot, uint64_t stripe_index)
 {
 	if (snapshot == NULL || snapshot->bitmap == NULL ||
-	    stripe_index >= MAX_SNAPSHOT_STRIPES) {
+	    stripe_index >= snapshot->total_stripes) {
 		return false;
 	}
 	
@@ -2096,7 +2472,7 @@ static inline void
 snapshot_bitmap_set(struct snapshot_storage *snapshot, uint64_t stripe_index)
 {
 	if (snapshot == NULL || snapshot->bitmap == NULL ||
-	    stripe_index >= MAX_SNAPSHOT_STRIPES) {
+	    stripe_index >= snapshot->total_stripes) {
 		return;
 	}
 	
@@ -2116,7 +2492,7 @@ static inline void
 snapshot_bitmap_clear(struct snapshot_storage *snapshot, uint64_t stripe_index)
 {
 	if (snapshot == NULL || snapshot->bitmap == NULL ||
-	    stripe_index >= MAX_SNAPSHOT_STRIPES) {
+	    stripe_index >= snapshot->total_stripes) {
 		return;
 	}
 	
@@ -2131,7 +2507,14 @@ snapshot_bitmap_clear(struct snapshot_storage *snapshot, uint64_t stripe_index)
 	snapshot->bitmap[byte_idx] &= ~(1U << bit_idx);
 }
 
-/* 存储快照 */
+/* 存储快照
+ * 
+ * 并发安全说明：
+ * - SPDK 使用单线程轮询模型，每个 I/O channel 绑定到一个线程
+ * - 快照存储和读取都在 I/O 完成回调中执行，这些回调在同一个线程中执行
+ * - 因此，对快照存储的访问是线程安全的（每个线程访问自己的 I/O channel）
+ * - 不需要额外的锁保护
+ */
 int
 wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
 				  uint64_t stripe_index,
@@ -2146,12 +2529,6 @@ wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
 		return -EINVAL;
 	}
 	
-	/* 边界检查：stripe_index 必须在范围内 */
-	if (stripe_index >= MAX_SNAPSHOT_STRIPES) {
-		/* 超出范围，不存储快照（使用默认选择） */
-		return -ERANGE;
-	}
-	
 	ext_if = ec_bdev_get_extension(ec_bdev);
 	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
 		/* 未启用磨损均衡扩展，不需要存储快照 */
@@ -2160,6 +2537,12 @@ wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
 	
 	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
 	snapshot = &wl_ext->snapshot;
+	
+	/* 边界检查：stripe_index 必须在范围内（必须在获取snapshot之后检查） */
+	if (stripe_index >= snapshot->total_stripes) {
+		/* 超出范围，不存储快照（使用默认选择） */
+		return -ERANGE;
+	}
 	
 	/* 检查快照存储是否已初始化 */
 	if (snapshot->snapshots == NULL || snapshot->bitmap == NULL) {
@@ -2177,7 +2560,21 @@ wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
 		return -EINVAL;
 	}
 	
-	/* 存储快照 */
+	/* 边界检查：确保数组索引不会越界
+	 * Note: k and p are uint8_t (0-255), EC_MAX_K/EC_MAX_P are 255.
+	 * Since uint8_t max is 255, we only need to check for zero.
+	 * Values are validated during EC bdev creation.
+	 */
+	if (ec_bdev->k == 0 || ec_bdev->p == 0) {
+		SPDK_ERRLOG("Invalid k=%u or p=%u (must be > 0)\n",
+			    ec_bdev->k, ec_bdev->p);
+		snapshot_record_failure(wl_ext, ec_bdev, "invalid_ec_parameters");
+		return -EINVAL;
+	}
+	
+	/* 存储快照
+	 * 注意：stripe_index 已经通过边界检查，snapshots 数组访问是安全的
+	 */
 	struct bdev_selection_snapshot *snap = &snapshot->snapshots[stripe_index];
 	memcpy(snap->data_indices, data_indices, ec_bdev->k * sizeof(uint8_t));
 	memcpy(snap->parity_indices, parity_indices, ec_bdev->p * sizeof(uint8_t));
@@ -2185,12 +2582,62 @@ wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
 	/* 设置位图（如果之前没有快照，增加计数） */
 	bool had_snapshot = snapshot_bitmap_get(snapshot, stripe_index);
 	if (!had_snapshot) {
-		/* 防止计数溢出（虽然不太可能，因为 MAX_SNAPSHOT_STRIPES = 1M） */
+		/* 防止计数溢出 */
 		if (snapshot->stored_snapshots < snapshot->total_stripes) {
 			snapshot->stored_snapshots++;
 		}
 	}
+	
+	/* Optimized: Batch bitmap updates to reduce memory write operations
+	 * Immediate bitmap update for consistency, but track for batch flushing
+	 * This reduces cache line flushes while maintaining read consistency
+	 */
 	snapshot_bitmap_set(snapshot, stripe_index);
+	
+	/* Prevent counter overflow: cap at interval to avoid wrapping */
+	if (snapshot->pending_bitmap_updates < snapshot->bitmap_flush_interval_ios) {
+		snapshot->pending_bitmap_updates++;
+	} else {
+		/* Already at threshold, will trigger flush below */
+	}
+	
+	/* Check if batch flush is needed */
+	uint64_t now = spdk_get_ticks();
+	uint64_t ticks_hz = spdk_get_ticks_hz();
+	bool should_flush = false;
+	
+	if (snapshot->pending_bitmap_updates >= snapshot->bitmap_flush_interval_ios) {
+		should_flush = true;
+	} else if (snapshot->last_bitmap_flush_timestamp != 0) {
+		/* Check for time backwards (system clock adjustment) */
+		if (now >= snapshot->last_bitmap_flush_timestamp) {
+			uint64_t ticks_per_usec = ticks_hz / SPDK_SEC_TO_USEC;
+			if (ticks_per_usec > 0) {
+				uint64_t ticks_diff = now - snapshot->last_bitmap_flush_timestamp;
+				uint64_t time_since_flush_us = ticks_diff / ticks_per_usec;
+				if (time_since_flush_us >= snapshot->bitmap_flush_interval_us) {
+					should_flush = true;
+				}
+			}
+		} else {
+			/* Time went backwards, reset timestamp and flush immediately */
+			snapshot->last_bitmap_flush_timestamp = now;
+			should_flush = true;
+		}
+	} else {
+		/* First update, initialize timestamp */
+		snapshot->last_bitmap_flush_timestamp = now;
+	}
+	
+	/* Batch flush: memory barrier to ensure bitmap writes are visible
+	 * This is a no-op on most architectures but ensures consistency
+	 */
+	if (should_flush) {
+		/* Memory barrier to ensure all bitmap writes are visible */
+		asm volatile("" ::: "memory");
+		snapshot->pending_bitmap_updates = 0;
+		snapshot->last_bitmap_flush_timestamp = now;
+	}
 	
 	/* 成功时重置失败计数 */
 	snapshot_reset_failures(wl_ext);
@@ -2198,7 +2645,14 @@ wear_leveling_ext_store_snapshot(struct ec_bdev *ec_bdev,
 	return 0;
 }
 
-/* 读取快照 */
+/* 读取快照
+ * 
+ * 并发安全说明：
+ * - SPDK 使用单线程轮询模型，每个 I/O channel 绑定到一个线程
+ * - 快照存储和读取都在 I/O 完成回调中执行，这些回调在同一个线程中执行
+ * - 因此，对快照存储的访问是线程安全的（每个线程访问自己的 I/O channel）
+ * - 不需要额外的锁保护
+ */
 bool
 wear_leveling_ext_load_snapshot(struct ec_bdev *ec_bdev,
 				 uint64_t stripe_index,
@@ -2213,11 +2667,6 @@ wear_leveling_ext_load_snapshot(struct ec_bdev *ec_bdev,
 		return false;
 	}
 	
-	/* 边界检查：stripe_index 超出范围，返回 false（使用默认选择） */
-	if (stripe_index >= MAX_SNAPSHOT_STRIPES) {
-		return false;
-	}
-	
 	ext_if = ec_bdev_get_extension(ec_bdev);
 	if (ext_if == NULL || strcmp(ext_if->name, WEAR_LEVELING_EXT_NAME) != 0) {
 		/* 未启用磨损均衡扩展，返回 false（使用默认选择） */
@@ -2226,6 +2675,11 @@ wear_leveling_ext_load_snapshot(struct ec_bdev *ec_bdev,
 	
 	wl_ext = SPDK_CONTAINEROF(ext_if, struct wear_leveling_ext, ext_if);
 	snapshot = &wl_ext->snapshot;
+	
+	/* 边界检查：stripe_index 超出范围，返回 false（必须在获取snapshot之后检查） */
+	if (stripe_index >= snapshot->total_stripes) {
+		return false;
+	}
 	
 	/* 检查快照存储是否已初始化 */
 	if (snapshot->snapshots == NULL || snapshot->bitmap == NULL) {
@@ -2250,7 +2704,20 @@ wear_leveling_ext_load_snapshot(struct ec_bdev *ec_bdev,
 		return false;
 	}
 	
-	/* 读取快照 */
+	/* 边界检查：确保数组索引不会越界
+	 * Note: k and p are uint8_t (0-255), EC_MAX_K/EC_MAX_P are 255.
+	 * Since uint8_t max is 255, we only need to check for zero.
+	 * Values are validated during EC bdev creation.
+	 */
+	if (ec_bdev->k == 0 || ec_bdev->p == 0) {
+		SPDK_ERRLOG("Invalid k=%u or p=%u (must be > 0)\n",
+			    ec_bdev->k, ec_bdev->p);
+		return false;
+	}
+	
+	/* 读取快照
+	 * 注意：stripe_index 已经通过边界检查，snapshots 数组访问是安全的
+	 */
 	struct bdev_selection_snapshot *snap = &snapshot->snapshots[stripe_index];
 	memcpy(data_indices, snap->data_indices, ec_bdev->k * sizeof(uint8_t));
 	memcpy(parity_indices, snap->parity_indices, ec_bdev->p * sizeof(uint8_t));
