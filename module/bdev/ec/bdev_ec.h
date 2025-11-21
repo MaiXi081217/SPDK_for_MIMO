@@ -20,6 +20,7 @@
 #define EC_BDEV_DEFAULT_BUF_ALIGNMENT	0x1000	/* 4KB default alignment */
 #define EC_BDEV_PARITY_BUF_POOL_MAX	128	/* Maximum parity buffers in pool */
 #define EC_BDEV_RMW_BUF_POOL_MAX	64	/* Maximum RMW stripe buffers in pool */
+#define EC_BDEV_TEMP_DATA_BUF_POOL_MAX	32	/* Maximum temporary data buffers in pool */
 #define EC_BDEV_BITMAP_SIZE_LIMIT	64	/* Bitmap size limit for fast lookup */
 
 /* Invalid offset marker */
@@ -146,6 +147,12 @@ struct ec_bdev_io {
 	uint8_t				base_bdev_io_submitted;
 	enum spdk_bdev_io_status	base_bdev_io_status;
 	enum spdk_bdev_io_status	base_bdev_io_status_default;
+	
+	/* Optimized: Map base bdev I/O to index for O(1) lookup in completion callback
+	 * This array stores the base_bdev_idx for each submitted I/O
+	 * Index in array corresponds to submission order (0 to base_bdev_io_submitted-1)
+	 */
+	uint8_t				base_bdev_idx_map[EC_MAX_K + EC_MAX_P];
 
 	/* Private data for the EC module */
 	void				*module_private;
@@ -263,15 +270,27 @@ struct ec_bdev_io_channel {
 	/* Buffer pool for RMW stripe buffers */
 	SLIST_HEAD(, ec_parity_buf_entry)	rmw_stripe_buf_pool;
 	
+	/* Optimized: Buffer pool for temporary data buffers (cross-iov data) */
+	SLIST_HEAD(, ec_parity_buf_entry)	temp_data_buf_pool;
+	
 	/* Number of buffers in pool */
 	uint32_t			parity_buf_count;
 	uint32_t			rmw_buf_count;
+	uint32_t			temp_data_buf_count;
 	
 	/* Buffer size for parity buffers */
 	uint32_t			parity_buf_size;
 	
 	/* Buffer size for RMW stripe buffers */
 	uint32_t			rmw_buf_size;
+	
+	/* Buffer size for temporary data buffers */
+	uint32_t			temp_data_buf_size;
+	
+	/* Optimized: Cached alignment value to avoid repeated lookups from ec_bdev
+	 * This reduces memory access overhead in hot path (buffer allocation)
+	 */
+	size_t				cached_alignment;
 };
 
 /* TAIL head for EC bdev list */

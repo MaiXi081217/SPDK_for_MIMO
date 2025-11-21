@@ -37,14 +37,26 @@
 /* 磨损差异阈值：小于此值使用快速路径（默认策略） */
 #define WEAR_DIFF_THRESHOLD 5  /* 5% */
 
+/* Write count差异阈值：大于此值使用write count快速路径（避免NVMe查询） */
+#define WRITE_COUNT_DIFF_THRESHOLD_PERCENT 10  /* 10% */
+
 /* 默认预测参数 */
 #define WEAR_DEFAULT_THRESHOLD_BLOCKS (20971520ULL)  /* 10GB = 20M blocks * 512B */
 #define WEAR_DEFAULT_THRESHOLD_PERCENT (5)           /* 5% */
 #define WEAR_DEFAULT_READ_INTERVAL_US (30000000ULL)  /* 30秒 */
 
-/* 快照存储配置 */
-#define MAX_SNAPSHOT_STRIPES 1048576  /* 2^20 = 1M 个 stripe，覆盖常用范围 */
-#define SNAPSHOT_BITMAP_SIZE (MAX_SNAPSHOT_STRIPES / 8)  /* 位图大小（字节） */
+/* 快照存储配置
+ * 动态计算：根据EC配置自动计算所需stripe数量
+ * 计算公式：stripe_count = ec_bdev.blockcnt / (k * strip_size)
+ * 
+ * 限制：
+ * - 最小值：1M (1,048,576) - 保证基本功能
+ * - 最大值：256M (268,435,456) - 防止内存过度占用
+ * - 默认值：如果计算失败，使用64M作为默认值
+ */
+#define SNAPSHOT_STRIPES_MIN 1048576      /* 2^20 = 1M，最小值 */
+#define SNAPSHOT_STRIPES_MAX 268435456    /* 2^28 = 256M，最大值 */
+#define SNAPSHOT_STRIPES_DEFAULT 67108864 /* 2^26 = 64M，默认值（8×3.8TB场景） */
 
 /* 自动降级阈值 */
 #define WEAR_AUTO_FALLBACK_THRESHOLD (5)  /* 连续失败5次触发自动降级 */
@@ -102,13 +114,22 @@ struct wear_data_provider {
 	uint32_t cached_block_size[EC_MAX_K + EC_MAX_P];
 	uint64_t cache_hits;
 	uint64_t cache_misses;
+	
+	/* Optimized: Wear level cache to reduce NVMe health queries
+	 * Cache refresh policy: refresh every N I/Os or every M seconds
+	 */
+	uint64_t io_count_since_last_refresh;  /* I/O计数，用于批量刷新 */
+	uint64_t last_batch_refresh_timestamp; /* 上次批量刷新的时间戳 */
+	uint64_t wear_cache_refresh_interval_ios;  /* 每N次I/O刷新一次（默认100） */
+	uint64_t wear_cache_refresh_interval_us;   /* 每M微秒刷新一次（默认30秒） */
 };
 
 /* 调度策略模块 */
 struct wear_scheduler_state {
 	enum wear_leveling_mode mode;
 	bool all_wear_unavailable;
-	uint64_t fast_path_hits;
+	uint64_t fast_path_hits;           /* 快速路径命中次数（wear diff < threshold） */
+	uint64_t write_count_fast_path_hits; /* Write count快速路径命中次数（性能优化） */
 	
 	/* 健康检测和自动降级相关 */
 	uint32_t consecutive_failures;     /* 连续失败次数 */

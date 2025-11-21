@@ -277,28 +277,50 @@ ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 
 **说明**：需要读取完整的条带数据，因为校验块的计算依赖所有k个数据块。
 
-#### 阶段2：合并数据并编码
+#### 阶段2：合并数据并编码（优化：增量更新）
 
-```900:953:bdev_ec_io.c
-	/* 将新数据从iovs复制到stripe buffer */
-	unsigned char *target_stripe_data = rmw->data_ptrs[rmw->strip_idx_in_stripe] + offset_bytes;
+```987:1115:bdev_ec_io.c
+	/* Optimized: Save old data before merge for incremental parity update
+	 * This enables using ec_encode_stripe_update instead of full re-encoding
+	 * Performance: O(k*p*len) -> O(p*len) for encoding
+	 */
+	unsigned char *old_data_snapshot = NULL;
 	
-	/* 使用优化的64位复制（如果对齐） */
-	if (to_copy >= 64 && aligned) {
-		uint64_t *dst64 = (uint64_t *)target_stripe_data;
-		uint64_t *src64 = (uint64_t *)src;
-		for (j = 0; j < len64; j++) {
-			dst64[j] = src64[j];
+	/* Allocate temporary buffer for old data snapshot if incremental update is possible */
+	if (num_bytes_to_write >= strip_size_bytes / 4) {
+		/* Significant write (>25%): worth incremental update */
+		old_data_snapshot = spdk_dma_malloc(strip_size_bytes, EC_ISAL_OPTIMAL_ALIGN, NULL);
+		if (old_data_snapshot != NULL) {
+			/* Save entire strip's old data before merge */
+			memcpy(old_data_snapshot, full_strip_old_data, strip_size_bytes);
+		}
+	}
+	
+	/* Copy new data from iovs to stripe buffer */
+	// ... 数据复制逻辑 ...
+	
+	/* Optimized: Use incremental parity update instead of full re-encoding */
+	if (old_data_snapshot != NULL) {
+		rc = ec_encode_stripe_update(ec_bdev, rmw->strip_idx_in_stripe,
+					     old_data_snapshot, target_stripe_data,
+					     rmw->parity_bufs, strip_size_bytes);
+		if (rc == 0) {
+			/* Incremental update successful */
+			spdk_dma_free(old_data_snapshot);
+		} else {
+			/* Fall back to full re-encode */
+			ec_encode_stripe(ec_bdev, rmw->data_ptrs, rmw->parity_bufs, strip_size_bytes);
 		}
 	} else {
-		memcpy(target_stripe_data, src, to_copy);
+		/* Full re-encode for small writes */
+		ec_encode_stripe(ec_bdev, rmw->data_ptrs, rmw->parity_bufs, strip_size_bytes);
 	}
-
-	/* 重新编码整个条带 */
-	ec_encode_stripe(ec_bdev, rmw->data_ptrs, rmw->parity_bufs, strip_size_bytes);
 ```
 
-**说明**：将新数据合并到stripe buffer后，重新编码生成新的校验块。
+**说明**：
+- **优化前**：总是重新编码整个条带，计算复杂度O(k×p×len)
+- **优化后**：对于大于25%的写入，使用增量更新，只更新校验块，计算复杂度O(p×len)
+- **性能提升**：对于k=2, p=2，计算量减少约50%
 
 #### 阶段3：写入数据块和校验块
 
@@ -345,10 +367,17 @@ ec_encode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 - **并行读取**：k个数据块并行读取，减少读取延迟
 - **交错写入**：数据块和校验块交错提交，提升写入并行度
 
-**优化3：增量更新（未来优化方向）**
-- **场景**：如果旧数据已经在内存中（例如缓存）
+**优化3：增量更新（已实现）**
+- **场景**：RMW路径中，旧数据已在内存中
 - **方法**：使用`ec_encode_stripe_update()`增量更新校验块，而不是重新编码
-- **优势**：避免k次读取，只更新校验块
+- **优势**：
+  - 计算量减少：O(k×p×len) → O(p×len)
+  - 对于k=2, p=2，性能提升约50%
+- **实现细节**：
+  - 保存旧数据快照（写入>25%strip时）
+  - 计算delta = old_data XOR new_data
+  - 使用delta增量更新校验块
+  - 如果增量更新失败，回退到全量编码
 
 ---
 
@@ -491,42 +520,58 @@ int ec_encode_stripe_update(...)
 
 **核心思想**：复用缓冲区，减少分配开销。
 
-```29:87:bdev_ec_io.c
+```38:100:bdev_ec_io.c
 static unsigned char *
-ec_get_parity_buf(struct ec_bdev_io_channel *ec_ch, 
-                  struct ec_bdev *ec_bdev, 
-                  uint32_t buf_size)
+ec_get_buf_from_pool(struct ec_parity_buf_entry **pool_head,
+		     uint32_t *pool_size, uint32_t *pool_count,
+		     uint32_t expected_size, uint32_t requested_size,
+		     struct ec_bdev *ec_bdev, struct ec_bdev_io_channel *ec_ch,
+		     const char *pool_name)
 {
-    // 1. 先检查缓冲区池
-    entry = SLIST_FIRST(&ec_ch->parity_buf_pool);
-    if (spdk_likely(entry != NULL && ec_ch->parity_buf_size == buf_size)) {
-        // 从池中取出（快速路径）
-        SLIST_REMOVE_HEAD(&ec_ch->parity_buf_pool, link);
-        return entry->buf;
+    // 1. 优化：使用缓存的对齐值（避免重复查找）
+    if (spdk_likely(ec_ch != NULL && ec_ch->cached_alignment > 0)) {
+        align = ec_ch->cached_alignment;
+    } else if (ec_bdev != NULL && ec_bdev->buf_alignment > 0) {
+        align = ec_bdev->buf_alignment;
+        // 缓存对齐值
+        if (ec_ch != NULL) {
+            ec_ch->cached_alignment = align;
+        }
+    } else {
+        align = EC_BDEV_DEFAULT_BUF_ALIGNMENT;
+        // 缓存默认对齐值
+        if (ec_ch != NULL) {
+            ec_ch->cached_alignment = align;
+        }
     }
     
-    // 2. 池中没有，分配新缓冲区
-    buf = spdk_dma_malloc(buf_size, align, NULL);
+    // 2. 快速路径：检查缓冲区池
+    entry = SLIST_FIRST((SLIST_HEAD(, ec_parity_buf_entry) *)pool_head);
+    if (spdk_likely(entry != NULL && *pool_size == requested_size)) {
+        SLIST_REMOVE_HEAD((SLIST_HEAD(, ec_parity_buf_entry) *)pool_head, link);
+        if (spdk_likely(*pool_count > 0)) {
+            (*pool_count)--;
+        }
+        buf = entry->buf;
+        free(entry);
+        return buf;
+    }
+    
+    // 3. 池中没有或大小不匹配，分配新缓冲区
+    buf = spdk_dma_malloc(requested_size, align, NULL);
     return buf;
 }
-
-// 归还缓冲区到池
-static void
-ec_put_parity_buf(struct ec_bdev_io_channel *ec_ch, 
-                  unsigned char *buf, 
-                  uint32_t buf_size)
-{
-    // 如果池未满，归还到池中；否则直接释放
-    if (ec_ch->parity_buf_count < MAX_POOL_SIZE) {
-        entry = malloc(sizeof(*entry));
-        entry->buf = buf;
-        SLIST_INSERT_HEAD(&ec_ch->parity_buf_pool, entry, link);
-        ec_ch->parity_buf_count++;
-    } else {
-        spdk_dma_free(buf);
-    }
-}
 ```
+
+**缓冲区池类型**：
+- **校验块缓冲区池**：最多128个，预分配p×8个
+- **RMW缓冲区池**：最多64个，预分配16个
+- **临时数据缓冲区池**：最多32个，预分配k×2个（新增）
+
+**优化点**：
+- **对齐值缓存**：在io_channel中缓存对齐值，避免重复查找
+- **预分配**：创建channel时预分配缓冲区，减少运行时分配
+- **分支预测**：使用`spdk_likely`优化快速路径
 
 ### 优化：对齐分配和分支预测
 
@@ -663,44 +708,44 @@ ec_put_parity_buf(struct ec_bdev_io_channel *ec_ch,
 
 **解决方案**：数据块和校验块交错提交。
 
-```718:823:bdev_ec_io.c
-	/* Optimized: Submit all writes in a single loop for better cache locality
-	 * Interleave data and parity writes to maximize parallelism
-	 * This allows hardware to process writes in parallel more effectively
+```788:860:bdev_ec_io.c
+	/* Optimized: Submit writes in separate loops to reduce branch prediction overhead
+	 * Separating data and parity writes eliminates conditional checks in hot path
+	 * Performance benefit: reduces branch mispredictions, improves instruction cache locality
 	 */
-	uint8_t max_writes = (k > p) ? k : p;
 	
-	for (i = 0; i < max_writes; i++) {
-		/* Submit data block write if available */
-		if (i < k) {
-			idx = data_indices[i];
-			base_info = &ec_bdev->base_bdev_info[idx];
-			uint64_t pd_lba = pd_strip_base + base_info->data_offset;
-			
-			rc = spdk_bdev_write_blocks(base_info->desc,
-						    ec_io->ec_ch->base_channel[idx],
-						    data_ptrs[i], pd_lba, strip_size,
-						    ec_base_bdev_io_complete, ec_io);
-		}
+	/* Submit all data block writes first */
+	for (i = 0; i < k; i++) {
+		idx = data_indices[i];
+		base_info = &ec_bdev->base_bdev_info[idx];
+		uint64_t pd_lba = pd_strip_base + base_info->data_offset;
 		
-		/* Submit parity block write if available */
-		if (i < p) {
-			idx = parity_indices[i];
-			base_info = &ec_bdev->base_bdev_info[idx];
-			uint64_t pd_lba = pd_strip_base + base_info->data_offset;
-			
-			rc = spdk_bdev_write_blocks(base_info->desc,
-						    ec_io->ec_ch->base_channel[idx],
-						    parity_ptrs[i], pd_lba, strip_size,
-						    ec_base_bdev_io_complete, ec_io);
-		}
+		rc = spdk_bdev_write_blocks(base_info->desc,
+					    ec_io->ec_ch->base_channel[idx],
+					    data_ptrs[i], pd_lba, strip_size,
+					    ec_base_bdev_io_complete, ec_io);
+		// ... 错误处理和base_bdev_idx_map存储 ...
+	}
+	
+	/* Submit all parity block writes */
+	for (i = 0; i < p; i++) {
+		idx = parity_indices[i];
+		base_info = &ec_bdev->base_bdev_info[idx];
+		uint64_t pd_lba = pd_strip_base + base_info->data_offset;
+		
+		rc = spdk_bdev_write_blocks(base_info->desc,
+					    ec_io->ec_ch->base_channel[idx],
+					    parity_ptrs[i], pd_lba, strip_size,
+					    ec_base_bdev_io_complete, ec_io);
+		// ... 错误处理和base_bdev_idx_map存储 ...
 	}
 ```
 
-**优化**：
-- **交错提交**：数据块和校验块交替提交，提升并行度
-- **单循环**：使用一个循环处理，提升缓存局部性
+**优化**（最新实现）：
+- **分离循环**：数据块和校验块写入分离，减少分支预测失败
+- **性能提升**：减少条件判断开销，提升指令缓存局部性
 - **并行处理**：底层存储可以同时处理数据块和校验块写入
+- **O(1)查找优化**：使用base_bdev_idx_map存储索引，完成回调中O(1)查找
 
 ---
 

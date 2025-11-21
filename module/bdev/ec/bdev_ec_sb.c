@@ -12,6 +12,10 @@
 
 #include "bdev_ec.h"
 
+/* External reference to global zero buffer (defined in bdev_ec.c) */
+extern void *g_ec_zero_buf;
+#define EC_ZERO_BUFFER_SIZE 0x100000  /* 1MB - same as in bdev_ec.c */
+
 struct ec_bdev_write_sb_ctx {
 	struct ec_bdev *ec_bdev;
 	int status;
@@ -711,6 +715,7 @@ err:
 struct ec_bdev_wipe_single_sb_ctx {
 	struct ec_base_bdev_info *base_info;
 	void *zero_buf;
+	bool use_global_buf;  /* True if using global zero buffer, false if allocated */
 	ec_base_bdev_cb cb;
 	void *cb_ctx;
 };
@@ -735,8 +740,8 @@ ec_bdev_wipe_single_base_bdev_sb_cb(struct spdk_bdev_io *bdev_io, bool success, 
 
 	spdk_bdev_free_io(bdev_io);
 
-	/* Free the zero buffer */
-	if (ctx->zero_buf != NULL) {
+	/* Free the zero buffer only if it was dynamically allocated */
+	if (ctx->zero_buf != NULL && !ctx->use_global_buf) {
 		spdk_dma_free(ctx->zero_buf);
 	}
 
@@ -788,25 +793,40 @@ ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
 	ctx->cb = cb;
 	ctx->cb_ctx = cb_ctx;
 
-	/* Allocate zero buffer for wiping */
-	ctx->zero_buf = spdk_dma_malloc(ec_bdev->sb_io_buf_size, EC_BDEV_DEFAULT_BUF_ALIGNMENT, NULL);
-	if (ctx->zero_buf == NULL) {
-		SPDK_ERRLOG("Failed to allocate buffer for wiping superblock\n");
-		free(ctx);
-		if (cb != NULL) {
-			cb(cb_ctx, -ENOMEM);
+	/* Use global zero buffer if available and size is sufficient
+	 * Otherwise, allocate a temporary buffer
+	 * This optimization reduces allocation overhead for common cases
+	 */
+	if (g_ec_zero_buf != NULL && ec_bdev->sb_io_buf_size <= EC_ZERO_BUFFER_SIZE) {
+		/* Use global zero buffer - no need to allocate or memset */
+		ctx->zero_buf = g_ec_zero_buf;
+		ctx->use_global_buf = true;
+		/* Ensure the buffer is zeroed (it should already be, but be safe) */
+		memset(ctx->zero_buf, 0, ec_bdev->sb_io_buf_size);
+	} else {
+		/* Global buffer not available or too small - allocate temporary buffer */
+		ctx->zero_buf = spdk_dma_malloc(ec_bdev->sb_io_buf_size, EC_BDEV_DEFAULT_BUF_ALIGNMENT, NULL);
+		if (ctx->zero_buf == NULL) {
+			SPDK_ERRLOG("Failed to allocate buffer for wiping superblock\n");
+			free(ctx);
+			if (cb != NULL) {
+				cb(cb_ctx, -ENOMEM);
+			}
+			return -ENOMEM;
 		}
-		return -ENOMEM;
+		ctx->use_global_buf = false;
+		memset(ctx->zero_buf, 0, ec_bdev->sb_io_buf_size);
 	}
-
-	memset(ctx->zero_buf, 0, ec_bdev->sb_io_buf_size);
 
 	/* Write zeros to superblock area */
 	rc = spdk_bdev_write(base_info->desc, base_info->app_thread_ch,
 			     ctx->zero_buf, 0, ec_bdev->sb_io_buf_size,
 			     ec_bdev_wipe_single_base_bdev_sb_cb, ctx);
 	if (rc != 0) {
-		spdk_dma_free(ctx->zero_buf);
+		/* Free buffer only if it was dynamically allocated */
+		if (!ctx->use_global_buf && ctx->zero_buf != NULL) {
+			spdk_dma_free(ctx->zero_buf);
+		}
 		free(ctx);
 		if (rc == -ENOMEM) {
 			SPDK_WARNLOG("I/O queue full, cannot wipe superblock immediately\n");
