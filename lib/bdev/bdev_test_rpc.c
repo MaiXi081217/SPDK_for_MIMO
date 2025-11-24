@@ -16,7 +16,6 @@
 #include "bdev_raid.h"
 #include "bdev_ec.h"
 #include "bdev_ec_internal.h"
-#include "wear_leveling_ext.h"
 #include "spdk/crc32.h"
 
 /* 测试结果结构 */
@@ -1168,9 +1167,10 @@ test_ec_io_mapping_logic(void)
  * 磨损均衡扩展模块测试
  * ============================================================================ */
 
-/* 测试磨损均衡扩展模块的注册和注销 */
+/* 测试磨损均衡扩展模块的注册和注销 - 已移除 */
+#if 0
 static void
-test_wear_leveling_register_unregister(void)
+test_wear_leveling_register_unregister_disabled(void)
 {
 	const char *test_name = "wear_leveling_register_unregister";
 	struct ec_bdev *ec_bdev = NULL;
@@ -1326,10 +1326,12 @@ cleanup:
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
+#endif
 
-/* 测试TBW设置 */
+/* 测试TBW设置 - 已移除 */
+#if 0
 static void
-test_wear_leveling_tbw_setting(void)
+test_wear_leveling_tbw_setting_disabled(void)
 {
 	const char *test_name = "wear_leveling_tbw_setting";
 	struct ec_bdev *ec_bdev = NULL;
@@ -1405,10 +1407,12 @@ cleanup:
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
+#endif
 
-/* 测试预测参数设置 */
+/* 测试预测参数设置 - 已移除 */
+#if 0
 static void
-test_wear_leveling_predict_params(void)
+test_wear_leveling_predict_params_disabled(void)
 {
 	const char *test_name = "wear_leveling_predict_params";
 	struct ec_bdev *ec_bdev = NULL;
@@ -1469,10 +1473,12 @@ cleanup:
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
+#endif
 
-/* 测试磨损感知的base bdev选择（确定性测试） */
+/* 测试磨损感知的base bdev选择（确定性测试） - 已移除 */
+#if 0
 static void
-test_wear_leveling_selection_deterministic(void)
+test_wear_leveling_selection_deterministic_disabled(void)
 {
 	const char *test_name = "wear_leveling_selection_deterministic";
 	struct ec_bdev *ec_bdev = NULL;
@@ -1558,10 +1564,12 @@ cleanup:
 	}
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
+#endif
 
-/* 测试磨损均衡在磨损变化及不可用场景下的完整行为 */
+/* 测试磨损均衡在磨损变化及不可用场景下的完整行为 - 已移除 */
+#if 0
 static void
-test_wear_leveling_wear_variation(void)
+test_wear_leveling_wear_variation_disabled(void)
 {
 	const char *test_name = "wear_leveling_wear_variation";
 	struct ec_bdev *ec_bdev = NULL;
@@ -1685,6 +1693,7 @@ cleanup:
 result:
 	add_test_result(test_name, test_passed, test_passed ? NULL : err_msg);
 }
+#endif
 
 /* ============================================================================
  * 重建场景测试
@@ -3058,17 +3067,7 @@ rpc_bdev_test_all(struct spdk_jsonrpc_request *request,
 	test_ec_io_mapping_logic();
 	SPDK_DEBUGLOG(bdev_raid, "EC wear-leveling and IO tests completed\n");
 
-	/* 磨损均衡扩展模块测试 */
-	SPDK_NOTICELOG("Running wear leveling extension module tests...\n");
-	wear_leveling_ext_enable_test_mode(true);
-	test_wear_leveling_register_unregister();
-	test_wear_leveling_mode_switching();
-	test_wear_leveling_tbw_setting();
-	test_wear_leveling_predict_params();
-	test_wear_leveling_selection_deterministic();
-	test_wear_leveling_wear_variation();
-	wear_leveling_ext_enable_test_mode(false);
-	SPDK_DEBUGLOG(bdev_raid, "Wear leveling extension module tests completed\n");
+	/* 磨损均衡扩展模块测试已移除 */
 
 	/* RAID 重建场景测试 */
 	SPDK_NOTICELOG("Running RAID rebuild scenario tests...\n");

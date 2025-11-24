@@ -7,6 +7,7 @@
 #define SPDK_BDEV_EC_H
 
 #include "spdk/bdev_module.h"
+#include "spdk/thread.h"
 #include "spdk/uuid.h"
 #include <isa-l/erasure_code.h>
 
@@ -22,6 +23,7 @@
 #define EC_BDEV_RMW_BUF_POOL_MAX	64	/* Maximum RMW stripe buffers in pool */
 #define EC_BDEV_TEMP_DATA_BUF_POOL_MAX	32	/* Maximum temporary data buffers in pool */
 #define EC_BDEV_BITMAP_SIZE_LIMIT	64	/* Bitmap size limit for fast lookup */
+#define EC_MAX_ENCODE_WORKERS	2	/* Default number of dedicated encoding workers */
 
 /* Invalid offset marker */
 #define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
@@ -153,6 +155,12 @@ struct ec_bdev_io {
 	 * Index in array corresponds to submission order (0 to base_bdev_io_submitted-1)
 	 */
 	uint8_t				base_bdev_idx_map[EC_MAX_K + EC_MAX_P];
+	
+	/* Optimized: Direct base_info pointer map for true O(1) lookup in completion callback
+	 * This eliminates the need for bdev pointer comparison in hot path
+	 * Index corresponds to submission order, matches base_bdev_idx_map
+	 */
+	struct ec_base_bdev_info	*base_info_map[EC_MAX_K + EC_MAX_P];
 
 	/* Private data for the EC module */
 	void				*module_private;
@@ -234,9 +242,6 @@ struct ec_bdev {
 	ec_bdev_destruct_cb		deconfigure_cb_fn;
 	void				*deconfigure_cb_arg;
 
-	/* Extension interface for external modules (e.g., FTL for wear leveling) */
-	struct ec_bdev_extension_if	*extension_if;
-
 	/* Buffer alignment requirement for memory allocations */
 	size_t				buf_alignment;
 
@@ -291,110 +296,20 @@ struct ec_bdev_io_channel {
 	 * This reduces memory access overhead in hot path (buffer allocation)
 	 */
 	size_t				cached_alignment;
+	
+	/* RAID5F-style object pool for stripe_private structures
+	 * Pre-allocated stripe_private objects to avoid malloc overhead
+	 */
+	TAILQ_HEAD(, ec_stripe_private)	free_stripe_privs;
+	
+	/* RAID5F-style: For async encoding retry queue (if encoding resources unavailable) */
+	TAILQ_HEAD(, ec_stripe_private)	encode_retry_queue;
 };
 
 /* TAIL head for EC bdev list */
 TAILQ_HEAD(ec_all_tailq, ec_bdev);
 
 extern struct ec_all_tailq		g_ec_bdev_list;
-
-/*
- * EC bdev extension interface for external modules (e.g., FTL for wear leveling)
- * This interface allows external modules to control I/O distribution based on
- * wear leveling or other policies.
- */
-struct ec_bdev_extension_if;
-
-/*
- * Callback to select base bdev indices for data blocks based on wear leveling
- * or other policies. This allows external modules (e.g., FTL) to control
- * which disks receive data based on wear statistics.
- * params:
- * ext_if - extension interface
- * ec_bdev - EC bdev
- * offset_blocks - logical offset in blocks
- * num_blocks - number of blocks
- * data_indices - output array of base bdev indices for data blocks (size k)
- * parity_indices - output array of base bdev indices for parity blocks (size p)
- * ctx - extension context
- * returns:
- * 0 on success, non-zero on failure
- */
-typedef int (*ec_ext_select_base_bdevs_fn)(struct ec_bdev_extension_if *ext_if,
-					    struct ec_bdev *ec_bdev,
-					    uint64_t offset_blocks,
-					    uint32_t num_blocks,
-					    uint8_t *data_indices,
-					    uint8_t *parity_indices,
-					    void *ctx);
-
-/*
- * Callback to get wear level information for a base bdev
- * This allows external modules to provide wear statistics
- * params:
- * ext_if - extension interface
- * ec_bdev - EC bdev
- * base_info - base bdev info
- * wear_level - output wear level (0-100, 0 = no wear, 100 = maximum wear)
- * ctx - extension context
- * returns:
- * 0 on success, non-zero on failure
- */
-typedef int (*ec_ext_get_wear_level_fn)(struct ec_bdev_extension_if *ext_if,
-					 struct ec_bdev *ec_bdev,
-					 struct ec_base_bdev_info *base_info,
-					 uint8_t *wear_level,
-					 void *ctx);
-
-/*
- * Callback to notify I/O completion for wear level tracking
- * This allows external modules to update wear statistics
- * params:
- * ext_if - extension interface
- * ec_bdev - EC bdev
- * base_info - base bdev info that handled the I/O
- * offset_blocks - logical offset in blocks
- * num_blocks - number of blocks
- * is_write - true if write operation, false if read
- * ctx - extension context
- * returns:
- * none
- */
-typedef void (*ec_ext_notify_io_complete_fn)(struct ec_bdev_extension_if *ext_if,
-					      struct ec_bdev *ec_bdev,
-					      struct ec_base_bdev_info *base_info,
-					      uint64_t offset_blocks,
-					      uint32_t num_blocks,
-					      bool is_write,
-					      void *ctx);
-
-/*
- * EC bdev extension interface
- * External modules (e.g., FTL) can register this interface to control
- * I/O distribution and wear leveling.
- */
-struct ec_bdev_extension_if {
-	/* Name of the extension module */
-	const char *name;
-
-	/* Context for extension module */
-	void *ctx;
-
-	/* Callback to select base bdevs for data/parity blocks */
-	ec_ext_select_base_bdevs_fn select_base_bdevs;
-
-	/* Callback to get wear level information */
-	ec_ext_get_wear_level_fn get_wear_level;
-
-	/* Callback to notify I/O completion */
-	ec_ext_notify_io_complete_fn notify_io_complete;
-
-	/* Optional: callback to initialize extension */
-	int (*init)(struct ec_bdev_extension_if *ext_if, struct ec_bdev *ec_bdev);
-
-	/* Optional: callback to cleanup extension */
-	void (*fini)(struct ec_bdev_extension_if *ext_if, struct ec_bdev *ec_bdev);
-};
 
 /*
  * EC bdev module private data
@@ -417,6 +332,15 @@ struct ec_bdev_module_private {
 
 	/* Decode index array */
 	unsigned char decode_index[EC_MAX_K + EC_MAX_P];
+
+	/* Dedicated encoding worker threads (optional) */
+	struct {
+		struct spdk_thread *threads[EC_MAX_ENCODE_WORKERS];
+		uint32_t count;
+		uint32_t next_rr;
+		uint32_t active_tasks;
+		bool enabled;
+	} encode_workers;
 };
 
 int ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
@@ -433,11 +357,6 @@ void ec_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ct
 int ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, void *cb_ctx);
 void ec_bdev_fail_base_bdev(struct ec_base_bdev_info *base_info);
 int ec_bdev_gen_decode_matrix(struct ec_bdev *ec_bdev, uint8_t *frag_err_list, int nerrs);
-
-/* Extension interface functions */
-int ec_bdev_register_extension(struct ec_bdev *ec_bdev, struct ec_bdev_extension_if *ext_if);
-void ec_bdev_unregister_extension(struct ec_bdev *ec_bdev);
-struct ec_bdev_extension_if *ec_bdev_get_extension(struct ec_bdev *ec_bdev);
 
 /*
  * Definitions related to EC bdev superblock

@@ -7,6 +7,7 @@
 #define SPDK_BDEV_EC_INTERNAL_H
 
 #include "bdev_ec.h"
+#include "spdk/thread.h"
 #include "spdk/vmd.h"
 
 /* Prefetch support - use compiler builtin if available, otherwise use inline asm */
@@ -23,11 +24,55 @@
 /* ISA-L optimal alignment for SIMD operations */
 #define EC_ISAL_OPTIMAL_ALIGN	64
 
+/* RAID5F-style object pool size - pre-allocate stripe_private objects
+ * Increased from 32 to 64 for better performance with sufficient memory
+ * Each object is ~1-2KB, so 64 objects = ~64-128KB per io_channel
+ */
+#define EC_MAX_STRIPES 64
+
+/* RAID5F-style: Always use async encoding (no threshold)
+ * 
+ * RAID5F uses accel framework which always uses async operations regardless of size.
+ * We follow the same approach for consistency and maximum throughput.
+ * 
+ * Benefits:
+ *   - Main thread never blocks - better concurrency
+ *   - Consistent behavior - no size-based decisions
+ *   - Handles high concurrency naturally
+ * 
+ * Note: Thread switch overhead is acceptable compared to I/O latency and
+ *       the throughput benefits from non-blocking main thread.
+ */
+
 /* Type identifier for module_private structures */
 enum ec_private_type {
 	EC_PRIVATE_TYPE_FULL_STRIPE,
 	EC_PRIVATE_TYPE_RMW,
 	EC_PRIVATE_TYPE_DECODE
+};
+
+/* Chunk structure for iovec management (borrowed from RAID5F design)
+ * Each data/parity block has its own chunk with mapped iovecs
+ * This enables zero-copy writes using writev_blocks_ext
+ */
+struct ec_chunk {
+	/* Corresponds to base_bdev index */
+	uint8_t index;
+	
+	/* Array of iovecs mapped from original iovs */
+	struct iovec *iovs;
+	
+	/* Number of used iovecs */
+	int iovcnt;
+	
+	/* Total number of available iovecs in the array */
+	int iovcnt_max;
+	
+	/* Pointer to buffer with I/O metadata (if any) */
+	void *md_buf;
+	
+	/* For encoding: pointer to contiguous buffer (if data spans multiple iovs) */
+	unsigned char *encode_buf;  /* NULL if data is in single iov */
 };
 
 /* Private structure for stripe write operations */
@@ -42,6 +87,35 @@ struct ec_stripe_private {
 	uint64_t stripe_index;
 	uint8_t data_indices[EC_MAX_K];
 	uint8_t parity_indices[EC_MAX_P];
+	
+	/* RAID5F-style chunk management for zero-copy writes */
+	struct ec_chunk data_chunks[EC_MAX_K];  /* Chunks for data blocks */
+	struct ec_chunk parity_chunks[EC_MAX_P];  /* Chunks for parity blocks */
+	
+	/* RAID5F-style object pool link */
+	TAILQ_ENTRY(ec_stripe_private) link;
+	
+	/* Flag to track if this object came from pool (chunk iovs already allocated) */
+	bool from_pool;
+	
+	/* RAID5F-style async encoding state */
+	struct {
+		int status;  /* Encoding status: 0=success, negative=error, -ECANCELED=cancelled */
+		void (*cb)(struct ec_stripe_private *stripe_priv, int status);  /* Callback when encoding completes */
+		unsigned char **data_ptrs;  /* Data pointers for encoding */
+		unsigned char **parity_ptrs;  /* Parity pointers for encoding */
+		size_t len;  /* Encoding length */
+		struct ec_bdev *ec_bdev;  /* EC bdev for encoding */
+		struct ec_bdev_io *ec_io;  /* EC I/O for encoding */
+		bool cancelled;  /* Flag to indicate encoding was cancelled */
+		bool used_dedicated_worker;  /* True if encode work queued to dedicated worker */
+		/* Performance statistics */
+		uint64_t t_data_write_submit;  /* Timestamp when data writes submitted */
+		uint64_t t_encode_submit;  /* Timestamp when encoding task submitted to background thread */
+		uint64_t t_encode_start;  /* Timestamp when encoding actually started in background thread */
+		uint64_t t_encode_end;  /* Timestamp when encoding completed */
+		uint64_t t_parity_write_submit;  /* Timestamp when parity writes submitted */
+	} encode;
 };
 
 /* RMW state enumeration */
@@ -84,6 +158,12 @@ struct ec_rmw_private {
 	uint8_t reads_completed;
 	uint8_t reads_expected;
 	enum ec_rmw_state state;
+	
+	/* Performance statistics: timestamps for latency measurement */
+	uint64_t t_rmw_start;          /* RMW operation start time */
+	uint64_t t_read_complete;      /* All reads completed time */
+	uint64_t t_encode_complete;    /* Encoding completed time */
+	uint64_t t_write_complete;     /* All writes completed time */
 };
 
 /* Private structure for decode (recovery) operations */
@@ -196,55 +276,47 @@ int ec_bdev_gen_decode_matrix(struct ec_bdev *ec_bdev, uint8_t *frag_err_list, i
 int ec_decode_stripe(struct ec_bdev *ec_bdev, unsigned char **data_ptrs,
 		     unsigned char **recover_ptrs, uint8_t *frag_err_list, int nerrs, size_t len);
 
+int ec_bdev_init_encode_workers(struct ec_bdev *ec_bdev);
+void ec_bdev_cleanup_encode_workers(struct ec_bdev *ec_bdev);
+struct spdk_thread *ec_bdev_get_encode_worker_thread(struct ec_bdev *ec_bdev, bool *is_dedicated);
+
+static inline void
+ec_bdev_encode_worker_task_start(struct ec_bdev *ec_bdev)
+{
+	struct ec_bdev_module_private *mp;
+
+	if (ec_bdev == NULL) {
+		return;
+	}
+
+	mp = ec_bdev->module_private;
+	if (mp == NULL) {
+		return;
+	}
+
+	__atomic_fetch_add(&mp->encode_workers.active_tasks, 1, __ATOMIC_RELAXED);
+}
+
+static inline void
+ec_bdev_encode_worker_task_done(struct ec_bdev *ec_bdev)
+{
+	struct ec_bdev_module_private *mp;
+
+	if (ec_bdev == NULL) {
+		return;
+	}
+
+	mp = ec_bdev->module_private;
+	if (mp == NULL) {
+		return;
+	}
+
+	__atomic_fetch_sub(&mp->encode_workers.active_tasks, 1, __ATOMIC_RELAXED);
+}
+
 /* Base bdev selection */
 int ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 				 uint8_t *data_indices, uint8_t *parity_indices);
-
-/* Extension interface helper - unified base bdev selection */
-static inline int
-ec_select_base_bdevs_with_extension(struct ec_bdev *ec_bdev,
-				    uint64_t offset_blocks,
-				    uint32_t num_blocks,
-				    uint64_t stripe_index,
-				    uint8_t *data_indices,
-				    uint8_t *parity_indices)
-{
-	struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
-
-	/* Use extension interface if available, otherwise fall back to default */
-	if (ext_if != NULL && ext_if->select_base_bdevs != NULL) {
-		int rc = ext_if->select_base_bdevs(ext_if, ec_bdev,
-						    offset_blocks, num_blocks,
-						    data_indices, parity_indices,
-						    ext_if->ctx);
-		if (spdk_unlikely(rc != 0)) {
-			SPDK_ERRLOG("Extension interface failed to select base bdevs for EC bdev %s\n",
-				    ec_bdev->bdev.name);
-			return rc;
-		}
-		return 0;
-	}
-
-	/* Fall back to default selection */
-	return ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
-}
-
-/* Extension interface helper - notify I/O completion for wear level tracking */
-static inline void
-ec_notify_extension_io_complete(struct ec_bdev *ec_bdev,
-				struct ec_base_bdev_info *base_info,
-				uint64_t offset_blocks,
-				uint32_t num_blocks,
-				bool is_write)
-{
-	struct ec_bdev_extension_if *ext_if = ec_bdev->extension_if;
-
-	if (ext_if != NULL && ext_if->notify_io_complete != NULL && base_info != NULL) {
-		ext_if->notify_io_complete(ext_if, ec_bdev, base_info,
-					   offset_blocks, num_blocks,
-					   is_write, ext_if->ctx);
-	}
-}
 
 /* Rebuild functions */
 int ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_base_info,
@@ -263,6 +335,9 @@ void ec_bdev_set_healthy_disks_led(struct ec_bdev *ec_bdev, enum spdk_vmd_led_st
 /* RMW stripe buffer management */
 unsigned char *ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size);
 void ec_put_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, unsigned char *buf, uint32_t buf_size);
+
+/* Helper function to initialize chunk iov arrays for stripe_private */
+int ec_stripe_private_init_chunks(struct ec_stripe_private *stripe_priv, uint8_t k, uint8_t p);
 
 /* Validation helper functions */
 static inline int
