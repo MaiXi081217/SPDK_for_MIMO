@@ -1609,15 +1609,22 @@ def add_parser(subparsers):
             sys.exit(1)
 
         # Print the created EC name (RPC returns a string)
-        print_json(args.client.bdev_ec_create(
-                                  name=args.name,
-                                  k=args.k,
-                                  p=args.p,
-                                  strip_size_kb=args.strip_size_kb,
-                                  base_bdevs=base_bdevs,
-                                  uuid=args.uuid,
-                                  superblock=args.superblock,
-                                  wear_leveling_mode=args.wear_leveling_mode))
+        # Build request params - only include wear_leveling_mode if explicitly set
+        params = {
+            'name': args.name,
+            'k': args.k,
+            'p': args.p,
+            'base_bdevs': base_bdevs,
+        }
+        if args.strip_size_kb is not None:
+            params['strip_size_kb'] = args.strip_size_kb
+        if args.uuid is not None:
+            params['uuid'] = args.uuid
+        if args.superblock:
+            params['superblock'] = args.superblock
+        # Note: wear_leveling_mode is not supported by RPC interface, so we don't include it
+        
+        print_json(args.client.bdev_ec_create(**params))
     
     p = subparsers.add_parser('bdev_ec_create', help='Create new EC (Erasure Code) bdev')
     p.add_argument('-n', '--name', help='EC bdev name', required=True)
@@ -1633,11 +1640,8 @@ def add_parser(subparsers):
     p.add_argument('--uuid', help='UUID for this EC bdev')
     p.add_argument('-s', '--superblock', help='information about EC bdev will be stored in superblock on each base bdev, '
                                               'disabled by default', action='store_true')
-    p.add_argument('-w', '--wear-leveling-mode', dest='wear_leveling_mode', help='''Wear leveling mode (0=DISABLED, 1=SIMPLE, 2=FULL). 
-    0=DISABLED: No wear leveling (most stable, use default EC scheduling)
-    1=SIMPLE: Basic wear leveling using cached wear info only
-    2=FULL: Full wear leveling with NVMe health monitoring and prediction (default)''', 
-                   type=int, default=2, choices=[0, 1, 2])
+    # Note: wear_leveling_mode parameter removed - not supported by RPC interface
+    # p.add_argument('-w', '--wear-leveling-mode', dest='wear_leveling_mode', ...)
     p.set_defaults(func=bdev_ec_create)
 
     def bdev_ec_delete(args):

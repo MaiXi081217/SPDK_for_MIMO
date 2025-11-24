@@ -160,6 +160,14 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 	ec_ch->parity_buf_count = 0;
 	ec_ch->rmw_buf_count = 0;
 	ec_ch->temp_data_buf_count = 0;
+	
+	/* RAID5F-style: Initialize stripe_private object pool */
+	TAILQ_INIT(&ec_ch->free_stripe_privs);
+	TAILQ_INIT(&ec_ch->encode_retry_queue);
+	
+	/* RAID5F-style: Initialize encoding retry queue */
+	TAILQ_INIT(&ec_ch->encode_retry_queue);
+	TAILQ_INIT(&ec_ch->encode_retry_queue);
 	ec_ch->parity_buf_size = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
 	ec_ch->rmw_buf_size = ec_ch->parity_buf_size * ec_bdev->k;
 	ec_ch->temp_data_buf_size = ec_ch->parity_buf_size;  /* Same size as parity buffers */
@@ -170,36 +178,19 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 	ec_ch->cached_alignment = (ec_bdev->buf_alignment > 0) ?
 		ec_bdev->buf_alignment : EC_BDEV_DEFAULT_BUF_ALIGNMENT;
 
-	/* Pre-allocate buffers for better performance and stability */
-	/* Optimized: Pre-allocate more buffers to reduce allocation overhead during I/O */
-	/* Aggressive pre-allocation for maximum performance and stability */
-	/* This reduces performance variance by avoiding dynamic allocation during hot path */
-	/* Use cached alignment value (already initialized above) */
+	/* Pre-allocate buffers for better performance */
 	size_t align = ec_ch->cached_alignment;
 	struct ec_parity_buf_entry *entry;
 	unsigned char *buf;
 	uint8_t j;
-	/* Optimized: Aggressive pre-allocation - pre-allocate more buffers for high concurrency */
-	/* Pre-allocate p*8 parity buffers (8x parity count) for high concurrency scenarios */
-	/* Pre-allocate 16 RMW buffers for concurrent partial stripe writes */
-	/* Pre-allocate k*2 temporary data buffers for cross-iov data scenarios */
-	uint8_t parity_prealloc = ec_bdev->p * 8;  /* 8x parity count for high concurrency */
-	uint8_t rmw_prealloc = 16;  /* 16 RMW buffers for high concurrency */
-	uint8_t temp_data_prealloc = ec_bdev->k * 2;  /* 2x data count for cross-iov scenarios */
+	uint8_t parity_prealloc = ec_bdev->p * 8;
+	uint8_t rmw_prealloc = 16;
+	uint8_t temp_data_prealloc = ec_bdev->k * 2;
 	
-	/* Cap pre-allocation to pool limits */
-	if (parity_prealloc > 128) {
-		parity_prealloc = 128;
-	}
-	if (rmw_prealloc > 64) {
-		rmw_prealloc = 64;
-	}
-	if (temp_data_prealloc > 32) {
-		temp_data_prealloc = 32;
-	}
+	if (parity_prealloc > 128) parity_prealloc = 128;
+	if (rmw_prealloc > 64) rmw_prealloc = 64;
+	if (temp_data_prealloc > 32) temp_data_prealloc = 32;
 
-	/* Pre-allocate parity buffers */
-	/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
 	for (j = 0; j < parity_prealloc && ec_ch->parity_buf_count < 128; j++) {
 		buf = spdk_dma_malloc(ec_ch->parity_buf_size, align, NULL);
 		if (buf != NULL) {
@@ -214,8 +205,6 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 		}
 	}
 
-	/* Pre-allocate RMW stripe buffers */
-	/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
 	for (j = 0; j < rmw_prealloc && ec_ch->rmw_buf_count < 64; j++) {
 		buf = spdk_dma_malloc(ec_ch->rmw_buf_size, align, NULL);
 		if (buf != NULL) {
@@ -230,8 +219,6 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 		}
 	}
 
-	/* Optimized: Pre-allocate temporary data buffers for cross-iov scenarios */
-	/* Use malloc instead of calloc - entry only needs buf pointer */
 	for (j = 0; j < temp_data_prealloc && ec_ch->temp_data_buf_count < 32; j++) {
 		buf = spdk_dma_malloc(ec_ch->temp_data_buf_size, align, NULL);
 		if (buf != NULL) {
@@ -244,6 +231,33 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 				spdk_dma_free(buf);
 			}
 		}
+	}
+
+	/* RAID5F-style: Pre-allocate stripe_private objects for object pool
+	 * Pre-allocate EC_MAX_STRIPES objects to avoid malloc overhead in hot path
+	 * With sufficient memory, larger pool size improves performance
+	 */
+	struct ec_stripe_private *stripe_priv;
+	uint8_t k = ec_bdev->k;
+	uint8_t p = ec_bdev->p;
+	uint8_t stripe_idx;
+	
+	for (stripe_idx = 0; stripe_idx < EC_MAX_STRIPES; stripe_idx++) {
+		stripe_priv = malloc(sizeof(*stripe_priv));
+		if (stripe_priv == NULL) {
+			SPDK_WARNLOG("Failed to pre-allocate stripe_private %u\n", stripe_idx);
+			break;
+		}
+		memset(stripe_priv, 0, sizeof(*stripe_priv));
+		stripe_priv->from_pool = true;  /* Pre-allocated objects are marked as from pool */
+		
+		if (ec_stripe_private_init_chunks(stripe_priv, k, p) != 0) {
+			free(stripe_priv);
+			SPDK_WARNLOG("Failed to init chunks for stripe_private %u\n", stripe_idx);
+			break;
+		}
+		
+		TAILQ_INSERT_HEAD(&ec_ch->free_stripe_privs, stripe_priv, link);
 	}
 
 	i = 0;
@@ -323,6 +337,26 @@ ec_bdev_destroy_cb(void *io_device, void *ctx_buf)
 		free(buf_entry);
 	}
 	ec_ch->temp_data_buf_count = 0;
+	
+	/* RAID5F-style: Free stripe_private object pool */
+	struct ec_stripe_private *stripe_priv;
+	while ((stripe_priv = TAILQ_FIRST(&ec_ch->free_stripe_privs)) != NULL) {
+		TAILQ_REMOVE(&ec_ch->free_stripe_privs, stripe_priv, link);
+		
+		/* Free chunk iov arrays */
+		uint8_t k = ec_bdev->k;
+		uint8_t p = ec_bdev->p;
+		uint8_t j;
+		
+		for (j = 0; j < k; j++) {
+			free(stripe_priv->data_chunks[j].iovs);
+		}
+		for (j = 0; j < p; j++) {
+			free(stripe_priv->parity_chunks[j].iovs);
+		}
+		
+		free(stripe_priv);
+	}
 
 	if (ec_ch->base_channel == NULL) {
 		return;
@@ -739,6 +773,10 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_bdev_io_channel *ec_ch,
 	ec_io->base_bdev_io_remaining = 0;
 	ec_io->base_bdev_io_submitted = 0;
 	ec_io->completion_cb = NULL;
+	
+	/* Optimized: Initialize base_info_map for O(1) lookup in completion callback */
+	memset(ec_io->base_bdev_idx_map, 0xFF, sizeof(ec_io->base_bdev_idx_map));
+	memset(ec_io->base_info_map, 0, sizeof(ec_io->base_info_map));
 
 	ec_bdev_io_set_default_status(ec_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 }
@@ -1012,14 +1050,24 @@ ec_start(struct ec_bdev *ec_bdev)
 		return rc;
 	}
 
-	/* Set optimal_io_boundary for reading (similar to RAID0/RAID5F)
-	 * This allows bdev layer to automatically split I/O at strip boundaries
+	rc = ec_bdev_init_encode_workers(ec_bdev);
+	if (rc != 0) {
+		ec_bdev_cleanup_tables(ec_bdev);
+		return rc;
+	}
 
-
+	/* Set optimal_io_boundary to full stripe size for optimal write performance
+	 * This allows bdev layer to automatically split I/O at full stripe boundaries,
+	 * enabling efficient full stripe writes instead of splitting at strip boundaries.
+	 * 
+	 * For EC, the optimal I/O boundary should be a full stripe (strip_size * k),
+	 * not a single strip, to maximize full stripe write performance.
+	 * 
 	 * Only set if we have multiple base bdevs (k + p > 1), similar to RAID0
 	 */
 	if (ec_bdev->num_base_bdevs > 1) {
-		ec_bdev->bdev.optimal_io_boundary = ec_bdev->strip_size;
+		/* Set optimal_io_boundary to full stripe size (strip_size * k) */
+		ec_bdev->bdev.optimal_io_boundary = ec_bdev->strip_size * k;
 		ec_bdev->bdev.split_on_optimal_io_boundary = true;
 		
 		/* Set write_unit_size to full stripe size (strip_size * k) as a hint for optimal write performance
@@ -1053,95 +1101,11 @@ static void
 ec_stop(struct ec_bdev *ec_bdev)
 {
 	if (ec_bdev->module_private != NULL) {
+		ec_bdev_cleanup_encode_workers(ec_bdev);
 		ec_bdev_cleanup_tables(ec_bdev);
 		free(ec_bdev->module_private);
 		ec_bdev->module_private = NULL;
 	}
-}
-
-
-/*
- * brief:
- * ec_bdev_register_extension registers an extension interface for EC bdev
- * This allows external modules (e.g., FTL) to control I/O distribution
- * params:
- * ec_bdev - pointer to EC bdev
- * ext_if - extension interface to register
- * returns:
- * 0 on success, non-zero on failure
- */
-int
-ec_bdev_register_extension(struct ec_bdev *ec_bdev, struct ec_bdev_extension_if *ext_if)
-{
-	if (ec_bdev == NULL || ext_if == NULL) {
-		return -EINVAL;
-	}
-
-	if (ec_bdev->extension_if != NULL) {
-		SPDK_ERRLOG("Extension interface already registered for EC bdev %s\n",
-			    ec_bdev->bdev.name);
-		return -EEXIST;
-	}
-
-	if (ext_if->select_base_bdevs == NULL) {
-		SPDK_ERRLOG("Extension interface must provide select_base_bdevs callback\n");
-		return -EINVAL;
-	}
-
-	/* Initialize extension if init callback is provided */
-	if (ext_if->init != NULL) {
-		int rc = ext_if->init(ext_if, ec_bdev);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to initialize extension interface: %s\n",
-				    spdk_strerror(-rc));
-			return rc;
-		}
-	}
-
-	ec_bdev->extension_if = ext_if;
-	SPDK_NOTICELOG("Extension interface '%s' registered for EC bdev %s\n",
-		       ext_if->name, ec_bdev->bdev.name);
-
-	return 0;
-}
-
-/*
- * brief:
- * ec_bdev_unregister_extension unregisters an extension interface
- * params:
- * ec_bdev - pointer to EC bdev
- * returns:
- * none
- */
-void
-ec_bdev_unregister_extension(struct ec_bdev *ec_bdev)
-{
-	if (ec_bdev == NULL || ec_bdev->extension_if == NULL) {
-		return;
-	}
-
-	/* Cleanup extension if fini callback is provided */
-	if (ec_bdev->extension_if->fini != NULL) {
-		ec_bdev->extension_if->fini(ec_bdev->extension_if, ec_bdev);
-	}
-
-	SPDK_NOTICELOG("Extension interface '%s' unregistered from EC bdev %s\n",
-		       ec_bdev->extension_if->name, ec_bdev->bdev.name);
-	ec_bdev->extension_if = NULL;
-}
-
-/*
- * brief:
- * ec_bdev_get_extension gets the registered extension interface
- * params:
- * ec_bdev - pointer to EC bdev
- * returns:
- * pointer to extension interface, or NULL if not registered
- */
-struct ec_bdev_extension_if *
-ec_bdev_get_extension(struct ec_bdev *ec_bdev)
-{
-	return ec_bdev != NULL ? ec_bdev->extension_if : NULL;
 }
 
 /* ec_select_base_bdevs_default is defined in bdev_ec_io.c */
@@ -1460,11 +1424,6 @@ ec_bdev_free(struct ec_bdev *ec_bdev)
 		ec_bdev->self_desc = NULL;
 	}
 
-	/* Free extension interface if registered */
-	if (ec_bdev->extension_if != NULL) {
-		ec_bdev_unregister_extension(ec_bdev);
-	}
-
 	/* Free all base bdev resources */
 	if (ec_bdev->base_bdev_info != NULL) {
 		EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
@@ -1482,6 +1441,8 @@ ec_bdev_free(struct ec_bdev *ec_bdev)
 	/* Free module private data */
 	if (ec_bdev->module_private != NULL) {
 		struct ec_bdev_module_private *mp = ec_bdev->module_private;
+
+		ec_bdev_cleanup_encode_workers(ec_bdev);
 		if (mp->encode_matrix != NULL) {
 			spdk_dma_free(mp->encode_matrix);
 		}

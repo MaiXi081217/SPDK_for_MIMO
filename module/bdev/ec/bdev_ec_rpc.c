@@ -6,7 +6,6 @@
 #include "spdk/rpc.h"
 #include "spdk/bdev.h"
 #include "bdev_ec.h"
-#include "wear_leveling_ext.h"
 #include "spdk/util.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
@@ -144,9 +143,6 @@ struct rpc_bdev_ec_create {
 
 	/* If set, information about EC bdev will be stored in superblock on each base bdev */
 	bool                                 superblock_enabled;
-
-	/* Wear leveling mode: 0=DISABLED, 1=SIMPLE, 2=FULL (optional, defaults to 2) */
-	uint8_t                              wear_leveling_mode;
 };
 
 /*
@@ -224,7 +220,6 @@ static const struct spdk_json_object_decoder rpc_bdev_ec_create_decoders[] = {
 	{"base_bdevs", offsetof(struct rpc_bdev_ec_create, base_bdevs), decode_ec_base_bdevs},
 	{"uuid", offsetof(struct rpc_bdev_ec_create, uuid), spdk_json_decode_uuid, true},
 	{"superblock", offsetof(struct rpc_bdev_ec_create, superblock_enabled), spdk_json_decode_bool, true},
-	{"wear_leveling_mode", offsetof(struct rpc_bdev_ec_create, wear_leveling_mode), spdk_json_decode_uint8, true},
 };
 
 struct rpc_bdev_ec_create_ctx {
@@ -376,21 +371,6 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 						     spdk_strerror(-err), ctx->status);
 		}
     } else {
-		/* Register wear leveling extension if mode is not DISABLED */
-		if (ctx->req.wear_leveling_mode != WL_MODE_DISABLED) {
-			int wl_rc = wear_leveling_ext_register(ctx->ec_bdev, 
-							       (enum wear_leveling_mode)ctx->req.wear_leveling_mode);
-			if (wl_rc != 0) {
-				SPDK_WARNLOG("Failed to register wear leveling extension for EC bdev %s (mode %u): %s\n",
-					     ctx->req.name, ctx->req.wear_leveling_mode, spdk_strerror(-wl_rc));
-				/* Don't fail the creation, just log warning */
-			} else {
-				SPDK_NOTICELOG("Wear leveling extension registered for EC bdev %s in mode %u (%s)\n",
-					       ctx->req.name, ctx->req.wear_leveling_mode,
-					       ctx->req.wear_leveling_mode == WL_MODE_SIMPLE ? "SIMPLE" : "FULL");
-			}
-		}
-		
         /* Return the created EC bdev name */
 		struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(ctx->request);
 		spdk_json_write_string(w, ctx->req.name);
@@ -424,9 +404,6 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 	req = &ctx->req;
 	/* ctx is zero-initialized by calloc, but explicitly initialize req for clarity */
 	memset(req, 0, sizeof(*req));
-	
-	/* Set default wear leveling mode to FULL (2) */
-	req->wear_leveling_mode = WL_MODE_FULL;
 
 	if (spdk_json_decode_object(params, rpc_bdev_ec_create_decoders,
 				    SPDK_COUNTOF(rpc_bdev_ec_create_decoders),
@@ -442,14 +419,6 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 	if (req->k == 0 || req->p == 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
 					     "Must have at least one data block (k) and one parity block (p)");
-		goto cleanup;
-	}
-	
-	/* Validate wear_leveling_mode (0=DISABLED, 1=SIMPLE, 2=FULL) */
-	if (req->wear_leveling_mode > WL_MODE_FULL) {
-		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
-					     "Invalid wear_leveling_mode: %u (must be 0=DISABLED, 1=SIMPLE, or 2=FULL)",
-					     req->wear_leveling_mode);
 		goto cleanup;
 	}
 
