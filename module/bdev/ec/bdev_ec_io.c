@@ -1046,12 +1046,15 @@ send_completion:
 	{
 		/* Call completion callback on original thread */
 		struct ec_bdev_io *ec_io = stripe_priv->encode.ec_io;
+		bool cleanup_active_tasks = false;
 		
 		/* Validate ec_io and ec_ch before accessing */
 		if (spdk_unlikely(ec_io == NULL || ec_io->ec_ch == NULL)) {
 			SPDK_ERRLOG("Invalid ec_io or ec_ch in encoding worker\n");
 			/* Cannot send message - encoding failed but no way to notify */
-			return;
+			/* Must cleanup active_tasks counter if dedicated worker was used */
+			cleanup_active_tasks = true;
+			goto cleanup_and_exit;
 		}
 		
 		struct spdk_thread *orig_thread = spdk_io_channel_get_thread(
@@ -1059,7 +1062,9 @@ send_completion:
 		
 		if (spdk_unlikely(orig_thread == NULL)) {
 			SPDK_ERRLOG("Failed to get original thread for encoding completion\n");
-			return;
+			/* Must cleanup active_tasks counter if dedicated worker was used */
+			cleanup_active_tasks = true;
+			goto cleanup_and_exit;
 		}
 		
 		/* Send completion message - check return value */
@@ -1068,6 +1073,15 @@ send_completion:
 			SPDK_ERRLOG("Failed to send encoding completion message: %s\n", spdk_strerror(-msg_rc));
 			/* If we can't send the message, we're in a bad state - encoding completed but can't notify */
 			/* The I/O will eventually timeout or be cleaned up elsewhere */
+			/* Must cleanup active_tasks counter if dedicated worker was used */
+			cleanup_active_tasks = true;
+		}
+		
+cleanup_and_exit:
+		/* If we couldn't send completion message, cleanup active_tasks counter */
+		if (cleanup_active_tasks && stripe_priv->encode.used_dedicated_worker) {
+			ec_bdev_encode_worker_task_done(stripe_priv->encode.ec_bdev);
+			stripe_priv->encode.used_dedicated_worker = false;
 		}
 	}
 }
@@ -2265,10 +2279,18 @@ ec_submit_decode_read(struct ec_bdev_io *ec_io, uint64_t stripe_index,
 	uint8_t num_available = 0;
 	int rc;
 
-	/* Select base bdevs using default round-robin selection */
-	rc = ec_select_base_bdevs_default(ec_bdev, stripe_index, data_indices, parity_indices);
+	/* Select base bdevs using configured selection strategy */
+	if (ec_bdev->selection_config.select_fn != NULL) {
+		rc = ec_bdev->selection_config.select_fn(ec_bdev, stripe_index,
+							data_indices, parity_indices);
+	} else {
+		/* Fallback to default if not configured */
+		rc = ec_select_base_bdevs_default(ec_bdev, stripe_index,
+						  data_indices, parity_indices);
+	}
 	if (rc != 0) {
-		SPDK_ERRLOG("Failed to select base bdevs for decode\n");
+		SPDK_ERRLOG("Failed to select base bdevs for decode: %s\n",
+			    spdk_strerror(-rc));
 		return rc;
 	}
 
@@ -2504,12 +2526,28 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		stripe_index = start_strip / k;
 		offset_in_strip = ec_io->offset_blocks & (strip_size - 1);
 
-		/* Select base bdevs using default round-robin selection */
-		rc = ec_select_base_bdevs_default(ec_bdev, stripe_index,
-						  data_indices, parity_indices);
+		/* Select base bdevs using configured selection strategy */
+		if (ec_bdev->selection_config.wear_leveling_enabled &&
+		    ec_bdev->selection_config.select_fn == ec_select_base_bdevs_wear_leveling) {
+			rc = ec_selection_bind_group_profile(ec_bdev, stripe_index);
+			if (spdk_unlikely(rc != 0)) {
+				SPDK_ERRLOG("EC bdev %s: Failed to bind stripe %lu to wear profile: %s\n",
+					    ec_bdev->bdev.name, stripe_index, spdk_strerror(-rc));
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
+		}
+		if (ec_bdev->selection_config.select_fn != NULL) {
+			rc = ec_bdev->selection_config.select_fn(ec_bdev, stripe_index,
+								data_indices, parity_indices);
+		} else {
+			/* Fallback to default if not configured */
+			rc = ec_select_base_bdevs_default(ec_bdev, stripe_index,
+							  data_indices, parity_indices);
+		}
 		if (rc != 0) {
-			SPDK_ERRLOG("Failed to select base bdevs for EC bdev %s\n",
-				    ec_bdev->bdev.name);
+			SPDK_ERRLOG("Failed to select base bdevs for EC bdev %s: %s\n",
+				    ec_bdev->bdev.name, spdk_strerror(-rc));
 			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
@@ -2721,12 +2759,18 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 
 		uint8_t data_indices[EC_MAX_K];
 		uint8_t parity_indices[EC_MAX_P];
-		/* Select base bdevs using default round-robin selection */
-		rc = ec_select_base_bdevs_default(ec_bdev, stripe_index,
-						  data_indices, parity_indices);
+		/* Select base bdevs using configured selection strategy */
+		if (ec_bdev->selection_config.select_fn != NULL) {
+			rc = ec_bdev->selection_config.select_fn(ec_bdev, stripe_index,
+								data_indices, parity_indices);
+		} else {
+			/* Fallback to default if not configured */
+			rc = ec_select_base_bdevs_default(ec_bdev, stripe_index,
+							  data_indices, parity_indices);
+		}
 		if (rc != 0) {
-			SPDK_ERRLOG("Failed to select base bdevs for EC bdev %s\n",
-				    ec_bdev->bdev.name);
+			SPDK_ERRLOG("Failed to select base bdevs for EC bdev %s: %s\n",
+				    ec_bdev->bdev.name, spdk_strerror(-rc));
 			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
@@ -2735,9 +2779,83 @@ ec_submit_rw_request(struct ec_bdev_io *ec_io)
 		base_info = &ec_bdev->base_bdev_info[target_data_idx];
 		if (base_info->desc == NULL || base_info->is_failed ||
 		    ec_io->ec_ch->base_channel[target_data_idx] == NULL) {
-			SPDK_ERRLOG("Target data base bdev %u is not available\n", target_data_idx);
-			ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
-			return;
+			/* Target device is failed - check if we can use decode path */
+			/* Count available devices in this stripe (data + parity) */
+			uint8_t stripe_available = 0;
+			uint8_t stripe_failed = 0;
+			uint8_t j;
+			
+			for (j = 0; j < k; j++) {
+				uint8_t idx = data_indices[j];
+				struct ec_base_bdev_info *info = &ec_bdev->base_bdev_info[idx];
+				if (info->desc != NULL && !info->is_failed &&
+				    ec_io->ec_ch->base_channel[idx] != NULL) {
+					stripe_available++;
+				} else {
+					stripe_failed++;
+				}
+			}
+			for (j = 0; j < p; j++) {
+				uint8_t idx = parity_indices[j];
+				struct ec_base_bdev_info *info = &ec_bdev->base_bdev_info[idx];
+				if (info->desc != NULL && !info->is_failed &&
+				    ec_io->ec_ch->base_channel[idx] != NULL) {
+					stripe_available++;
+				} else {
+					stripe_failed++;
+				}
+			}
+			
+			/* If we have at least k available devices and failed <= p, use decode path */
+			if (stripe_available >= k && stripe_failed <= p) {
+				SPDK_NOTICELOG("EC bdev %s: Target device %u failed, falling back to decode path "
+					       "(stripe %lu, available: %u, failed: %u)\n",
+					       ec_bdev->bdev.name, target_data_idx, stripe_index,
+					       stripe_available, stripe_failed);
+				rc = ec_submit_decode_read(ec_io, stripe_index, strip_idx_in_stripe, offset_in_strip);
+				if (rc == 0) {
+					return;
+				} else if (rc == -ENOMEM) {
+					/* Buffer allocation failed - queue I/O wait */
+					struct ec_base_bdev_info *wait_base_info = NULL;
+					struct spdk_io_channel *wait_channel = NULL;
+					uint8_t wait_idx;
+					
+					wait_idx = 0;
+					EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+						if (base_info->desc != NULL && !base_info->is_failed &&
+						    ec_io->ec_ch->base_channel[wait_idx] != NULL) {
+							wait_base_info = base_info;
+							wait_channel = ec_io->ec_ch->base_channel[wait_idx];
+							break;
+						}
+						wait_idx++;
+					}
+					
+					if (wait_base_info != NULL && wait_channel != NULL) {
+						ec_bdev_queue_io_wait(ec_io,
+								      spdk_bdev_desc_get_bdev(wait_base_info->desc),
+								      wait_channel,
+								      (spdk_bdev_io_wait_cb)ec_submit_rw_request);
+						return;
+					} else {
+						SPDK_ERRLOG("No available base bdev for I/O wait in decode fallback path\n");
+						ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+						return;
+					}
+				} else {
+					SPDK_ERRLOG("Failed to submit decode read (fallback): %s\n", spdk_strerror(-rc));
+					ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+					return;
+				}
+			} else {
+				SPDK_ERRLOG("EC bdev %s: Target data base bdev %u is not available, "
+					    "and decode path not possible (available: %u < %u or failed: %u > %u)\n",
+					    ec_bdev->bdev.name, target_data_idx,
+					    stripe_available, k, stripe_failed, p);
+				ec_bdev_io_complete(ec_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
 		}
 
 		uint64_t pd_strip = stripe_index;

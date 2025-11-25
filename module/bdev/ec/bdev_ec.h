@@ -9,9 +9,10 @@
 #include "spdk/bdev_module.h"
 #include "spdk/thread.h"
 #include "spdk/uuid.h"
+#include "spdk/env.h"
 #include <isa-l/erasure_code.h>
 
-#define EC_BDEV_MIN_DATA_OFFSET_SIZE	(1024*1024) /* 1 MiB */
+#define EC_BDEV_MIN_DATA_OFFSET_SIZE	(1024*1024) /* 1 MiB (minimum metadata reservation) */
 
 /* Maximum k and p values for EC */
 #define EC_MAX_K 255
@@ -30,6 +31,77 @@
 
 /* RPC configuration */
 #define EC_RPC_MAX_BASE_BDEVS		255	/* Maximum base bdevs in RPC */
+#define EC_MAX_BASE_BDEVS		255	/* Maximum base bdevs for device selection */
+#define EC_ASSIGNMENT_CACHE_DEFAULT_CAPACITY	16384  /* Default stripe assignment cache size (~8.5MB, must be power of two) */
+
+/* Forward declaration */
+struct ec_bdev;
+struct ec_assignment_cache_entry;
+
+struct ec_assignment_cache {
+	struct ec_assignment_cache_entry *entries;
+	uint32_t capacity;
+	uint32_t mask;
+	bool initialized;
+	struct spdk_spinlock lock;
+};
+
+/* Wear profile management */
+#define EC_MAX_WEAR_PROFILES	256
+#define EC_GROUP_PROFILE_INVALID	0
+#define EC_GROUP_MAP_FLUSH_THRESHOLD	1024
+#define EC_GROUP_MAP_FLUSH_MAX_RETRIES	3
+
+struct ec_wear_profile_slot {
+	uint16_t profile_id;
+	uint16_t reserved;
+	bool valid;
+	uint32_t wear_levels[EC_MAX_BASE_BDEVS];
+	uint32_t wear_weights[EC_MAX_BASE_BDEVS];
+};
+
+/* Device selection strategy configuration */
+struct ec_device_selection_config {
+	/* Wear leveling (static, read once at initialization) */
+	bool wear_leveling_enabled;
+	uint32_t wear_levels[EC_MAX_BASE_BDEVS];   /* Static wear values */
+	uint32_t wear_weights[EC_MAX_BASE_BDEVS];  /* Computed weights */
+	
+	/* Fault tolerance for wear leveling (内置在磨损均衡算法中) */
+	uint8_t stripe_group_size;  /* Stripe group size for fault tolerance (usually = num_base_bdevs) */
+	
+	/* Deterministic algorithm parameters */
+	uint32_t selection_seed;  /* Seed for deterministic selection */
+	
+	/* Device selection function pointer */
+	int (*select_fn)(struct ec_bdev *ec_bdev,
+			uint64_t stripe_index,
+			uint8_t *data_indices,
+			uint8_t *parity_indices);
+
+	/* Wear profile tracking */
+	uint16_t active_profile_id;
+	uint16_t next_profile_id;
+	uint32_t wear_profile_count;
+	struct ec_wear_profile_slot wear_profiles[EC_MAX_WEAR_PROFILES];
+
+	/* Stripe group profile map */
+	uint16_t *group_profile_map;
+	uint32_t num_stripe_groups;
+	uint32_t group_profile_capacity;
+	bool group_map_dirty;
+	uint32_t group_map_dirty_count;
+	bool group_map_flush_in_progress;
+	uint64_t group_map_dirty_version;
+	uint64_t group_map_flush_version;
+	uint32_t group_map_flush_retries;
+	
+	/* Debug flags */
+	bool debug_enabled;  /* Enable debug logging */
+
+	/* Deterministic stripe assignment cache (accelerates fault tolerance checks) */
+	struct ec_assignment_cache assignment_cache;
+};
 
 /*
  * EC bdev state
@@ -226,6 +298,7 @@ struct ec_bdev {
 	/* Superblock */
 	bool				superblock_enabled;
 	struct ec_bdev_superblock	*sb;
+	size_t				sb_buffer_capacity;
 
 	/* Superblock buffer used for I/O */
 	void				*sb_io_buf;
@@ -250,6 +323,9 @@ struct ec_bdev {
 
 	/* Rebuild state and context */
 	struct ec_rebuild_context	*rebuild_ctx;
+	
+	/* Device selection strategy configuration */
+	struct ec_device_selection_config selection_config;
 };
 
 #define EC_FOR_EACH_BASE_BDEV(e, i) \
@@ -362,8 +438,9 @@ int ec_bdev_gen_decode_matrix(struct ec_bdev *ec_bdev, uint8_t *frag_err_list, i
  * Definitions related to EC bdev superblock
  */
 #define EC_BDEV_SB_VERSION_MAJOR	1
-#define EC_BDEV_SB_VERSION_MINOR	0
+#define EC_BDEV_SB_VERSION_MINOR	1
 #define EC_BDEV_SB_NAME_SIZE		64
+#define EC_BDEV_SB_MAX_SUPPORTED_LENGTH	(64ULL * 1024 * 1024)
 
 enum ec_bdev_sb_base_bdev_state {
 	EC_SB_BASE_BDEV_MISSING	= 0,
@@ -429,7 +506,22 @@ struct ec_bdev_superblock {
 	/* number of parity blocks (p) */
 	uint8_t			p;
 
-	uint8_t			reserved[115];
+	struct {
+		uint8_t			wear_leveling_enabled;
+		uint8_t			stripe_group_size;
+		uint16_t		reserved16;
+		uint32_t		selection_seed;
+	} wear_cfg;
+
+	/* Extended metadata offsets (relative to start of superblock buffer) */
+	uint32_t		profile_region_offset;
+	uint32_t		profile_region_length;
+	uint32_t		group_map_offset;
+	uint32_t		group_map_length;
+	uint32_t		latest_profile_id;
+	uint32_t		total_profile_slots;
+
+	uint8_t			reserved[83];
 
 	/* size of the base bdevs array */
 	uint8_t			base_bdevs_size;
@@ -438,10 +530,7 @@ struct ec_bdev_superblock {
 };
 SPDK_STATIC_ASSERT(sizeof(struct ec_bdev_superblock) == 256, "incorrect size");
 
-#define EC_BDEV_SB_MAX_LENGTH (sizeof(struct ec_bdev_superblock) + UINT8_MAX * sizeof(struct ec_bdev_sb_base_bdev))
-
-SPDK_STATIC_ASSERT(EC_BDEV_SB_MAX_LENGTH < EC_BDEV_MIN_DATA_OFFSET_SIZE,
-		   "Incorrect min data offset");
+#define EC_BDEV_SB_BASE_SECTION_LENGTH (sizeof(struct ec_bdev_superblock) + UINT8_MAX * sizeof(struct ec_bdev_sb_base_bdev))
 
 typedef void (*ec_bdev_write_sb_cb)(int status, struct ec_bdev *ec_bdev, void *ctx);
 typedef void (*ec_bdev_load_sb_cb)(const struct ec_bdev_superblock *sb, int status, void *ctx);
@@ -453,6 +542,12 @@ void ec_bdev_write_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb,
 			       void *cb_ctx);
 void ec_bdev_wipe_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb,
 			     void *cb_ctx);
+int ec_bdev_sb_reserve_buffer(struct ec_bdev *ec_bdev, size_t required_length);
+void ec_bdev_sb_save_selection_metadata(struct ec_bdev *ec_bdev);
+void ec_bdev_sb_load_selection_metadata(struct ec_bdev *ec_bdev,
+					const struct ec_bdev_superblock *sb);
+void ec_bdev_sb_load_wear_leveling_config(const struct ec_bdev_superblock *sb,
+					  struct ec_device_selection_config *config);
 int ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
 					     ec_base_bdev_cb cb, void *cb_ctx);
 int ec_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,

@@ -6,6 +6,14 @@
 #ifndef SPDK_BDEV_EC_INTERNAL_H
 #define SPDK_BDEV_EC_INTERNAL_H
 
+#include "spdk/stdinc.h"
+
+/* Global configuration: Enable/disable EC encoding dedicated worker threads
+ * This can be set by the application (e.g., via command line argument)
+ * Default: true (enabled)
+ */
+extern bool g_ec_encode_workers_enabled;
+
 #include "bdev_ec.h"
 #include "spdk/thread.h"
 #include "spdk/vmd.h"
@@ -314,9 +322,19 @@ ec_bdev_encode_worker_task_done(struct ec_bdev *ec_bdev)
 	__atomic_fetch_sub(&mp->encode_workers.active_tasks, 1, __ATOMIC_RELAXED);
 }
 
+/* Device selection strategy configuration is defined in bdev_ec.h */
+
 /* Base bdev selection */
 int ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 				 uint8_t *data_indices, uint8_t *parity_indices);
+
+/* Device selection strategy functions */
+int ec_bdev_init_selection_config(struct ec_bdev *ec_bdev);
+void ec_bdev_cleanup_selection_config(struct ec_bdev *ec_bdev);
+int ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
+		uint64_t stripe_index,
+		uint8_t *data_indices,
+		uint8_t *parity_indices);
 
 /* Rebuild functions */
 int ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_base_info,
@@ -331,6 +349,9 @@ void ec_bdev_fail_base_bdev(struct ec_base_bdev_info *base_info);
 
 /* LED control */
 void ec_bdev_set_healthy_disks_led(struct ec_bdev *ec_bdev, enum spdk_vmd_led_state led_state);
+int ec_selection_bind_group_profile(struct ec_bdev *ec_bdev, uint64_t stripe_index);
+int ec_selection_create_profile_from_devices(struct ec_bdev *ec_bdev, bool make_active,
+					     bool persist_now);
 
 /* RMW stripe buffer management */
 unsigned char *ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size);

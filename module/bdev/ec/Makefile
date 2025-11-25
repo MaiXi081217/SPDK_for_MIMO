@@ -10,7 +10,7 @@ SO_VER := 7
 SO_MINOR := 0
 
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
-C_SRCS = bdev_ec.c bdev_ec_rpc.c bdev_ec_sb.c bdev_ec_io.c bdev_ec_encode.c bdev_ec_rebuild.c bdev_ec_workers.c
+C_SRCS = bdev_ec.c bdev_ec_rpc.c bdev_ec_sb.c bdev_ec_io.c bdev_ec_encode.c bdev_ec_rebuild.c bdev_ec_workers.c bdev_ec_selection.c
 
 # Add ISA-L include paths
 CFLAGS += -I/usr/local/include/isa-l -I$(HOME)/isa-l/include

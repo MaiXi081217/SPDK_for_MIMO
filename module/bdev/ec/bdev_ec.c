@@ -20,6 +20,12 @@ extern struct spdk_pci_device *spdk_nvme_ctrlr_get_pci_device(struct spdk_nvme_c
 
 static bool g_shutdown_started = false;
 
+/* Global configuration: Enable/disable EC encoding dedicated worker threads
+ * Can be controlled via command line argument -E in mimo_tgt
+ * Default: true (enabled)
+ */
+bool g_ec_encode_workers_enabled = true;
+
 /* Global zero buffer for reuse (similar to FTL's g_ftl_write_buf/g_ftl_read_buf)
  * This reduces allocation overhead for operations requiring zero data (e.g., superblock wipe)
  * Size: 1MB (0x100000) - same as FTL_ZERO_BUFFER_SIZE
@@ -1085,6 +1091,16 @@ ec_start(struct ec_bdev *ec_bdev)
 		ec_bdev->bdev.split_on_write_unit = false;
 	}
 
+	/* Initialize device selection configuration (fault tolerance + wear leveling) */
+	rc = ec_bdev_init_selection_config(ec_bdev);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to initialize device selection configuration: %s\n",
+			    spdk_strerror(-rc));
+		ec_bdev_cleanup_encode_workers(ec_bdev);
+		ec_bdev_cleanup_tables(ec_bdev);
+		return rc;
+	}
+
 	return 0;
 }
 
@@ -1102,6 +1118,7 @@ ec_stop(struct ec_bdev *ec_bdev)
 {
 	if (ec_bdev->module_private != NULL) {
 		ec_bdev_cleanup_encode_workers(ec_bdev);
+		ec_bdev_cleanup_selection_config(ec_bdev);
 		ec_bdev_cleanup_tables(ec_bdev);
 		free(ec_bdev->module_private);
 		ec_bdev->module_private = NULL;
@@ -1610,6 +1627,13 @@ ec_bdev_create_from_sb(const struct ec_bdev_superblock *sb, struct ec_bdev **ec_
 	rc = ec_bdev_alloc_superblock(ec_bdev, sb->block_size);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to allocate superblock: %s\n", spdk_strerror(-rc));
+		ec_bdev_free(ec_bdev);
+		return rc;
+	}
+
+	rc = ec_bdev_sb_reserve_buffer(ec_bdev, sb->length);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to reserve superblock buffer: %s\n", spdk_strerror(-rc));
 		ec_bdev_free(ec_bdev);
 		return rc;
 	}
@@ -3039,6 +3063,25 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 					     base_info->name, spdk_strerror(-rc));
 				/* Don't fail configuration if rebuild start fails */
 			}
+		}
+	}
+
+	/* Auto-update wear leveling weights if enabled (after adding new device)
+	 * This ensures new devices (which might be old user disks) are included
+	 * in wear level calculations
+	 */
+	if (ec_bdev->state == EC_BDEV_STATE_ONLINE &&
+	    ec_bdev->selection_config.wear_leveling_enabled) {
+		SPDK_NOTICELOG("EC bdev %s: New device added, auto-updating wear leveling weights\n",
+			       ec_bdev->bdev.name);
+		int rc = ec_selection_create_profile_from_devices(ec_bdev, true, true);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: Failed to update wear leveling weights after adding device: %s\n",
+				     ec_bdev->bdev.name, spdk_strerror(-rc));
+			/* Don't fail device addition if weight update fails */
+		} else {
+			SPDK_NOTICELOG("EC bdev %s: Wear leveling weights updated successfully\n",
+				       ec_bdev->bdev.name);
 		}
 	}
 
