@@ -287,36 +287,32 @@ ec_rebuild_next_stripe(void *ctx)
 	}
 
 	/* Get data and parity indices for this stripe */
-	rc = ec_select_base_bdevs_default(ec_bdev, rebuild_ctx->current_stripe,
-					  data_indices, parity_indices);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to select base bdevs for rebuild stripe %lu\n",
-			    rebuild_ctx->current_stripe);
-		
-		/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
-		if (ec_bdev->sb != NULL) {
-			uint8_t i;
-			for (i = 0; i < ec_bdev->sb->base_bdevs_size; i++) {
-				if (ec_bdev->sb->base_bdevs[i].slot == rebuild_ctx->target_slot) {
-					ec_bdev->sb->base_bdevs[i].state = EC_SB_BASE_BDEV_FAILED;
-					/* Increment sequence number to indicate superblock update */
-					ec_bdev->sb->seq_number++;
-					/* Update CRC */
-					ec_bdev->sb->crc = 0;
-					ec_bdev->sb->crc = spdk_crc32c_update(ec_bdev->sb, ec_bdev->sb->length, 0);
-					/* Write superblock asynchronously */
-					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
-					break;
-				}
+	if (ec_bdev->selection_config.select_fn != NULL) {
+		if (ec_bdev->selection_config.wear_leveling_enabled &&
+		    ec_bdev->selection_config.select_fn == ec_select_base_bdevs_wear_leveling) {
+			rc = ec_selection_bind_group_profile(ec_bdev, rebuild_ctx->current_stripe);
+			if (spdk_unlikely(rc != 0)) {
+				SPDK_ERRLOG("Failed to bind stripe %lu to wear profile during rebuild on EC bdev %s: %s\n",
+					    rebuild_ctx->current_stripe, ec_bdev->bdev.name, spdk_strerror(-rc));
+				goto handle_select_error;
 			}
+			SPDK_DEBUGLOG(bdev_ec, "EC bdev %s: Rebuild stripe %lu bound to profile before selection\n",
+				      ec_bdev->bdev.name, rebuild_ctx->current_stripe);
 		}
-		
-		if (rebuild_ctx->rebuild_done_cb) {
-			rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, rc);
-		}
-		ec_bdev->rebuild_ctx = NULL;
-		ec_rebuild_cleanup(rebuild_ctx);
-		return;
+		rc = ec_bdev->selection_config.select_fn(ec_bdev, rebuild_ctx->current_stripe,
+							data_indices, parity_indices);
+		SPDK_DEBUGLOG(bdev_ec, "EC bdev %s: Rebuild stripe %lu selected via wear-leveling path (rc=%d)\n",
+			      ec_bdev->bdev.name, rebuild_ctx->current_stripe, rc);
+	} else {
+		rc = ec_select_base_bdevs_default(ec_bdev, rebuild_ctx->current_stripe,
+						  data_indices, parity_indices);
+		SPDK_DEBUGLOG(bdev_ec, "EC bdev %s: Rebuild stripe %lu selected via default path (rc=%d)\n",
+			      ec_bdev->bdev.name, rebuild_ctx->current_stripe, rc);
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to select base bdevs for rebuild stripe %lu on EC bdev %s: %s\n",
+			    rebuild_ctx->current_stripe, ec_bdev->bdev.name, spdk_strerror(-rc));
+		goto handle_select_error;
 	}
 
 	/* Find available base bdevs and determine failed fragment index */
@@ -421,6 +417,29 @@ ec_rebuild_next_stripe(void *ctx)
 			}
 		}
 	}
+	return;
+
+handle_select_error:
+	/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+	if (ec_bdev->sb != NULL) {
+		uint8_t sb_idx;
+		for (sb_idx = 0; sb_idx < ec_bdev->sb->base_bdevs_size; sb_idx++) {
+			if (ec_bdev->sb->base_bdevs[sb_idx].slot == rebuild_ctx->target_slot) {
+				ec_bdev->sb->base_bdevs[sb_idx].state = EC_SB_BASE_BDEV_FAILED;
+				ec_bdev->sb->seq_number++;
+				ec_bdev->sb->crc = 0;
+				ec_bdev->sb->crc = spdk_crc32c_update(ec_bdev->sb, ec_bdev->sb->length, 0);
+				ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+				break;
+			}
+		}
+	}
+
+	if (rebuild_ctx->rebuild_done_cb) {
+		rebuild_ctx->rebuild_done_cb(rebuild_ctx->rebuild_done_ctx, rc);
+	}
+	ec_bdev->rebuild_ctx = NULL;
+	ec_rebuild_cleanup(rebuild_ctx);
 }
 
 /*

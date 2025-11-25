@@ -6,6 +6,7 @@
 #include "spdk/rpc.h"
 #include "spdk/bdev.h"
 #include "bdev_ec.h"
+#include "bdev_ec_internal.h"
 #include "spdk/util.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
@@ -886,4 +887,219 @@ err:
 	rpc_bdev_ec_remove_base_bdev_done(request, rc);
 }
 SPDK_RPC_REGISTER("bdev_ec_remove_base_bdev", rpc_bdev_ec_remove_base_bdev, SPDK_RPC_RUNTIME)
+
+/*
+ * RPC structure for bdev_ec_set_selection_strategy
+ */
+struct rpc_bdev_ec_set_selection_strategy {
+	char *name;
+	uint8_t stripe_group_size;  /* For fault tolerance in wear leveling (built-in) */
+	bool wear_leveling_enabled;
+	bool debug_enabled;
+	uint32_t selection_seed;
+};
+
+static void
+free_rpc_bdev_ec_set_selection_strategy(struct rpc_bdev_ec_set_selection_strategy *req)
+{
+	free(req->name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_ec_set_selection_strategy_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_ec_set_selection_strategy, name), spdk_json_decode_string},
+	{"stripe_group_size", offsetof(struct rpc_bdev_ec_set_selection_strategy, stripe_group_size), spdk_json_decode_uint8, true},
+	{"wear_leveling_enabled", offsetof(struct rpc_bdev_ec_set_selection_strategy, wear_leveling_enabled), spdk_json_decode_bool, true},
+	{"debug_enabled", offsetof(struct rpc_bdev_ec_set_selection_strategy, debug_enabled), spdk_json_decode_bool, true},
+	{"selection_seed", offsetof(struct rpc_bdev_ec_set_selection_strategy, selection_seed), spdk_json_decode_uint32, true},
+};
+
+/*
+ * RPC handler for bdev_ec_set_selection_strategy
+ * Configures device selection strategy (fault tolerance + wear leveling)
+ */
+static void
+rpc_bdev_ec_set_selection_strategy(struct spdk_jsonrpc_request *request,
+				   const struct spdk_json_val *params)
+{
+	struct rpc_bdev_ec_set_selection_strategy req = {};
+	struct ec_bdev *ec_bdev;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_ec_set_selection_strategy_decoders,
+				    SPDK_COUNTOF(rpc_bdev_ec_set_selection_strategy_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	ec_bdev = ec_bdev_find_by_name(req.name);
+	if (ec_bdev == NULL) {
+		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
+						     "EC bdev %s not found", req.name);
+		goto cleanup;
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: Configuring device selection strategy\n", req.name);
+
+	struct ec_device_selection_config *config = &ec_bdev->selection_config;
+
+	/* Update stripe_group_size (for fault tolerance in wear leveling, built-in) */
+	if (req.stripe_group_size > 0 && req.stripe_group_size <= ec_bdev->num_base_bdevs) {
+		config->stripe_group_size = req.stripe_group_size;
+	} else {
+		/* Default to number of base bdevs if invalid or not provided */
+		config->stripe_group_size = ec_bdev->num_base_bdevs;
+		if (req.stripe_group_size > 0) {
+			SPDK_WARNLOG("EC bdev %s: Invalid stripe_group_size %u, using default %u\n",
+				     req.name, req.stripe_group_size, config->stripe_group_size);
+		}
+	}
+	SPDK_NOTICELOG("EC bdev %s: Stripe group size set to %u (for fault tolerance in wear leveling)\n",
+		       req.name, config->stripe_group_size);
+
+	/* Update wear leveling settings (if provided) */
+	if (req.wear_leveling_enabled != config->wear_leveling_enabled) {
+		config->wear_leveling_enabled = req.wear_leveling_enabled;
+		if (config->wear_leveling_enabled) {
+			SPDK_NOTICELOG("EC bdev %s: Wear leveling enabled, reading wear levels...\n",
+				       req.name);
+			/* Re-read wear levels */
+			rc = ec_bdev_init_selection_config(ec_bdev);
+			if (rc != 0) {
+				spdk_jsonrpc_send_error_response_fmt(request, rc,
+								     "Failed to initialize wear leveling: %s",
+								     spdk_strerror(-rc));
+				goto cleanup;
+			}
+		} else {
+			SPDK_NOTICELOG("EC bdev %s: Wear leveling disabled\n", req.name);
+		}
+	}
+
+	/* Update debug flag (if provided) */
+	config->debug_enabled = req.debug_enabled;
+	if (config->debug_enabled) {
+		SPDK_NOTICELOG("EC bdev %s: Debug logging enabled for device selection\n",
+			       req.name);
+	}
+
+	/* Update selection seed (if provided and valid) */
+	if (req.selection_seed > 0) {
+		config->selection_seed = req.selection_seed;
+		SPDK_NOTICELOG("EC bdev %s: Selection seed set to %u\n",
+			       req.name, config->selection_seed);
+	}
+
+	/* Update selection function based on current configuration
+	 * 逻辑说明：
+	 * 1. 如果启用磨损均衡，使用磨损均衡算法（内置容错保证）
+	 * 2. 如果未启用磨损均衡，使用默认 round-robin（已经保证不重叠）
+	 * 注意：容错保证是磨损均衡算法的内置功能，不是独立配置项
+	 */
+	if (config->wear_leveling_enabled) {
+		/* 磨损均衡算法内置容错保证，确保同组条带不共享设备 */
+		config->select_fn = ec_select_base_bdevs_wear_leveling;
+		SPDK_NOTICELOG("EC bdev %s: Using wear-leveling device selection (with built-in fault tolerance)\n", req.name);
+	} else {
+		/* 使用默认 round-robin（已经保证不重叠） */
+		config->select_fn = ec_select_base_bdevs_default;
+		SPDK_NOTICELOG("EC bdev %s: Using default round-robin device selection\n", req.name);
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: Device selection strategy configured successfully\n",
+		       req.name);
+
+	/* Save configuration to superblock if enabled */
+	if (ec_bdev->superblock_enabled && ec_bdev->sb != NULL) {
+		/* Update superblock with current configuration (includes wear leveling config) */
+		ec_bdev_sb_save_selection_metadata(ec_bdev);
+		ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		SPDK_NOTICELOG("EC bdev %s: Wear leveling configuration saved to superblock\n",
+			       req.name);
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	free_rpc_bdev_ec_set_selection_strategy(&req);
+	return;
+
+cleanup:
+	free_rpc_bdev_ec_set_selection_strategy(&req);
+}
+SPDK_RPC_REGISTER("bdev_ec_set_selection_strategy", rpc_bdev_ec_set_selection_strategy, SPDK_RPC_RUNTIME)
+
+/*
+ * RPC structure for bdev_ec_refresh_wear_levels
+ */
+struct rpc_bdev_ec_refresh_wear_levels {
+	char *name;
+};
+
+static void
+free_rpc_bdev_ec_refresh_wear_levels(struct rpc_bdev_ec_refresh_wear_levels *req)
+{
+	free(req->name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_ec_refresh_wear_levels_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_ec_refresh_wear_levels, name), spdk_json_decode_string},
+};
+
+/*
+ * RPC handler for bdev_ec_refresh_wear_levels
+ * Refreshes wear levels for all devices and recalculates weights
+ */
+static void
+rpc_bdev_ec_refresh_wear_levels(struct spdk_jsonrpc_request *request,
+				const struct spdk_json_val *params)
+{
+	struct rpc_bdev_ec_refresh_wear_levels req = {};
+	struct ec_bdev *ec_bdev;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_ec_refresh_wear_levels_decoders,
+				    SPDK_COUNTOF(rpc_bdev_ec_refresh_wear_levels_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	ec_bdev = ec_bdev_find_by_name(req.name);
+	if (ec_bdev == NULL) {
+		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
+						     "EC bdev %s not found", req.name);
+		goto cleanup;
+	}
+
+	struct ec_device_selection_config *config = &ec_bdev->selection_config;
+
+	/* Check if wear leveling is enabled */
+	if (!config->wear_leveling_enabled) {
+		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+						     "Wear leveling is not enabled for EC bdev %s", req.name);
+		goto cleanup;
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: Refreshing wear levels for all devices...\n", req.name);
+
+	/* Create new wear profile and make it active */
+	rc = ec_selection_create_profile_from_devices(ec_bdev, true, true);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "Failed to refresh wear levels: %s",
+						     spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	SPDK_NOTICELOG("EC bdev %s: Wear levels refreshed successfully\n", req.name);
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	free_rpc_bdev_ec_refresh_wear_levels(&req);
+	return;
+
+cleanup:
+	free_rpc_bdev_ec_refresh_wear_levels(&req);
+}
+SPDK_RPC_REGISTER("bdev_ec_refresh_wear_levels", rpc_bdev_ec_refresh_wear_levels, SPDK_RPC_RUNTIME)
 
