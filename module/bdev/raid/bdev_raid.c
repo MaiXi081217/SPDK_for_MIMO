@@ -240,8 +240,17 @@ raid_bdev_ch_process_setup(struct raid_bdev_io_channel *raid_ch, struct raid_bde
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
 		uint8_t slot = raid_bdev_base_bdev_slot(base_info);
 
+		/* Safety check: ensure slot is within valid range */
+		if (slot >= raid_bdev->num_base_bdevs) {
+			SPDK_ERRLOG("Calculated slot %u exceeds num_base_bdevs %u\n",
+				    slot, raid_bdev->num_base_bdevs);
+			continue;
+		}
+
 		if (base_info != process->target) {
-			raid_ch_processed->base_channel[slot] = raid_ch->base_channel[slot];
+			if (slot < raid_bdev->num_base_bdevs && raid_ch->base_channel != NULL) {
+				raid_ch_processed->base_channel[slot] = raid_ch->base_channel[slot];
+			}
 		} else {
 			raid_ch_processed->base_channel[slot] = raid_ch->process.target_ch;
 		}
@@ -442,7 +451,25 @@ raid_bdev_deconfigure_base_bdev(struct raid_base_bdev_info *base_info)
 static void
 raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
 {
-	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	struct raid_bdev *raid_bdev;
+
+	if (base_info == NULL) {
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		/* If raid_bdev is NULL, we can only clean up what we can */
+		free(base_info->name);
+		base_info->name = NULL;
+		spdk_uuid_set_null(&base_info->uuid);
+		base_info->is_failed = false;
+		base_info->data_offset = 0;
+		base_info->is_configured = false;
+		base_info->is_process_target = false;
+		base_info->remove_scheduled = false;
+		return;
+	}
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 	assert(base_info->configure_cb == NULL);
@@ -457,19 +484,25 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
 	/* clear `data_offset` to allow it to be recalculated during configuration */
 	base_info->data_offset = 0;
 
-	if (base_info->desc == NULL) {
-		return;
-	}
-
-	spdk_bdev_module_release_bdev(spdk_bdev_desc_get_bdev(base_info->desc));
-	spdk_bdev_close(base_info->desc);
-	base_info->desc = NULL;
-	spdk_put_io_channel(base_info->app_thread_ch);
-	base_info->app_thread_ch = NULL;
-
+	/* Always deconfigure if configured, regardless of desc state */
 	if (base_info->is_configured) {
 		raid_bdev_deconfigure_base_bdev(base_info);
 	}
+
+	/* Only close desc and channel if they exist */
+	if (base_info->desc != NULL) {
+		spdk_bdev_module_release_bdev(spdk_bdev_desc_get_bdev(base_info->desc));
+		spdk_bdev_close(base_info->desc);
+		base_info->desc = NULL;
+	}
+
+	if (base_info->app_thread_ch != NULL) {
+		spdk_put_io_channel(base_info->app_thread_ch);
+		base_info->app_thread_ch = NULL;
+	}
+
+	/* Clear remove_scheduled flag to allow this slot to be reused */
+	base_info->remove_scheduled = false;
 }
 
 static void
@@ -2039,7 +2072,22 @@ raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev)
 static void
 raid_bdev_remove_base_bdev_done(struct raid_base_bdev_info *base_info, int status)
 {
-	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	struct raid_bdev *raid_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_done\n");
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_remove_base_bdev_done\n");
+		base_info->remove_scheduled = false;
+		if (base_info->remove_cb != NULL) {
+			base_info->remove_cb(base_info->remove_cb_ctx, -EINVAL);
+		}
+		return;
+	}
 
 	assert(base_info->remove_scheduled);
 	base_info->remove_scheduled = false;
@@ -2062,7 +2110,19 @@ static void
 raid_bdev_remove_base_bdev_on_unquiesced(void *ctx, int status)
 {
 	struct raid_base_bdev_info *base_info = ctx;
-	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	struct raid_bdev *raid_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_on_unquiesced\n");
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_remove_base_bdev_on_unquiesced\n");
+		raid_bdev_remove_base_bdev_done(base_info, -EINVAL);
+		return;
+	}
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to unquiesce raid bdev %s: %s\n",
@@ -2078,17 +2138,46 @@ raid_bdev_channel_remove_base_bdev(struct spdk_io_channel_iter *i)
 	struct raid_base_bdev_info *base_info = spdk_io_channel_iter_get_ctx(i);
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct raid_bdev_io_channel *raid_ch = spdk_io_channel_get_ctx(ch);
-	uint8_t idx = raid_bdev_base_bdev_slot(base_info);
+	struct raid_bdev *raid_bdev;
+	uint8_t idx;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_channel_remove_base_bdev\n");
+		spdk_for_each_channel_continue(i, -EINVAL);
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL || raid_bdev->base_bdev_info == NULL) {
+		SPDK_ERRLOG("raid_bdev or base_bdev_info is NULL in raid_bdev_channel_remove_base_bdev\n");
+		spdk_for_each_channel_continue(i, -EINVAL);
+		return;
+	}
+
+	idx = raid_bdev_base_bdev_slot(base_info);
+
+	/* Safety check: ensure idx is within valid range */
+	if (idx >= raid_bdev->num_base_bdevs) {
+		SPDK_ERRLOG("Calculated slot %u exceeds num_base_bdevs %u for RAID bdev '%s'\n",
+			    idx, raid_bdev->num_base_bdevs, raid_bdev->bdev.name);
+		spdk_for_each_channel_continue(i, -EINVAL);
+		return;
+	}
 
 	SPDK_DEBUGLOG(bdev_raid, "slot: %u raid_ch: %p\n", idx, raid_ch);
 
-	if (raid_ch->base_channel[idx] != NULL) {
-		spdk_put_io_channel(raid_ch->base_channel[idx]);
-		raid_ch->base_channel[idx] = NULL;
+	/* Safety check: ensure base_channel array is allocated */
+	if (raid_ch->base_channel != NULL) {
+		if (raid_ch->base_channel[idx] != NULL) {
+			spdk_put_io_channel(raid_ch->base_channel[idx]);
+			raid_ch->base_channel[idx] = NULL;
+		}
 	}
 
-	if (raid_ch->process.ch_processed != NULL) {
-		raid_ch->process.ch_processed->base_channel[idx] = NULL;
+	if (raid_ch->process.ch_processed != NULL && raid_ch->process.ch_processed->base_channel != NULL) {
+		if (idx < raid_bdev->num_base_bdevs) {
+			raid_ch->process.ch_processed->base_channel[idx] = NULL;
+		}
 	}
 
 	spdk_for_each_channel_continue(i, 0);
@@ -2098,7 +2187,19 @@ static void
 raid_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int status)
 {
 	struct raid_base_bdev_info *base_info = spdk_io_channel_iter_get_ctx(i);
-	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	struct raid_bdev *raid_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_channels_remove_base_bdev_done\n");
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_channels_remove_base_bdev_done\n");
+		raid_bdev_free_base_bdev_resource(base_info);
+		return;
+	}
 
 	raid_bdev_free_base_bdev_resource(base_info);
 
@@ -2109,9 +2210,22 @@ raid_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int sta
 static void
 raid_bdev_remove_base_bdev_do_remove(struct raid_base_bdev_info *base_info)
 {
+	struct raid_bdev *raid_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_do_remove\n");
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_remove_base_bdev_do_remove\n");
+		return;
+	}
+
 	raid_bdev_deconfigure_base_bdev(base_info);
 
-	spdk_for_each_channel(base_info->raid_bdev, raid_bdev_channel_remove_base_bdev, base_info,
+	spdk_for_each_channel(raid_bdev, raid_bdev_channel_remove_base_bdev, base_info,
 			      raid_bdev_channels_remove_base_bdev_done);
 }
 
@@ -2122,6 +2236,11 @@ raid_bdev_remove_base_bdev_reset_done(struct spdk_bdev_io *bdev_io, bool success
 
 	spdk_bdev_free_io(bdev_io);
 
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_reset_done\n");
+		return;
+	}
+
 	raid_bdev_remove_base_bdev_do_remove(base_info);
 }
 
@@ -2130,11 +2249,22 @@ raid_bdev_remove_base_bdev_cont(struct raid_base_bdev_info *base_info)
 {
 	int rc;
 
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_cont\n");
+		return;
+	}
+
+	if (base_info->desc == NULL || base_info->app_thread_ch == NULL) {
+		SPDK_WARNLOG("base_info->desc or app_thread_ch is NULL, proceeding with removal\n");
+		raid_bdev_remove_base_bdev_do_remove(base_info);
+		return;
+	}
+
 	rc = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
 			     raid_bdev_remove_base_bdev_reset_done, base_info);
 	if (rc != 0) {
 		SPDK_WARNLOG("Reset base bdev '%s' before removal failed: %s\n",
-			     base_info->name, spdk_strerror(-rc));
+			     base_info->name ? base_info->name : "unknown", spdk_strerror(-rc));
 		/* Proceed with removal even if reset submission failed */
 		raid_bdev_remove_base_bdev_do_remove(base_info);
 	}
@@ -2144,6 +2274,11 @@ static void
 raid_bdev_remove_base_bdev_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
 {
 	struct raid_base_bdev_info *base_info = ctx;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_write_sb_cb\n");
+		return;
+	}
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to write raid bdev '%s' superblock: %s\n",
@@ -2159,7 +2294,18 @@ static void
 raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 {
 	struct raid_base_bdev_info *base_info = ctx;
-	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	struct raid_bdev *raid_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_on_quiesced\n");
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_remove_base_bdev_on_quiesced\n");
+		return;
+	}
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
@@ -2170,7 +2316,16 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 
 	if (raid_bdev->sb) {
 		struct raid_bdev_superblock *sb = raid_bdev->sb;
-		uint8_t slot = raid_bdev_base_bdev_slot(base_info);
+		uint8_t slot;
+
+		/* Safety check: ensure base_bdev_info array is valid before calculating slot */
+		if (raid_bdev->base_bdev_info == NULL) {
+			SPDK_ERRLOG("raid_bdev->base_bdev_info is NULL for RAID bdev '%s'\n", raid_bdev->bdev.name);
+			raid_bdev_remove_base_bdev_done(base_info, -EINVAL);
+			return;
+		}
+
+		slot = raid_bdev_base_bdev_slot(base_info);
 		uint8_t i;
 
 		for (i = 0; i < sb->base_bdevs_size; i++) {
@@ -2310,10 +2465,24 @@ static void
 raid_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
 {
 	struct raid_base_bdev_info *base_info = ctx;
-	struct raid_bdev *raid_bdev = base_info->raid_bdev;
-	raid_base_bdev_cb cb_fn = base_info->remove_cb;
-	void *cb_ctx = base_info->remove_cb_ctx;
+	struct raid_bdev *raid_bdev;
+	raid_base_bdev_cb cb_fn;
+	void *cb_ctx;
 	int ret;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_after_wipe\n");
+		return;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_remove_base_bdev_after_wipe\n");
+		return;
+	}
+
+	cb_fn = base_info->remove_cb;
+	cb_ctx = base_info->remove_cb_ctx;
 
 	if (status != 0) {
 		/* Wipe failed, but continue with removal anyway */
@@ -2357,18 +2526,33 @@ static int
 _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 			    raid_base_bdev_cb cb_fn, void *cb_ctx)
 {
-	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	struct raid_bdev *raid_bdev;
 	int ret = 0;
 
-	SPDK_DEBUGLOG(bdev_raid, "%s\n", base_info->name);
-
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in _raid_bdev_remove_base_bdev\n");
+		return -EINVAL;
+	}
+
+	raid_bdev = base_info->raid_bdev;
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in _raid_bdev_remove_base_bdev\n");
+		return -EINVAL;
+	}
+
+	SPDK_DEBUGLOG(bdev_raid, "%s\n", base_info->name ? base_info->name : "unknown");
 
 	if (base_info->remove_scheduled || !base_info->is_configured) {
 		return -ENODEV;
 	}
 
-	assert(base_info->desc);
+	if (base_info->desc == NULL) {
+		SPDK_ERRLOG("base_info->desc is NULL, cannot remove base bdev\n");
+		return -ENODEV;
+	}
+
 	base_info->remove_scheduled = true;
 	base_info->remove_cb = cb_fn;
 	base_info->remove_cb_ctx = cb_ctx;
@@ -2448,8 +2632,13 @@ raid_bdev_fail_base_remove_cb(void *ctx, int status)
 {
 	struct raid_base_bdev_info *base_info = ctx;
 
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in raid_bdev_fail_base_remove_cb\n");
+		return;
+	}
+
 	if (status != 0) {
-		SPDK_WARNLOG("Failed to remove base bdev %s\n", base_info->name);
+		SPDK_WARNLOG("Failed to remove base bdev %s\n", base_info->name ? base_info->name : "unknown");
 		base_info->is_failed = false;
 	}
 }
@@ -2930,9 +3119,15 @@ raid_bdev_channel_process_finish(struct spdk_io_channel_iter *i)
 
 	if (process->status == 0) {
 		uint8_t slot = raid_bdev_base_bdev_slot(process->target);
+		struct raid_bdev *raid_bdev = process->raid_bdev;
 
-		raid_ch->base_channel[slot] = raid_ch->process.target_ch;
-		raid_ch->process.target_ch = NULL;
+		/* Safety check: ensure slot is within valid range */
+		if (slot < raid_bdev->num_base_bdevs && raid_ch->base_channel != NULL) {
+			raid_ch->base_channel[slot] = raid_ch->process.target_ch;
+			raid_ch->process.target_ch = NULL;
+		} else {
+			SPDK_ERRLOG("Invalid slot %u or base_channel is NULL\n", slot);
+		}
 	}
 
 	raid_bdev_ch_process_cleanup(raid_ch);
@@ -3508,6 +3703,13 @@ raid_bdev_start_rebuild_with_cb(struct raid_base_bdev_info *target,
 	/* Find target slot */
 	target_slot = raid_bdev_base_bdev_slot(target);
 
+	/* Safety check: ensure target_slot is within valid range */
+	if (target_slot >= raid_bdev->num_base_bdevs) {
+		SPDK_ERRLOG("Calculated target_slot %u exceeds num_base_bdevs %u for RAID bdev '%s'\n",
+			    target_slot, raid_bdev->num_base_bdevs, raid_bdev->bdev.name);
+		return -EINVAL;
+	}
+
 	/* Check if we're resuming a previous rebuild (REBUILDING state) */
 	if (raid_bdev->sb != NULL) {
 		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, target_slot);
@@ -3564,8 +3766,19 @@ static void
 raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 {
 	struct raid_bdev *raid_bdev = base_info->raid_bdev;
-	raid_base_bdev_cb configure_cb;
+	raid_base_bdev_cb configure_cb = NULL;
 	int rc;
+
+	/* Safety check: ensure raid_bdev is valid */
+	if (raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_configure_base_bdev_cont\n");
+		if (base_info->configure_cb) {
+			configure_cb = base_info->configure_cb;
+			base_info->configure_cb = NULL;
+			configure_cb(base_info->configure_cb_ctx, -EINVAL);
+		}
+		return;
+	}
 
 	if (raid_bdev->num_base_bdevs_discovered == raid_bdev->num_base_bdevs_operational &&
 	    base_info->is_process_target == false) {
@@ -3580,10 +3793,25 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 
 	/* For RAID10: Check if this slot is already occupied (scenario 4: old disk re-inserted after rebuild) */
 	if (raid_bdev->level == RAID10 && raid_bdev->state == RAID_BDEV_STATE_ONLINE && raid_bdev->sb != NULL) {
+		/* Safety check: ensure base_bdev_info array is valid before calculating slot */
+		if (raid_bdev->base_bdev_info == NULL) {
+			SPDK_ERRLOG("raid_bdev->base_bdev_info is NULL for RAID bdev '%s'\n", raid_bdev->bdev.name);
+			if (base_info->configure_cb) {
+				configure_cb = base_info->configure_cb;
+				base_info->configure_cb = NULL;
+				configure_cb(base_info->configure_cb_ctx, -EINVAL);
+			}
+			return;
+		}
 		uint8_t slot_idx = raid_bdev_base_bdev_slot(base_info);
 
-		/* Check if slot is already occupied by another disk */
-		if (base_info->is_configured || base_info->name != NULL) {
+		/* Check if slot is already occupied by another disk
+		 * Note: We only check is_configured, not name, because name is set
+		 * during the add process before configure_cont is called.
+		 * If is_configured is true, it means this slot was already configured
+		 * and should not be reused for a new disk.
+		 */
+		if (base_info->is_configured) {
 			/* Slot is already occupied - this disk cannot be added */
 			const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, slot_idx);
 			const char *uuid_match_info = "";
@@ -3608,10 +3836,15 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 			SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", base_info->name);
 			SPDK_NOTICELOG("===========================================================\n");
 
-			raid_bdev_free_base_bdev_resource(base_info);
+			/* Clear configure_cb before freeing resources, as raid_bdev_free_base_bdev_resource
+			 * asserts that configure_cb is NULL
+			 */
 			if (base_info->configure_cb) {
 				configure_cb = base_info->configure_cb;
 				base_info->configure_cb = NULL;
+			}
+			raid_bdev_free_base_bdev_resource(base_info);
+			if (configure_cb) {
 				configure_cb(base_info->configure_cb_ctx, -EEXIST);
 			}
 			return;
@@ -3653,7 +3886,30 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 
 	/* For RAID10: Check if this base bdev needs rebuild after configuration */
 	if (raid_bdev->level == RAID10 && raid_bdev->state == RAID_BDEV_STATE_ONLINE && raid_bdev->sb != NULL) {
+		/* Safety check: ensure base_bdev_info array is valid before calculating slot */
+		if (raid_bdev->base_bdev_info == NULL) {
+			SPDK_ERRLOG("raid_bdev->base_bdev_info is NULL for RAID bdev '%s'\n", raid_bdev->bdev.name);
+			if (base_info->configure_cb) {
+				configure_cb = base_info->configure_cb;
+				base_info->configure_cb = NULL;
+				configure_cb(base_info->configure_cb_ctx, -EINVAL);
+			}
+			return;
+		}
 		uint8_t slot_idx = raid_bdev_base_bdev_slot(base_info);
+
+		/* Safety check: ensure slot_idx is within valid range */
+		if (slot_idx >= raid_bdev->num_base_bdevs) {
+			SPDK_ERRLOG("Calculated slot %u exceeds num_base_bdevs %u for RAID bdev '%s'\n",
+				    slot_idx, raid_bdev->num_base_bdevs, raid_bdev->bdev.name);
+			if (base_info->configure_cb) {
+				configure_cb = base_info->configure_cb;
+				base_info->configure_cb = NULL;
+				configure_cb(base_info->configure_cb_ctx, -EINVAL);
+			}
+			return;
+		}
+
 		bool needs_rebuild = false;
 		const char *rebuild_reason = NULL;
 
@@ -3830,7 +4086,6 @@ raid_bdev_configure_base_bdev_check_sb_cb(const struct raid_bdev_superblock *sb,
 			 */
 			if (raid_bdev->level == RAID10) {
 				bdev = spdk_bdev_desc_get_bdev(base_info->desc);
-				raid_bdev_free_base_bdev_resource(base_info);
 				/* Set UUID from superblock if not already set */
 				if (spdk_uuid_is_null(&base_info->uuid)) {
 					const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_uuid(sb, spdk_bdev_get_uuid(bdev));
@@ -3838,7 +4093,12 @@ raid_bdev_configure_base_bdev_check_sb_cb(const struct raid_bdev_superblock *sb,
 						spdk_uuid_copy(&base_info->uuid, &sb_base->uuid);
 					}
 				}
-				/* Continue with configuration using configure_cont for strict validation */
+				/* Continue with configuration using configure_cont for strict validation
+				 * Note: Do NOT call raid_bdev_free_base_bdev_resource here because
+				 * raid_bdev_configure_base_bdev_cont needs base_info->name, base_info->desc,
+				 * and other resources. The resource cleanup will be handled by configure_cont
+				 * or its error paths if needed.
+				 */
 				raid_bdev_configure_base_bdev_cont(base_info);
 				return;
 			} else {
@@ -4126,6 +4386,20 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 		return -EINVAL;
 	}
 
+	/* Safety check: ensure base_info has valid raid_bdev pointer */
+	if (base_info->raid_bdev == NULL) {
+		SPDK_ERRLOG("base_info->raid_bdev is NULL for slot in raid bdev '%s'\n",
+			    raid_bdev->bdev.name);
+		return -EINVAL;
+	}
+
+	/* Safety check: ensure base_info belongs to the correct raid_bdev */
+	if (base_info->raid_bdev != raid_bdev) {
+		SPDK_ERRLOG("base_info belongs to different raid_bdev '%s' (expected '%s')\n",
+			    base_info->raid_bdev->bdev.name, raid_bdev->bdev.name);
+		return -EINVAL;
+	}
+
 	assert(base_info->is_configured == false);
 
 	if (raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
@@ -4397,9 +4671,11 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
 		 * This is a safety check in examine path: if slot is already occupied,
 		 * we don't auto-replace it to avoid accidental data loss.
 		 * User should manually remove the existing disk first if replacement is intended.
+		 * Note: We only check is_configured, not name, because name may be set
+		 * during configuration but is_configured is the definitive flag.
 		 */
 		if (raid_bdev->level == RAID10) {
-			if (base_info->is_configured || base_info->name != NULL) {
+			if (base_info->is_configured) {
 				/* RAID bdev is already fully configured, this disk cannot be added */
 				/* This can happen if superblock state is CONFIGURED but slot is occupied */
 				SPDK_NOTICELOG("===========================================================\n");

@@ -10,8 +10,8 @@
 static void
 usage(void)
 {
-	printf("Usage: spdk_lspci\n");
-	printf("Print available SPDK PCI devices supported by NVMe driver.\n");
+	printf("Usage: mimo_lspci\n");
+	printf("Print available MIMO PCI devices supported by NVMe driver.\n");
 }
 
 static int
@@ -65,7 +65,7 @@ main(int argc, char **argv)
 	opts.name = "spdk_lspci";
 
 	if (spdk_env_init(&opts) < 0) {
-		printf("Unable to initialize SPDK env\n");
+		printf("Unable to initialize MIMO env\n");
 		return 1;
 	}
 

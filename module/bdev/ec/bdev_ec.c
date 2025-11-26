@@ -18,10 +18,20 @@
 extern struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev) __attribute__((weak));
 extern struct spdk_pci_device *spdk_nvme_ctrlr_get_pci_device(struct spdk_nvme_ctrlr *ctrlr) __attribute__((weak));
 
-#define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
-
 static bool g_shutdown_started = false;
 
+/* Global configuration: Enable/disable EC encoding dedicated worker threads
+ * Can be controlled via command line argument -E in mimo_tgt
+ * Default: true (enabled)
+ */
+bool g_ec_encode_workers_enabled = true;
+
+/* Global zero buffer for reuse (similar to FTL's g_ftl_write_buf/g_ftl_read_buf)
+ * This reduces allocation overhead for operations requiring zero data (e.g., superblock wipe)
+ * Size: 1MB (0x100000) - same as FTL_ZERO_BUFFER_SIZE
+ */
+#define EC_ZERO_BUFFER_SIZE 0x100000
+void *g_ec_zero_buf = NULL;
 
 /* List of all EC bdevs */
 struct ec_all_tailq g_ec_bdev_list = TAILQ_HEAD_INITIALIZER(g_ec_bdev_list);
@@ -152,35 +162,41 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 	/* Initialize buffer pools */
 	SLIST_INIT(&ec_ch->parity_buf_pool);
 	SLIST_INIT(&ec_ch->rmw_stripe_buf_pool);
+	SLIST_INIT(&ec_ch->temp_data_buf_pool);
 	ec_ch->parity_buf_count = 0;
 	ec_ch->rmw_buf_count = 0;
+	ec_ch->temp_data_buf_count = 0;
+	
+	/* RAID5F-style: Initialize stripe_private object pool */
+	TAILQ_INIT(&ec_ch->free_stripe_privs);
+	TAILQ_INIT(&ec_ch->encode_retry_queue);
+	
+	/* RAID5F-style: Initialize encoding retry queue */
+	TAILQ_INIT(&ec_ch->encode_retry_queue);
+	TAILQ_INIT(&ec_ch->encode_retry_queue);
 	ec_ch->parity_buf_size = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
 	ec_ch->rmw_buf_size = ec_ch->parity_buf_size * ec_bdev->k;
+	ec_ch->temp_data_buf_size = ec_ch->parity_buf_size;  /* Same size as parity buffers */
+	
+	/* Optimized: Cache alignment value to avoid repeated lookups from ec_bdev
+	 * This reduces memory access overhead in hot path (buffer allocation)
+	 */
+	ec_ch->cached_alignment = (ec_bdev->buf_alignment > 0) ?
+		ec_bdev->buf_alignment : EC_BDEV_DEFAULT_BUF_ALIGNMENT;
 
-	/* Pre-allocate buffers for better performance and stability */
-	/* Optimized: Pre-allocate more buffers to reduce allocation overhead during I/O */
-	/* Aggressive pre-allocation for maximum performance and stability */
-	/* This reduces performance variance by avoiding dynamic allocation during hot path */
-	size_t align = ec_bdev->buf_alignment > 0 ? ec_bdev->buf_alignment : 0x1000;
+	/* Pre-allocate buffers for better performance */
+	size_t align = ec_ch->cached_alignment;
 	struct ec_parity_buf_entry *entry;
 	unsigned char *buf;
 	uint8_t j;
-	/* Optimized: Aggressive pre-allocation - pre-allocate more buffers for high concurrency */
-	/* Pre-allocate p*8 parity buffers (8x parity count) for high concurrency scenarios */
-	/* Pre-allocate 16 RMW buffers for concurrent partial stripe writes */
-	uint8_t parity_prealloc = ec_bdev->p * 8;  /* 8x parity count for high concurrency */
-	uint8_t rmw_prealloc = 16;  /* 16 RMW buffers for high concurrency */
+	uint8_t parity_prealloc = ec_bdev->p * 8;
+	uint8_t rmw_prealloc = 16;
+	uint8_t temp_data_prealloc = ec_bdev->k * 2;
 	
-	/* Cap pre-allocation to pool limits */
-	if (parity_prealloc > 128) {
-		parity_prealloc = 128;
-	}
-	if (rmw_prealloc > 64) {
-		rmw_prealloc = 64;
-	}
+	if (parity_prealloc > 128) parity_prealloc = 128;
+	if (rmw_prealloc > 64) rmw_prealloc = 64;
+	if (temp_data_prealloc > 32) temp_data_prealloc = 32;
 
-	/* Pre-allocate parity buffers */
-	/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
 	for (j = 0; j < parity_prealloc && ec_ch->parity_buf_count < 128; j++) {
 		buf = spdk_dma_malloc(ec_ch->parity_buf_size, align, NULL);
 		if (buf != NULL) {
@@ -195,8 +211,6 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 		}
 	}
 
-	/* Pre-allocate RMW stripe buffers */
-	/* Optimized: Use malloc instead of calloc - entry only needs buf pointer */
 	for (j = 0; j < rmw_prealloc && ec_ch->rmw_buf_count < 64; j++) {
 		buf = spdk_dma_malloc(ec_ch->rmw_buf_size, align, NULL);
 		if (buf != NULL) {
@@ -209,6 +223,47 @@ ec_bdev_create_cb(void *io_device, void *ctx_buf)
 				spdk_dma_free(buf);
 			}
 		}
+	}
+
+	for (j = 0; j < temp_data_prealloc && ec_ch->temp_data_buf_count < 32; j++) {
+		buf = spdk_dma_malloc(ec_ch->temp_data_buf_size, align, NULL);
+		if (buf != NULL) {
+			entry = malloc(sizeof(*entry));
+			if (entry != NULL) {
+				entry->buf = buf;
+				SLIST_INSERT_HEAD(&ec_ch->temp_data_buf_pool, entry, link);
+				ec_ch->temp_data_buf_count++;
+			} else {
+				spdk_dma_free(buf);
+			}
+		}
+	}
+
+	/* RAID5F-style: Pre-allocate stripe_private objects for object pool
+	 * Pre-allocate EC_MAX_STRIPES objects to avoid malloc overhead in hot path
+	 * With sufficient memory, larger pool size improves performance
+	 */
+	struct ec_stripe_private *stripe_priv;
+	uint8_t k = ec_bdev->k;
+	uint8_t p = ec_bdev->p;
+	uint8_t stripe_idx;
+	
+	for (stripe_idx = 0; stripe_idx < EC_MAX_STRIPES; stripe_idx++) {
+		stripe_priv = malloc(sizeof(*stripe_priv));
+		if (stripe_priv == NULL) {
+			SPDK_WARNLOG("Failed to pre-allocate stripe_private %u\n", stripe_idx);
+			break;
+		}
+		memset(stripe_priv, 0, sizeof(*stripe_priv));
+		stripe_priv->from_pool = true;  /* Pre-allocated objects are marked as from pool */
+		
+		if (ec_stripe_private_init_chunks(stripe_priv, k, p) != 0) {
+			free(stripe_priv);
+			SPDK_WARNLOG("Failed to init chunks for stripe_private %u\n", stripe_idx);
+			break;
+		}
+		
+		TAILQ_INSERT_HEAD(&ec_ch->free_stripe_privs, stripe_priv, link);
 	}
 
 	i = 0;
@@ -278,6 +333,36 @@ ec_bdev_destroy_cb(void *io_device, void *ctx_buf)
 		free(buf_entry);
 	}
 	ec_ch->rmw_buf_count = 0;
+	
+	/* Optimized: Free temporary data buffer pool */
+	SLIST_FOREACH_SAFE(buf_entry, &ec_ch->temp_data_buf_pool, link, buf_entry_tmp) {
+		SLIST_REMOVE(&ec_ch->temp_data_buf_pool, buf_entry, ec_parity_buf_entry, link);
+		if (buf_entry->buf != NULL) {
+			spdk_dma_free(buf_entry->buf);
+		}
+		free(buf_entry);
+	}
+	ec_ch->temp_data_buf_count = 0;
+	
+	/* RAID5F-style: Free stripe_private object pool */
+	struct ec_stripe_private *stripe_priv;
+	while ((stripe_priv = TAILQ_FIRST(&ec_ch->free_stripe_privs)) != NULL) {
+		TAILQ_REMOVE(&ec_ch->free_stripe_privs, stripe_priv, link);
+		
+		/* Free chunk iov arrays */
+		uint8_t k = ec_bdev->k;
+		uint8_t p = ec_bdev->p;
+		uint8_t j;
+		
+		for (j = 0; j < k; j++) {
+			free(stripe_priv->data_chunks[j].iovs);
+		}
+		for (j = 0; j < p; j++) {
+			free(stripe_priv->parity_chunks[j].iovs);
+		}
+		
+		free(stripe_priv);
+	}
 
 	if (ec_ch->base_channel == NULL) {
 		return;
@@ -694,6 +779,10 @@ ec_bdev_io_init(struct ec_bdev_io *ec_io, struct ec_bdev_io_channel *ec_ch,
 	ec_io->base_bdev_io_remaining = 0;
 	ec_io->base_bdev_io_submitted = 0;
 	ec_io->completion_cb = NULL;
+	
+	/* Optimized: Initialize base_info_map for O(1) lookup in completion callback */
+	memset(ec_io->base_bdev_idx_map, 0xFF, sizeof(ec_io->base_bdev_idx_map));
+	memset(ec_io->base_info_map, 0, sizeof(ec_io->base_info_map));
 
 	ec_bdev_io_set_default_status(ec_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 }
@@ -967,18 +1056,49 @@ ec_start(struct ec_bdev *ec_bdev)
 		return rc;
 	}
 
-	/* Set optimal_io_boundary for reading (similar to RAID0/RAID5F)
-	 * This allows bdev layer to automatically split I/O at strip boundaries
-	 * Note: We do NOT set write_unit_size to allow flexible writes (FTL-friendly)
+	rc = ec_bdev_init_encode_workers(ec_bdev);
+	if (rc != 0) {
+		ec_bdev_cleanup_tables(ec_bdev);
+		return rc;
+	}
+
+	/* Set optimal_io_boundary to full stripe size for optimal write performance
+	 * This allows bdev layer to automatically split I/O at full stripe boundaries,
+	 * enabling efficient full stripe writes instead of splitting at strip boundaries.
+	 * 
+	 * For EC, the optimal I/O boundary should be a full stripe (strip_size * k),
+	 * not a single strip, to maximize full stripe write performance.
+	 * 
 	 * Only set if we have multiple base bdevs (k + p > 1), similar to RAID0
 	 */
 	if (ec_bdev->num_base_bdevs > 1) {
-		ec_bdev->bdev.optimal_io_boundary = ec_bdev->strip_size;
+		/* Set optimal_io_boundary to full stripe size (strip_size * k) */
+		ec_bdev->bdev.optimal_io_boundary = ec_bdev->strip_size * k;
 		ec_bdev->bdev.split_on_optimal_io_boundary = true;
+		
+		/* Set write_unit_size to full stripe size (strip_size * k) as a hint for optimal write performance
+		 * Note: We do NOT set split_on_write_unit to avoid rejecting small writes (< write_unit_size).
+		 * Instead, we rely on optimal_io_boundary splitting and EC module's RMW handling for partial stripes.
+		 * This allows both small writes (via RMW) and large writes (via full stripe path) to work correctly.
+		 */
+		ec_bdev->bdev.write_unit_size = ec_bdev->strip_size * k;
+		ec_bdev->bdev.split_on_write_unit = false;
 	} else {
 		/* Do not need to split reads/writes on single bdev EC modules. */
 		ec_bdev->bdev.optimal_io_boundary = 0;
 		ec_bdev->bdev.split_on_optimal_io_boundary = false;
+		ec_bdev->bdev.write_unit_size = 0;
+		ec_bdev->bdev.split_on_write_unit = false;
+	}
+
+	/* Initialize device selection configuration (fault tolerance + wear leveling) */
+	rc = ec_bdev_init_selection_config(ec_bdev);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to initialize device selection configuration: %s\n",
+			    spdk_strerror(-rc));
+		ec_bdev_cleanup_encode_workers(ec_bdev);
+		ec_bdev_cleanup_tables(ec_bdev);
+		return rc;
 	}
 
 	return 0;
@@ -997,99 +1117,12 @@ static void
 ec_stop(struct ec_bdev *ec_bdev)
 {
 	if (ec_bdev->module_private != NULL) {
+		ec_bdev_cleanup_encode_workers(ec_bdev);
+		ec_bdev_cleanup_selection_config(ec_bdev);
 		ec_bdev_cleanup_tables(ec_bdev);
 		free(ec_bdev->module_private);
 		ec_bdev->module_private = NULL;
 	}
-}
-
-
-/*
- * brief:
- * ec_bdev_register_extension registers an extension interface for EC bdev
- * This allows external modules (e.g., FTL) to control I/O distribution
- * params:
- * ec_bdev - pointer to EC bdev
- * ext_if - extension interface to register
- * returns:
- * 0 on success, non-zero on failure
- */
-int
-ec_bdev_register_extension(struct ec_bdev *ec_bdev, struct ec_bdev_extension_if *ext_if)
-{
-	if (ec_bdev == NULL || ext_if == NULL) {
-		return -EINVAL;
-	}
-
-	if (ec_bdev->extension_if != NULL) {
-		SPDK_ERRLOG("Extension interface already registered for EC bdev %s\n",
-			    ec_bdev->bdev.name);
-		return -EEXIST;
-	}
-
-	if (ext_if->select_base_bdevs == NULL) {
-		SPDK_ERRLOG("Extension interface must provide select_base_bdevs callback\n");
-		return -EINVAL;
-	}
-
-	/* Initialize extension if init callback is provided */
-	if (ext_if->init != NULL) {
-		int rc = ext_if->init(ext_if, ec_bdev);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to initialize extension interface: %s\n",
-				    spdk_strerror(-rc));
-			return rc;
-		}
-	}
-
-	ec_bdev->extension_if = ext_if;
-	SPDK_NOTICELOG("Extension interface '%s' registered for EC bdev %s\n",
-		       ext_if->name, ec_bdev->bdev.name);
-
-	return 0;
-}
-
-/*
- * brief:
- * ec_bdev_unregister_extension unregisters an extension interface
- * params:
- * ec_bdev - pointer to EC bdev
- * returns:
- * none
- */
-void
-ec_bdev_unregister_extension(struct ec_bdev *ec_bdev)
-{
-	if (ec_bdev == NULL || ec_bdev->extension_if == NULL) {
-		return;
-	}
-
-	/* Cleanup extension if fini callback is provided */
-	if (ec_bdev->extension_if->fini != NULL) {
-		ec_bdev->extension_if->fini(ec_bdev->extension_if, ec_bdev);
-	}
-
-	SPDK_NOTICELOG("Extension interface '%s' unregistered from EC bdev %s\n",
-		       ec_bdev->extension_if->name, ec_bdev->bdev.name);
-	ec_bdev->extension_if = NULL;
-}
-
-/*
- * brief:
- * ec_bdev_get_extension gets the registered extension interface
- * params:
- * ec_bdev - pointer to EC bdev
- * returns:
- * pointer to extension interface, or NULL if not registered
- */
-struct ec_bdev_extension_if *
-ec_bdev_get_extension(struct ec_bdev *ec_bdev)
-{
-	if (ec_bdev == NULL) {
-		return NULL;
-	}
-
-	return ec_bdev->extension_if;
 }
 
 /* ec_select_base_bdevs_default is defined in bdev_ec_io.c */
@@ -1408,11 +1441,6 @@ ec_bdev_free(struct ec_bdev *ec_bdev)
 		ec_bdev->self_desc = NULL;
 	}
 
-	/* Free extension interface if registered */
-	if (ec_bdev->extension_if != NULL) {
-		ec_bdev_unregister_extension(ec_bdev);
-	}
-
 	/* Free all base bdev resources */
 	if (ec_bdev->base_bdev_info != NULL) {
 		EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
@@ -1430,6 +1458,8 @@ ec_bdev_free(struct ec_bdev *ec_bdev)
 	/* Free module private data */
 	if (ec_bdev->module_private != NULL) {
 		struct ec_bdev_module_private *mp = ec_bdev->module_private;
+
+		ec_bdev_cleanup_encode_workers(ec_bdev);
 		if (mp->encode_matrix != NULL) {
 			spdk_dma_free(mp->encode_matrix);
 		}
@@ -1597,6 +1627,13 @@ ec_bdev_create_from_sb(const struct ec_bdev_superblock *sb, struct ec_bdev **ec_
 	rc = ec_bdev_alloc_superblock(ec_bdev, sb->block_size);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to allocate superblock: %s\n", spdk_strerror(-rc));
+		ec_bdev_free(ec_bdev);
+		return rc;
+	}
+
+	rc = ec_bdev_sb_reserve_buffer(ec_bdev, sb->length);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to reserve superblock buffer: %s\n", spdk_strerror(-rc));
 		ec_bdev_free(ec_bdev);
 		return rc;
 	}
@@ -1836,6 +1873,12 @@ ec_bdev_exit(void)
 {
 	/* All EC bdevs should have been deleted by now */
 	assert(TAILQ_EMPTY(&g_ec_bdev_list));
+
+	/* Free global zero buffer */
+	if (g_ec_zero_buf != NULL) {
+		spdk_free(g_ec_zero_buf);
+		g_ec_zero_buf = NULL;
+	}
 }
 
 /*
@@ -1849,6 +1892,16 @@ ec_bdev_exit(void)
 static int
 ec_bdev_init(void)
 {
+	/* Allocate global zero buffer for reuse (similar to FTL)
+	 * This reduces allocation overhead for operations requiring zero data
+	 */
+	g_ec_zero_buf = spdk_zmalloc(EC_ZERO_BUFFER_SIZE, EC_ZERO_BUFFER_SIZE, NULL,
+				     SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	if (!g_ec_zero_buf) {
+		SPDK_ERRLOG("Failed to allocate global zero buffer\n");
+		return -ENOMEM;
+	}
+
 	return 0;
 }
 
@@ -2698,7 +2751,6 @@ ec_bdev_configure_base_bdev_check_sb_cb(const struct ec_bdev_superblock *sb, int
 			 * (slot occupancy check, rebuild decision, etc.)
 			 */
 			bdev = spdk_bdev_desc_get_bdev(base_info->desc);
-			ec_bdev_free_base_bdev_resource(base_info);
 			/* Set UUID from superblock if not already set */
 			if (spdk_uuid_is_null(&base_info->uuid)) {
 				const struct ec_bdev_sb_base_bdev *sb_base = ec_bdev_sb_find_base_bdev_by_uuid(sb, spdk_bdev_get_uuid(bdev));
@@ -2706,7 +2758,12 @@ ec_bdev_configure_base_bdev_check_sb_cb(const struct ec_bdev_superblock *sb, int
 					spdk_uuid_copy(&base_info->uuid, &sb_base->uuid);
 				}
 			}
-			/* Continue with configuration using configure_cont for strict validation */
+			/* Continue with configuration using configure_cont for strict validation
+			 * Note: Do NOT call ec_bdev_free_base_bdev_resource here because
+			 * ec_bdev_configure_base_bdev_cont needs base_info->name, base_info->desc,
+			 * and other resources. The resource cleanup will be handled by configure_cont
+			 * or its error paths if needed.
+			 */
 			ec_bdev_configure_base_bdev_cont(base_info);
 			return;
 		}
@@ -2761,7 +2818,7 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 {
 	struct ec_bdev *ec_bdev = base_info->ec_bdev;
 	struct spdk_bdev *bdev;
-	ec_base_bdev_cb configure_cb;
+	ec_base_bdev_cb configure_cb = NULL;
 	int rc;
 
 	if (base_info->desc == NULL) {
@@ -2793,10 +2850,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 		if (ec_bdev->bdev.blocklen != bdev->blocklen) {
 			SPDK_ERRLOG("EC bdev '%s' blocklen %u differs from base bdev '%s' blocklen %u\n",
 				    ec_bdev->bdev.name, ec_bdev->bdev.blocklen, bdev->name, bdev->blocklen);
-			ec_bdev_free_base_bdev_resource(base_info);
+			/* Clear configure_cb before freeing resources */
 			if (base_info->configure_cb) {
 				configure_cb = base_info->configure_cb;
 				base_info->configure_cb = NULL;
+			}
+			ec_bdev_free_base_bdev_resource(base_info);
+			if (configure_cb) {
 				configure_cb(base_info->configure_cb_ctx, -EINVAL);
 			}
 			return;
@@ -2810,10 +2870,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 		    ec_bdev->bdev.dif_pi_format != bdev->dif_pi_format) {
 			SPDK_ERRLOG("EC bdev '%s' has different metadata format than base bdev '%s'\n",
 				    ec_bdev->bdev.name, bdev->name);
-			ec_bdev_free_base_bdev_resource(base_info);
+			/* Clear configure_cb before freeing resources */
 			if (base_info->configure_cb) {
 				configure_cb = base_info->configure_cb;
 				base_info->configure_cb = NULL;
+			}
+			ec_bdev_free_base_bdev_resource(base_info);
+			if (configure_cb) {
 				configure_cb(base_info->configure_cb_ctx, -EINVAL);
 			}
 			return;
@@ -2824,8 +2887,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 	if (ec_bdev->state == EC_BDEV_STATE_ONLINE && ec_bdev->sb != NULL) {
 		uint8_t slot_idx = (uint8_t)(base_info - ec_bdev->base_bdev_info);
 		
-		/* Check if slot is already occupied by another disk */
-		if (base_info->is_configured || base_info->name != NULL) {
+		/* Check if slot is already occupied by another disk
+		 * Note: We only check is_configured, not name, because name is set
+		 * during the add process before configure_cont is called.
+		 * If is_configured is true, it means this slot was already configured
+		 * and should not be reused for a new disk.
+		 */
+		if (base_info->is_configured) {
 			/* Slot is already occupied - this disk cannot be added */
 			const struct ec_bdev_sb_base_bdev *sb_base = ec_bdev_sb_find_base_bdev_by_slot(ec_bdev, slot_idx);
 			const char *uuid_match_info = "";
@@ -2850,10 +2918,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 			SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", base_info->name);
 			SPDK_NOTICELOG("===========================================================\n");
 			
-			ec_bdev_free_base_bdev_resource(base_info);
+			/* Clear configure_cb before freeing resources to ensure proper cleanup order */
 			if (base_info->configure_cb) {
 				configure_cb = base_info->configure_cb;
 				base_info->configure_cb = NULL;
+			}
+			ec_bdev_free_base_bdev_resource(base_info);
+			if (configure_cb) {
 				configure_cb(base_info->configure_cb_ctx, -EEXIST);
 			}
 			return;
@@ -3010,6 +3081,25 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 					     base_info->name, spdk_strerror(-rc));
 				/* Don't fail configuration if rebuild start fails */
 			}
+		}
+	}
+
+	/* Auto-update wear leveling weights if enabled (after adding new device)
+	 * This ensures new devices (which might be old user disks) are included
+	 * in wear level calculations
+	 */
+	if (ec_bdev->state == EC_BDEV_STATE_ONLINE &&
+	    ec_bdev->selection_config.wear_leveling_enabled) {
+		SPDK_NOTICELOG("EC bdev %s: New device added, auto-updating wear leveling weights\n",
+			       ec_bdev->bdev.name);
+		int rc = ec_selection_create_profile_from_devices(ec_bdev, true, true);
+		if (rc != 0) {
+			SPDK_WARNLOG("EC bdev %s: Failed to update wear leveling weights after adding device: %s\n",
+				     ec_bdev->bdev.name, spdk_strerror(-rc));
+			/* Don't fail device addition if weight update fails */
+		} else {
+			SPDK_NOTICELOG("EC bdev %s: Wear leveling weights updated successfully\n",
+				       ec_bdev->bdev.name);
 		}
 	}
 
@@ -3465,8 +3555,10 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 		 * This is a safety check in examine path: if slot is already occupied,
 		 * we don't auto-replace it to avoid accidental data loss.
 		 * User should manually remove the existing disk first if replacement is intended.
+		 * Note: We only check is_configured, not name, because name may be set
+		 * during configuration but is_configured is the definitive flag.
 		 */
-		if (base_info->is_configured || base_info->name != NULL) {
+		if (base_info->is_configured) {
 			/* EC bdev is already fully configured, this disk cannot be added */
 			/* This can happen if superblock state is CONFIGURED but slot is occupied */
 			SPDK_NOTICELOG("===========================================================\n");

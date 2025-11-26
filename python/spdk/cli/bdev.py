@@ -1609,14 +1609,22 @@ def add_parser(subparsers):
             sys.exit(1)
 
         # Print the created EC name (RPC returns a string)
-        print_json(args.client.bdev_ec_create(
-                                  name=args.name,
-                                  k=args.k,
-                                  p=args.p,
-                                  strip_size_kb=args.strip_size_kb,
-                                  base_bdevs=base_bdevs,
-                                  uuid=args.uuid,
-                                  superblock=args.superblock))
+        # Build request params - only include wear_leveling_mode if explicitly set
+        params = {
+            'name': args.name,
+            'k': args.k,
+            'p': args.p,
+            'base_bdevs': base_bdevs,
+        }
+        if args.strip_size_kb is not None:
+            params['strip_size_kb'] = args.strip_size_kb
+        if args.uuid is not None:
+            params['uuid'] = args.uuid
+        if args.superblock:
+            params['superblock'] = args.superblock
+        # Note: wear_leveling_mode is not supported by RPC interface, so we don't include it
+        
+        print_json(args.client.bdev_ec_create(**params))
     
     p = subparsers.add_parser('bdev_ec_create', help='Create new EC (Erasure Code) bdev')
     p.add_argument('-n', '--name', help='EC bdev name', required=True)
@@ -1632,6 +1640,8 @@ def add_parser(subparsers):
     p.add_argument('--uuid', help='UUID for this EC bdev')
     p.add_argument('-s', '--superblock', help='information about EC bdev will be stored in superblock on each base bdev, '
                                               'disabled by default', action='store_true')
+    # Note: wear_leveling_mode parameter removed - not supported by RPC interface
+    # p.add_argument('-w', '--wear-leveling-mode', dest='wear_leveling_mode', ...)
     p.set_defaults(func=bdev_ec_create)
 
     def bdev_ec_delete(args):
@@ -1667,3 +1677,9 @@ def add_parser(subparsers):
     p.add_argument('-b', '--name', help='Name of the bdev', required=True)
     p.add_argument('-s', '--size', help='Size in bytes to wipe (default: 1MB)', type=int, default=0)
     p.set_defaults(func=bdev_wipe_superblock)
+
+    def bdev_test_all(args):
+        print_dict(args.client.bdev_test_all())
+    
+    p = subparsers.add_parser('bdev_test_all', help='Run all tests for RAID, EC, and rebuild scenarios')
+    p.set_defaults(func=bdev_test_all)

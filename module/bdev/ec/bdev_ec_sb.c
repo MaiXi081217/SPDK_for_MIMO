@@ -9,8 +9,13 @@
 #include "spdk/log.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
+#include <errno.h>
 
 #include "bdev_ec.h"
+
+/* External reference to global zero buffer (defined in bdev_ec.c) */
+extern void *g_ec_zero_buf;
+#define EC_ZERO_BUFFER_SIZE 0x100000  /* 1MB - same as in bdev_ec.c */
 
 struct ec_bdev_write_sb_ctx {
 	struct ec_bdev *ec_bdev;
@@ -31,14 +36,84 @@ struct ec_bdev_read_sb_ctx {
 	uint32_t buf_size;
 };
 
+struct ec_sb_profile_slot_disk {
+	uint16_t profile_id;
+	uint16_t valid;
+	uint32_t wear_levels[EC_MAX_BASE_BDEVS];
+};
+
+SPDK_STATIC_ASSERT(sizeof(struct ec_sb_profile_slot_disk) ==
+		   (sizeof(uint16_t) * 2 + sizeof(uint32_t) * EC_MAX_BASE_BDEVS),
+		   "Invalid ec_sb_profile_slot_disk size");
+
 /* Forward declarations */
 static void ec_bdev_sb_update_crc(struct ec_bdev_superblock *sb);
+int ec_bdev_sb_reserve_buffer(struct ec_bdev *ec_bdev, size_t required_length);
+void ec_bdev_sb_save_selection_metadata(struct ec_bdev *ec_bdev);
+void ec_bdev_sb_load_selection_metadata(struct ec_bdev *ec_bdev,
+		const struct ec_bdev_superblock *sb);
+static void ec_bdev_write_superblock_noop_cb(int status, struct ec_bdev *ec_bdev, void *ctx);
 
+/* Helper functions for wear leveling configuration in superblock */
+static void ec_bdev_sb_save_wear_leveling_config(struct ec_bdev_superblock *sb,
+		const struct ec_device_selection_config *config);
+void ec_bdev_sb_load_wear_leveling_config(const struct ec_bdev_superblock *sb,
+		struct ec_device_selection_config *config);
+
+static void
+ec_bdev_write_superblock_noop_cb(int status, struct ec_bdev *ec_bdev, void *ctx)
+{
+	SPDK_DEBUGLOG(bdev_ec_sb, "Superblock write completed for %s with status %d\n",
+		      ec_bdev ? ec_bdev->bdev.name : "unknown", status);
+	(void)ctx;
+}
+
+static inline size_t
+ec_bdev_sb_profile_region_size(void)
+{
+	return EC_MAX_WEAR_PROFILES * sizeof(struct ec_sb_profile_slot_disk);
+}
+
+static inline void *
+ec_bdev_sb_get_profile_region(struct ec_bdev_superblock *sb)
+{
+	if (sb->profile_region_length == 0) {
+		return NULL;
+	}
+	return (uint8_t *)sb + sb->profile_region_offset;
+}
+
+static inline const void *
+ec_bdev_sb_get_profile_region_const(const struct ec_bdev_superblock *sb)
+{
+	if (sb->profile_region_length == 0) {
+		return NULL;
+	}
+	return (const uint8_t *)sb + sb->profile_region_offset;
+}
+
+static inline void *
+ec_bdev_sb_get_group_map(struct ec_bdev_superblock *sb)
+{
+	if (sb->group_map_length == 0) {
+		return NULL;
+	}
+	return (uint8_t *)sb + sb->group_map_offset;
+}
+
+static inline const void *
+ec_bdev_sb_get_group_map_const(const struct ec_bdev_superblock *sb)
+{
+	if (sb->group_map_length == 0) {
+		return NULL;
+	}
+	return (const uint8_t *)sb + sb->group_map_offset;
+}
 int
 ec_bdev_alloc_superblock(struct ec_bdev *ec_bdev, uint32_t block_size)
 {
 	struct ec_bdev_superblock *sb;
-	uint64_t align = 0x1000; /* Default 4KB alignment */
+	uint64_t align = EC_BDEV_DEFAULT_BUF_ALIGNMENT;
 	struct ec_base_bdev_info *base_info;
 
 	assert(ec_bdev->sb == NULL);
@@ -54,13 +129,66 @@ ec_bdev_alloc_superblock(struct ec_bdev *ec_bdev, uint32_t block_size)
 
 	/* If no base bdev is configured yet, use default alignment */
 	/* Note: This is safe as 4KB is a common alignment requirement */
-	sb = spdk_dma_zmalloc(SPDK_ALIGN_CEIL(EC_BDEV_SB_MAX_LENGTH, block_size), align, NULL);
+	size_t alloc_len = SPDK_ALIGN_CEIL(EC_BDEV_SB_BASE_SECTION_LENGTH, block_size);
+	if (alloc_len > EC_BDEV_SB_MAX_SUPPORTED_LENGTH) {
+		SPDK_ERRLOG("EC bdev %s: Requested superblock size %zu exceeds maximum %" PRIu64 "\n",
+			    ec_bdev->bdev.name, alloc_len, (uint64_t)EC_BDEV_SB_MAX_SUPPORTED_LENGTH);
+		return -E2BIG;
+	}
+	sb = spdk_dma_zmalloc(alloc_len, align, NULL);
 	if (!sb) {
 		SPDK_ERRLOG("Failed to allocate EC bdev sb buffer\n");
 		return -ENOMEM;
 	}
 
 	ec_bdev->sb = sb;
+	ec_bdev->sb_buffer_capacity = alloc_len;
+
+	return 0;
+}
+
+int
+ec_bdev_sb_reserve_buffer(struct ec_bdev *ec_bdev, size_t required_length)
+{
+	size_t aligned_length;
+	struct ec_bdev_superblock *new_sb;
+	struct ec_base_bdev_info *base_info;
+	uint64_t align = EC_BDEV_DEFAULT_BUF_ALIGNMENT;
+
+	if (ec_bdev == NULL) {
+		return -EINVAL;
+	}
+
+	aligned_length = SPDK_ALIGN_CEIL(required_length, EC_BDEV_DEFAULT_BUF_ALIGNMENT);
+	if (aligned_length > EC_BDEV_SB_MAX_SUPPORTED_LENGTH) {
+		SPDK_ERRLOG("EC bdev %s: Cannot grow superblock to %zu bytes (limit %" PRIu64 ")\n",
+			    ec_bdev->bdev.name, aligned_length, (uint64_t)EC_BDEV_SB_MAX_SUPPORTED_LENGTH);
+		return -E2BIG;
+	}
+	if (ec_bdev->sb_buffer_capacity >= aligned_length) {
+		return 0;
+	}
+
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->is_configured && base_info->desc != NULL) {
+			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+			align = spdk_bdev_get_buf_align(bdev);
+			break;
+		}
+	}
+
+	new_sb = spdk_dma_zmalloc(aligned_length, align, NULL);
+	if (new_sb == NULL) {
+		return -ENOMEM;
+	}
+
+	if (ec_bdev->sb != NULL) {
+		memcpy(new_sb, ec_bdev->sb, ec_bdev->sb->length);
+		spdk_dma_free(ec_bdev->sb);
+	}
+
+	ec_bdev->sb = new_sb;
+	ec_bdev->sb_buffer_capacity = aligned_length;
 
 	return 0;
 }
@@ -78,6 +206,7 @@ ec_bdev_free_superblock(struct ec_bdev *ec_bdev)
 			      ec_bdev->bdev.name);
 		spdk_dma_free(ec_bdev->sb);
 		ec_bdev->sb = NULL;
+		ec_bdev->sb_buffer_capacity = 0;
 	}
 }
 
@@ -113,6 +242,10 @@ ec_bdev_init_superblock(struct ec_bdev *ec_bdev)
 		sb_base_bdev++;
 	}
 
+	/* Save wear leveling configuration to superblock */
+	ec_bdev_sb_save_wear_leveling_config(sb, &ec_bdev->selection_config);
+	ec_bdev_sb_save_selection_metadata(ec_bdev);
+
 	/* Update CRC immediately after initialization for safety and debugging */
 	ec_bdev_sb_update_crc(sb);
 }
@@ -122,7 +255,7 @@ ec_bdev_alloc_sb_io_buf(struct ec_bdev *ec_bdev)
 {
 	struct ec_bdev_superblock *sb = ec_bdev->sb;
 	uint32_t data_block_size = spdk_bdev_get_data_block_size(&ec_bdev->bdev);
-	uint64_t align = 0x1000; /* Default alignment */
+	uint64_t align = EC_BDEV_DEFAULT_BUF_ALIGNMENT;
 	struct ec_base_bdev_info *base_info;
 
 	/* Try to get alignment from first configured base bdev if available */
@@ -156,6 +289,162 @@ ec_bdev_sb_update_crc(struct ec_bdev_superblock *sb)
 {
 	sb->crc = 0;
 	sb->crc = spdk_crc32c_update(sb, sb->length, 0);
+}
+
+/*
+ * Save wear leveling configuration to superblock reserved field
+ * Layout: offset 0-7 (8 bytes)
+ *   [0]: wear_leveling_enabled (1 byte, 0=false, 1=true)
+ *   [1]: stripe_group_size (1 byte)
+ *   [2-5]: selection_seed (4 bytes, uint32_t)
+ *   [6-7]: reserved for future use (2 bytes)
+ */
+static void
+ec_bdev_sb_save_wear_leveling_config(struct ec_bdev_superblock *sb,
+				     const struct ec_device_selection_config *config)
+{
+	if (sb == NULL || config == NULL) {
+		return;
+	}
+
+	sb->wear_cfg.wear_leveling_enabled = config->wear_leveling_enabled ? 1 : 0;
+	sb->wear_cfg.stripe_group_size = config->stripe_group_size;
+	sb->wear_cfg.selection_seed = config->selection_seed;
+}
+
+/*
+ * Load wear leveling configuration from superblock reserved field
+ */
+void
+ec_bdev_sb_load_wear_leveling_config(const struct ec_bdev_superblock *sb,
+				     struct ec_device_selection_config *config)
+{
+	if (sb == NULL || config == NULL) {
+		return;
+	}
+
+	if (sb->wear_cfg.stripe_group_size != 0 || sb->wear_cfg.selection_seed != 0 ||
+	    sb->wear_cfg.wear_leveling_enabled != 0) {
+		config->wear_leveling_enabled = (sb->wear_cfg.wear_leveling_enabled != 0);
+		config->stripe_group_size = sb->wear_cfg.stripe_group_size;
+		config->selection_seed = sb->wear_cfg.selection_seed;
+	} else {
+		config->wear_leveling_enabled = false;
+		config->stripe_group_size = 0;
+		config->selection_seed = 0;
+	}
+}
+
+void
+ec_bdev_sb_save_selection_metadata(struct ec_bdev *ec_bdev)
+{
+	struct ec_bdev_superblock *sb = ec_bdev->sb;
+	struct ec_device_selection_config *config = &ec_bdev->selection_config;
+	size_t base_section_len;
+	size_t profile_region_len = ec_bdev_sb_profile_region_size();
+	size_t group_map_len = 0;
+	int rc;
+	uint32_t i;
+
+	if (config->group_profile_map != NULL && config->num_stripe_groups > 0) {
+		group_map_len = config->num_stripe_groups * sizeof(uint16_t);
+	}
+
+	base_section_len = sizeof(*sb) + sizeof(struct ec_bdev_sb_base_bdev) * sb->base_bdevs_size;
+	rc = ec_bdev_sb_reserve_buffer(ec_bdev, base_section_len + profile_region_len + group_map_len);
+	if (rc != 0) {
+		SPDK_ERRLOG("EC bdev %s: Failed to grow superblock buffer: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-rc));
+		return;
+	}
+
+	sb = ec_bdev->sb;
+	sb->profile_region_offset = base_section_len;
+	sb->profile_region_length = profile_region_len;
+	sb->group_map_offset = sb->profile_region_offset + sb->profile_region_length;
+	sb->group_map_length = group_map_len;
+	sb->total_profile_slots = EC_MAX_WEAR_PROFILES;
+	sb->latest_profile_id = (config->next_profile_id > 0) ? (config->next_profile_id - 1) : 0;
+	sb->length = sb->group_map_offset + sb->group_map_length;
+
+	/* Serialize wear profiles */
+	struct ec_sb_profile_slot_disk *slots = ec_bdev_sb_get_profile_region(sb);
+	if (slots != NULL) {
+		for (i = 0; i < EC_MAX_WEAR_PROFILES; i++) {
+			const struct ec_wear_profile_slot *src = &config->wear_profiles[i];
+			struct ec_sb_profile_slot_disk *dst = &slots[i];
+
+			dst->profile_id = src->profile_id;
+			dst->valid = src->valid ? 1 : 0;
+			memcpy(dst->wear_levels, src->wear_levels, sizeof(dst->wear_levels));
+		}
+	}
+
+	/* Serialize stripe group map */
+	if (sb->group_map_length > 0 && config->group_profile_map != NULL) {
+		void *dst = ec_bdev_sb_get_group_map(sb);
+		memcpy(dst, config->group_profile_map, sb->group_map_length);
+	}
+
+	/* Save basic wear leveling config (enabled, stripe_group_size, seed) */
+	ec_bdev_sb_save_wear_leveling_config(sb, config);
+}
+
+void
+ec_bdev_sb_load_selection_metadata(struct ec_bdev *ec_bdev,
+				   const struct ec_bdev_superblock *sb)
+{
+	struct ec_device_selection_config *config = &ec_bdev->selection_config;
+	const struct ec_sb_profile_slot_disk *slots;
+	uint32_t i;
+	uint16_t max_profile_id = 0;
+
+	if (sb == NULL) {
+		return;
+	}
+
+	/* Load wear profiles */
+	slots = ec_bdev_sb_get_profile_region_const(sb);
+	if (slots != NULL && sb->profile_region_length >= ec_bdev_sb_profile_region_size()) {
+		for (i = 0; i < EC_MAX_WEAR_PROFILES; i++) {
+			struct ec_wear_profile_slot *dst = &config->wear_profiles[i];
+			const struct ec_sb_profile_slot_disk *src = &slots[i];
+
+			dst->profile_id = src->profile_id;
+			dst->valid = (src->valid != 0);
+			memcpy(dst->wear_levels, src->wear_levels, sizeof(dst->wear_levels));
+			memset(dst->wear_weights, 0, sizeof(dst->wear_weights));
+
+			if (dst->profile_id > max_profile_id && dst->valid) {
+				max_profile_id = dst->profile_id;
+			}
+		}
+		config->wear_profile_count = EC_MAX_WEAR_PROFILES;
+		config->next_profile_id = max_profile_id + 1;
+		config->active_profile_id = sb->latest_profile_id;
+	} else {
+		config->wear_profile_count = 0;
+		config->active_profile_id = 0;
+		config->next_profile_id = 1;
+	}
+
+	/* Load stripe group profile map */
+	if (sb->group_map_length > 0 && config->group_profile_map != NULL &&
+	    config->num_stripe_groups > 0) {
+		size_t expected_len = config->num_stripe_groups * sizeof(uint16_t);
+		size_t copy_len = spdk_min(expected_len, (size_t)sb->group_map_length);
+		const void *src = ec_bdev_sb_get_group_map_const(sb);
+
+		memcpy(config->group_profile_map, src, copy_len);
+
+		if (copy_len < expected_len) {
+			memset((uint8_t *)config->group_profile_map + copy_len, 0,
+			       expected_len - copy_len);
+		}
+	} else if (config->group_profile_map != NULL && config->num_stripe_groups > 0) {
+		memset(config->group_profile_map, 0,
+		       config->num_stripe_groups * sizeof(uint16_t));
+	}
 }
 
 /*
@@ -261,9 +550,9 @@ ec_bdev_parse_superblock(struct ec_bdev_read_sb_ctx *ctx)
 	}
 
 	/* Check length before processing */
-	if (sb->length > EC_BDEV_SB_MAX_LENGTH) {
+	if (sb->length > EC_BDEV_SB_MAX_SUPPORTED_LENGTH) {
 		SPDK_ERRLOG("Superblock length %u exceeds maximum %zu on bdev %s\n",
-			    sb->length, (size_t)EC_BDEV_SB_MAX_LENGTH, spdk_bdev_get_name(bdev));
+			    sb->length, (size_t)EC_BDEV_SB_MAX_SUPPORTED_LENGTH, spdk_bdev_get_name(bdev));
 		return -EINVAL;
 	}
 
@@ -332,7 +621,7 @@ ec_bdev_read_sb_remainder(struct ec_bdev_read_sb_ctx *ctx)
 	int rc;
 
 	buf_size_prev = ctx->buf_size;
-	ctx->buf_size = spdk_divide_round_up(spdk_min(sb->length, EC_BDEV_SB_MAX_LENGTH),
+	ctx->buf_size = spdk_divide_round_up(spdk_min((uint32_t)sb->length, (uint32_t)EC_BDEV_SB_MAX_SUPPORTED_LENGTH),
 					     spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
 	buf = spdk_dma_realloc(ctx->buf, ctx->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
 	if (buf == NULL) {
@@ -533,7 +822,9 @@ ec_bdev_write_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb, void *
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 	assert(sb != NULL);
-	assert(cb != NULL);
+	if (cb == NULL) {
+		cb = ec_bdev_write_superblock_noop_cb;
+	}
 
 	if (ec_bdev->sb_io_buf == NULL) {
 		rc = ec_bdev_alloc_sb_io_buf(ec_bdev);
@@ -711,6 +1002,7 @@ err:
 struct ec_bdev_wipe_single_sb_ctx {
 	struct ec_base_bdev_info *base_info;
 	void *zero_buf;
+	bool use_global_buf;  /* True if using global zero buffer, false if allocated */
 	ec_base_bdev_cb cb;
 	void *cb_ctx;
 };
@@ -735,8 +1027,8 @@ ec_bdev_wipe_single_base_bdev_sb_cb(struct spdk_bdev_io *bdev_io, bool success, 
 
 	spdk_bdev_free_io(bdev_io);
 
-	/* Free the zero buffer */
-	if (ctx->zero_buf != NULL) {
+	/* Free the zero buffer only if it was dynamically allocated */
+	if (ctx->zero_buf != NULL && !ctx->use_global_buf) {
 		spdk_dma_free(ctx->zero_buf);
 	}
 
@@ -788,25 +1080,40 @@ ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
 	ctx->cb = cb;
 	ctx->cb_ctx = cb_ctx;
 
-	/* Allocate zero buffer for wiping */
-	ctx->zero_buf = spdk_dma_malloc(ec_bdev->sb_io_buf_size, 0x1000, NULL);
-	if (ctx->zero_buf == NULL) {
-		SPDK_ERRLOG("Failed to allocate buffer for wiping superblock\n");
-		free(ctx);
-		if (cb != NULL) {
-			cb(cb_ctx, -ENOMEM);
+	/* Use global zero buffer if available and size is sufficient
+	 * Otherwise, allocate a temporary buffer
+	 * This optimization reduces allocation overhead for common cases
+	 */
+	if (g_ec_zero_buf != NULL && ec_bdev->sb_io_buf_size <= EC_ZERO_BUFFER_SIZE) {
+		/* Use global zero buffer - no need to allocate or memset */
+		ctx->zero_buf = g_ec_zero_buf;
+		ctx->use_global_buf = true;
+		/* Ensure the buffer is zeroed (it should already be, but be safe) */
+		memset(ctx->zero_buf, 0, ec_bdev->sb_io_buf_size);
+	} else {
+		/* Global buffer not available or too small - allocate temporary buffer */
+		ctx->zero_buf = spdk_dma_malloc(ec_bdev->sb_io_buf_size, EC_BDEV_DEFAULT_BUF_ALIGNMENT, NULL);
+		if (ctx->zero_buf == NULL) {
+			SPDK_ERRLOG("Failed to allocate buffer for wiping superblock\n");
+			free(ctx);
+			if (cb != NULL) {
+				cb(cb_ctx, -ENOMEM);
+			}
+			return -ENOMEM;
 		}
-		return -ENOMEM;
+		ctx->use_global_buf = false;
+		memset(ctx->zero_buf, 0, ec_bdev->sb_io_buf_size);
 	}
-
-	memset(ctx->zero_buf, 0, ec_bdev->sb_io_buf_size);
 
 	/* Write zeros to superblock area */
 	rc = spdk_bdev_write(base_info->desc, base_info->app_thread_ch,
 			     ctx->zero_buf, 0, ec_bdev->sb_io_buf_size,
 			     ec_bdev_wipe_single_base_bdev_sb_cb, ctx);
 	if (rc != 0) {
-		spdk_dma_free(ctx->zero_buf);
+		/* Free buffer only if it was dynamically allocated */
+		if (!ctx->use_global_buf && ctx->zero_buf != NULL) {
+			spdk_dma_free(ctx->zero_buf);
+		}
 		free(ctx);
 		if (rc == -ENOMEM) {
 			SPDK_WARNLOG("I/O queue full, cannot wipe superblock immediately\n");

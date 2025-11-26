@@ -971,7 +971,7 @@ mem_map_mem_event_callback_register(void)
 {
 	int rc;
 
-	rc = rte_mem_event_callback_register("spdk", memory_hotplug_cb, NULL);
+	rc = rte_mem_event_callback_register("mimo", memory_hotplug_cb, NULL);
 	if (rc != 0) {
 		return rc;
 	}
@@ -985,7 +985,7 @@ mem_map_mem_event_callback_unregister(void)
 {
 	if (g_mem_event_cb_registered) {
 		g_mem_event_cb_registered = false;
-		rte_mem_event_callback_unregister("spdk", NULL);
+		rte_mem_event_callback_unregister("mimo", NULL);
 	}
 }
 

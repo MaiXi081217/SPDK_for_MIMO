@@ -7,6 +7,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 include $(SPDK_ROOT_DIR)/mk/spdk.lib_deps.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
 DIRS-y += bdev blob conf dma accel event json jsonrpc \
           log lvol rpc sock thread trace util nvme vmd nvmf scsi \
@@ -43,9 +44,16 @@ ifeq ($(abspath $(CONFIG_ENV)),$(SPDK_ROOT_DIR)/lib/$(ENV_NAME))
 DIRS-y += $(ENV_NAME)
 endif
 
-.PHONY: all clean $(DIRS-y)
+.PHONY: all clean $(DIRS-y) $(GO_NOTIFY_LIB)
 
-all: $(DIRS-y)
+all: $(DIRS-y) $(GO_NOTIFY_LIB)
+
+$(GO_NOTIFY_LIB):
+	@echo "  GO BUILD $(notdir $@)"
+	$(Q)mkdir -p $(GO_NOTIFY_LIB_DIR)
+	$(Q)cd $(GO_NOTIFY_SRC_DIR) && go build -buildmode=c-shared -o $(GO_NOTIFY_LIB) .
+
 clean: $(DIRS-y)
+	$(Q)rm -f $(GO_NOTIFY_LIB)
 
 include $(SPDK_ROOT_DIR)/mk/spdk.subdirs.mk

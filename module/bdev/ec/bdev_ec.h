@@ -7,14 +7,101 @@
 #define SPDK_BDEV_EC_H
 
 #include "spdk/bdev_module.h"
+#include "spdk/thread.h"
 #include "spdk/uuid.h"
+#include "spdk/env.h"
 #include <isa-l/erasure_code.h>
 
-#define EC_BDEV_MIN_DATA_OFFSET_SIZE	(1024*1024) /* 1 MiB */
+#define EC_BDEV_MIN_DATA_OFFSET_SIZE	(1024*1024) /* 1 MiB (minimum metadata reservation) */
 
 /* Maximum k and p values for EC */
 #define EC_MAX_K 255
 #define EC_MAX_P 255
+
+/* Buffer pool configuration */
+#define EC_BDEV_DEFAULT_BUF_ALIGNMENT	0x1000	/* 4KB default alignment */
+#define EC_BDEV_PARITY_BUF_POOL_MAX	128	/* Maximum parity buffers in pool */
+#define EC_BDEV_RMW_BUF_POOL_MAX	64	/* Maximum RMW stripe buffers in pool */
+#define EC_BDEV_TEMP_DATA_BUF_POOL_MAX	32	/* Maximum temporary data buffers in pool */
+#define EC_BDEV_BITMAP_SIZE_LIMIT	64	/* Bitmap size limit for fast lookup */
+#define EC_MAX_ENCODE_WORKERS	2	/* Default number of dedicated encoding workers */
+
+/* Invalid offset marker */
+#define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
+
+/* RPC configuration */
+#define EC_RPC_MAX_BASE_BDEVS		255	/* Maximum base bdevs in RPC */
+#define EC_MAX_BASE_BDEVS		255	/* Maximum base bdevs for device selection */
+#define EC_ASSIGNMENT_CACHE_DEFAULT_CAPACITY	16384  /* Default stripe assignment cache size (~8.5MB, must be power of two) */
+
+/* Forward declaration */
+struct ec_bdev;
+struct ec_assignment_cache_entry;
+
+struct ec_assignment_cache {
+	struct ec_assignment_cache_entry *entries;
+	uint32_t capacity;
+	uint32_t mask;
+	bool initialized;
+	struct spdk_spinlock lock;
+};
+
+/* Wear profile management */
+#define EC_MAX_WEAR_PROFILES	256
+#define EC_GROUP_PROFILE_INVALID	0
+#define EC_GROUP_MAP_FLUSH_THRESHOLD	1024
+#define EC_GROUP_MAP_FLUSH_MAX_RETRIES	3
+
+struct ec_wear_profile_slot {
+	uint16_t profile_id;
+	uint16_t reserved;
+	bool valid;
+	uint32_t wear_levels[EC_MAX_BASE_BDEVS];
+	uint32_t wear_weights[EC_MAX_BASE_BDEVS];
+};
+
+/* Device selection strategy configuration */
+struct ec_device_selection_config {
+	/* Wear leveling (static, read once at initialization) */
+	bool wear_leveling_enabled;
+	uint32_t wear_levels[EC_MAX_BASE_BDEVS];   /* Static wear values */
+	uint32_t wear_weights[EC_MAX_BASE_BDEVS];  /* Computed weights */
+	
+	/* Fault tolerance for wear leveling (内置在磨损均衡算法中) */
+	uint8_t stripe_group_size;  /* Stripe group size for fault tolerance (usually = num_base_bdevs) */
+	
+	/* Deterministic algorithm parameters */
+	uint32_t selection_seed;  /* Seed for deterministic selection */
+	
+	/* Device selection function pointer */
+	int (*select_fn)(struct ec_bdev *ec_bdev,
+			uint64_t stripe_index,
+			uint8_t *data_indices,
+			uint8_t *parity_indices);
+
+	/* Wear profile tracking */
+	uint16_t active_profile_id;
+	uint16_t next_profile_id;
+	uint32_t wear_profile_count;
+	struct ec_wear_profile_slot wear_profiles[EC_MAX_WEAR_PROFILES];
+
+	/* Stripe group profile map */
+	uint16_t *group_profile_map;
+	uint32_t num_stripe_groups;
+	uint32_t group_profile_capacity;
+	bool group_map_dirty;
+	uint32_t group_map_dirty_count;
+	bool group_map_flush_in_progress;
+	uint64_t group_map_dirty_version;
+	uint64_t group_map_flush_version;
+	uint32_t group_map_flush_retries;
+	
+	/* Debug flags */
+	bool debug_enabled;  /* Enable debug logging */
+
+	/* Deterministic stripe assignment cache (accelerates fault tolerance checks) */
+	struct ec_assignment_cache assignment_cache;
+};
 
 /*
  * EC bdev state
@@ -134,6 +221,18 @@ struct ec_bdev_io {
 	uint8_t				base_bdev_io_submitted;
 	enum spdk_bdev_io_status	base_bdev_io_status;
 	enum spdk_bdev_io_status	base_bdev_io_status_default;
+	
+	/* Optimized: Map base bdev I/O to index for O(1) lookup in completion callback
+	 * This array stores the base_bdev_idx for each submitted I/O
+	 * Index in array corresponds to submission order (0 to base_bdev_io_submitted-1)
+	 */
+	uint8_t				base_bdev_idx_map[EC_MAX_K + EC_MAX_P];
+	
+	/* Optimized: Direct base_info pointer map for true O(1) lookup in completion callback
+	 * This eliminates the need for bdev pointer comparison in hot path
+	 * Index corresponds to submission order, matches base_bdev_idx_map
+	 */
+	struct ec_base_bdev_info	*base_info_map[EC_MAX_K + EC_MAX_P];
 
 	/* Private data for the EC module */
 	void				*module_private;
@@ -199,6 +298,7 @@ struct ec_bdev {
 	/* Superblock */
 	bool				superblock_enabled;
 	struct ec_bdev_superblock	*sb;
+	size_t				sb_buffer_capacity;
 
 	/* Superblock buffer used for I/O */
 	void				*sb_io_buf;
@@ -215,9 +315,6 @@ struct ec_bdev {
 	ec_bdev_destruct_cb		deconfigure_cb_fn;
 	void				*deconfigure_cb_arg;
 
-	/* Extension interface for external modules (e.g., FTL for wear leveling) */
-	struct ec_bdev_extension_if	*extension_if;
-
 	/* Buffer alignment requirement for memory allocations */
 	size_t				buf_alignment;
 
@@ -226,6 +323,9 @@ struct ec_bdev {
 
 	/* Rebuild state and context */
 	struct ec_rebuild_context	*rebuild_ctx;
+	
+	/* Device selection strategy configuration */
+	struct ec_device_selection_config selection_config;
 };
 
 #define EC_FOR_EACH_BASE_BDEV(e, i) \
@@ -251,119 +351,41 @@ struct ec_bdev_io_channel {
 	/* Buffer pool for RMW stripe buffers */
 	SLIST_HEAD(, ec_parity_buf_entry)	rmw_stripe_buf_pool;
 	
+	/* Optimized: Buffer pool for temporary data buffers (cross-iov data) */
+	SLIST_HEAD(, ec_parity_buf_entry)	temp_data_buf_pool;
+	
 	/* Number of buffers in pool */
 	uint32_t			parity_buf_count;
 	uint32_t			rmw_buf_count;
+	uint32_t			temp_data_buf_count;
 	
 	/* Buffer size for parity buffers */
 	uint32_t			parity_buf_size;
 	
 	/* Buffer size for RMW stripe buffers */
 	uint32_t			rmw_buf_size;
+	
+	/* Buffer size for temporary data buffers */
+	uint32_t			temp_data_buf_size;
+	
+	/* Optimized: Cached alignment value to avoid repeated lookups from ec_bdev
+	 * This reduces memory access overhead in hot path (buffer allocation)
+	 */
+	size_t				cached_alignment;
+	
+	/* RAID5F-style object pool for stripe_private structures
+	 * Pre-allocated stripe_private objects to avoid malloc overhead
+	 */
+	TAILQ_HEAD(, ec_stripe_private)	free_stripe_privs;
+	
+	/* RAID5F-style: For async encoding retry queue (if encoding resources unavailable) */
+	TAILQ_HEAD(, ec_stripe_private)	encode_retry_queue;
 };
 
 /* TAIL head for EC bdev list */
 TAILQ_HEAD(ec_all_tailq, ec_bdev);
 
 extern struct ec_all_tailq		g_ec_bdev_list;
-
-/*
- * EC bdev extension interface for external modules (e.g., FTL for wear leveling)
- * This interface allows external modules to control I/O distribution based on
- * wear leveling or other policies.
- */
-struct ec_bdev_extension_if;
-
-/*
- * Callback to select base bdev indices for data blocks based on wear leveling
- * or other policies. This allows external modules (e.g., FTL) to control
- * which disks receive data based on wear statistics.
- * params:
- * ext_if - extension interface
- * ec_bdev - EC bdev
- * offset_blocks - logical offset in blocks
- * num_blocks - number of blocks
- * data_indices - output array of base bdev indices for data blocks (size k)
- * parity_indices - output array of base bdev indices for parity blocks (size p)
- * ctx - extension context
- * returns:
- * 0 on success, non-zero on failure
- */
-typedef int (*ec_ext_select_base_bdevs_fn)(struct ec_bdev_extension_if *ext_if,
-					    struct ec_bdev *ec_bdev,
-					    uint64_t offset_blocks,
-					    uint32_t num_blocks,
-					    uint8_t *data_indices,
-					    uint8_t *parity_indices,
-					    void *ctx);
-
-/*
- * Callback to get wear level information for a base bdev
- * This allows external modules to provide wear statistics
- * params:
- * ext_if - extension interface
- * ec_bdev - EC bdev
- * base_info - base bdev info
- * wear_level - output wear level (0-100, 0 = no wear, 100 = maximum wear)
- * ctx - extension context
- * returns:
- * 0 on success, non-zero on failure
- */
-typedef int (*ec_ext_get_wear_level_fn)(struct ec_bdev_extension_if *ext_if,
-					 struct ec_bdev *ec_bdev,
-					 struct ec_base_bdev_info *base_info,
-					 uint8_t *wear_level,
-					 void *ctx);
-
-/*
- * Callback to notify I/O completion for wear level tracking
- * This allows external modules to update wear statistics
- * params:
- * ext_if - extension interface
- * ec_bdev - EC bdev
- * base_info - base bdev info that handled the I/O
- * offset_blocks - logical offset in blocks
- * num_blocks - number of blocks
- * is_write - true if write operation, false if read
- * ctx - extension context
- * returns:
- * none
- */
-typedef void (*ec_ext_notify_io_complete_fn)(struct ec_bdev_extension_if *ext_if,
-					      struct ec_bdev *ec_bdev,
-					      struct ec_base_bdev_info *base_info,
-					      uint64_t offset_blocks,
-					      uint32_t num_blocks,
-					      bool is_write,
-					      void *ctx);
-
-/*
- * EC bdev extension interface
- * External modules (e.g., FTL) can register this interface to control
- * I/O distribution and wear leveling.
- */
-struct ec_bdev_extension_if {
-	/* Name of the extension module */
-	const char *name;
-
-	/* Context for extension module */
-	void *ctx;
-
-	/* Callback to select base bdevs for data/parity blocks */
-	ec_ext_select_base_bdevs_fn select_base_bdevs;
-
-	/* Callback to get wear level information */
-	ec_ext_get_wear_level_fn get_wear_level;
-
-	/* Callback to notify I/O completion */
-	ec_ext_notify_io_complete_fn notify_io_complete;
-
-	/* Optional: callback to initialize extension */
-	int (*init)(struct ec_bdev_extension_if *ext_if, struct ec_bdev *ec_bdev);
-
-	/* Optional: callback to cleanup extension */
-	void (*fini)(struct ec_bdev_extension_if *ext_if, struct ec_bdev *ec_bdev);
-};
 
 /*
  * EC bdev module private data
@@ -386,6 +408,15 @@ struct ec_bdev_module_private {
 
 	/* Decode index array */
 	unsigned char decode_index[EC_MAX_K + EC_MAX_P];
+
+	/* Dedicated encoding worker threads (optional) */
+	struct {
+		struct spdk_thread *threads[EC_MAX_ENCODE_WORKERS];
+		uint32_t count;
+		uint32_t next_rr;
+		uint32_t active_tasks;
+		bool enabled;
+	} encode_workers;
 };
 
 int ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
@@ -403,17 +434,13 @@ int ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn,
 void ec_bdev_fail_base_bdev(struct ec_base_bdev_info *base_info);
 int ec_bdev_gen_decode_matrix(struct ec_bdev *ec_bdev, uint8_t *frag_err_list, int nerrs);
 
-/* Extension interface functions */
-int ec_bdev_register_extension(struct ec_bdev *ec_bdev, struct ec_bdev_extension_if *ext_if);
-void ec_bdev_unregister_extension(struct ec_bdev *ec_bdev);
-struct ec_bdev_extension_if *ec_bdev_get_extension(struct ec_bdev *ec_bdev);
-
 /*
  * Definitions related to EC bdev superblock
  */
 #define EC_BDEV_SB_VERSION_MAJOR	1
-#define EC_BDEV_SB_VERSION_MINOR	0
+#define EC_BDEV_SB_VERSION_MINOR	1
 #define EC_BDEV_SB_NAME_SIZE		64
+#define EC_BDEV_SB_MAX_SUPPORTED_LENGTH	(64ULL * 1024 * 1024)
 
 enum ec_bdev_sb_base_bdev_state {
 	EC_SB_BASE_BDEV_MISSING	= 0,
@@ -479,7 +506,22 @@ struct ec_bdev_superblock {
 	/* number of parity blocks (p) */
 	uint8_t			p;
 
-	uint8_t			reserved[115];
+	struct {
+		uint8_t			wear_leveling_enabled;
+		uint8_t			stripe_group_size;
+		uint16_t		reserved16;
+		uint32_t		selection_seed;
+	} wear_cfg;
+
+	/* Extended metadata offsets (relative to start of superblock buffer) */
+	uint32_t		profile_region_offset;
+	uint32_t		profile_region_length;
+	uint32_t		group_map_offset;
+	uint32_t		group_map_length;
+	uint32_t		latest_profile_id;
+	uint32_t		total_profile_slots;
+
+	uint8_t			reserved[83];
 
 	/* size of the base bdevs array */
 	uint8_t			base_bdevs_size;
@@ -488,10 +530,7 @@ struct ec_bdev_superblock {
 };
 SPDK_STATIC_ASSERT(sizeof(struct ec_bdev_superblock) == 256, "incorrect size");
 
-#define EC_BDEV_SB_MAX_LENGTH (sizeof(struct ec_bdev_superblock) + UINT8_MAX * sizeof(struct ec_bdev_sb_base_bdev))
-
-SPDK_STATIC_ASSERT(EC_BDEV_SB_MAX_LENGTH < EC_BDEV_MIN_DATA_OFFSET_SIZE,
-		   "Incorrect min data offset");
+#define EC_BDEV_SB_BASE_SECTION_LENGTH (sizeof(struct ec_bdev_superblock) + UINT8_MAX * sizeof(struct ec_bdev_sb_base_bdev))
 
 typedef void (*ec_bdev_write_sb_cb)(int status, struct ec_bdev *ec_bdev, void *ctx);
 typedef void (*ec_bdev_load_sb_cb)(const struct ec_bdev_superblock *sb, int status, void *ctx);
@@ -503,6 +542,12 @@ void ec_bdev_write_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb,
 			       void *cb_ctx);
 void ec_bdev_wipe_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb,
 			     void *cb_ctx);
+int ec_bdev_sb_reserve_buffer(struct ec_bdev *ec_bdev, size_t required_length);
+void ec_bdev_sb_save_selection_metadata(struct ec_bdev *ec_bdev);
+void ec_bdev_sb_load_selection_metadata(struct ec_bdev *ec_bdev,
+					const struct ec_bdev_superblock *sb);
+void ec_bdev_sb_load_wear_leveling_config(const struct ec_bdev_superblock *sb,
+					  struct ec_device_selection_config *config);
 int ec_bdev_wipe_single_base_bdev_superblock(struct ec_base_bdev_info *base_info,
 					     ec_base_bdev_cb cb, void *cb_ctx);
 int ec_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,

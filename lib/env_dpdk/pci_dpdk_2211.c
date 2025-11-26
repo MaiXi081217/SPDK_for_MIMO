@@ -132,7 +132,7 @@ pci_driver_register_2211(struct spdk_pci_driver *driver,
 		return -ENOMEM;
 	}
 
-	snprintf(rte_name, rte_name_len, "spdk_%s", driver->name);
+	snprintf(rte_name, rte_name_len, "mimo_%s", driver->name);
 	driver->driver->driver.name = rte_name;
 	driver->driver->id_table = rte_id_table;
 

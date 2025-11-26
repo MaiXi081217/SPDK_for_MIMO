@@ -269,7 +269,7 @@ main(int argc, char **argv)
 	}
 
 	if (spdk_env_init(&opts) < 0) {
-		fprintf(stderr, "Unable to initialize SPDK env\n");
+		fprintf(stderr, "Unable to initialize MIMO env\n");
 		exit(1);
 	}
 

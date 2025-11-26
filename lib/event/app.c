@@ -755,7 +755,7 @@ unclaim_cpu_cores(uint32_t *failed_core)
 
 	for (i = 0; i < SPDK_CONFIG_MAX_LCORES; i++) {
 		if (g_core_locks[i] != -1 && g_core_locks[i] != 0) {
-			snprintf(core_name, sizeof(core_name), "/var/tmp/spdk_cpu_lock_%03d", i);
+			snprintf(core_name, sizeof(core_name), "/var/tmp/mimo_cpu_lock_%03d", i);
 			rc = close(g_core_locks[i]);
 			if (rc) {
 				SPDK_ERRLOG("Failed to close lock fd for core %d, errno: %d\n", i, errno);
@@ -802,7 +802,7 @@ claim_cpu_cores(uint32_t *failed_core)
 			continue;
 		}
 
-		snprintf(core_name, sizeof(core_name), "/var/tmp/spdk_cpu_lock_%03d", core);
+		snprintf(core_name, sizeof(core_name), "/var/tmp/mimo_cpu_lock_%03d", core);
 		core_fd = open(core_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
 		if (core_fd == -1) {
 			SPDK_ERRLOG("Could not open %s (%s).\n", core_name, spdk_strerror(errno));
@@ -1193,7 +1193,7 @@ usage(void (*app_usage)(void))
 
 	printf("\nOther options:\n");
 	printf(" -h, --help                show this usage\n");
-	printf(" -v, --version             print SPDK version\n");
+	printf(" -v, --version             print MIMO version\n");
 	printf(" -d, --limit-coredump      do not set max coredump size to RLIM_INFINITY\n");
 	printf("     --env-context         Opaque context for use of the env implementation\n");
 
