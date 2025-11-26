@@ -31,7 +31,7 @@ MIMO 是基于 SPDK 深度定制的高性能存储框架，核心目标包括：
 9. **2025-10-20 · 0c93263 – Re-add submodules properly**：重新正确添加全部子模块引用，修复上一阶段的初始化问题。
 10. **2025-10-21 · f88f709 – update dpdk submodule to spdk-25.03**：把 dpdk 子模块切换到 `spdk-25.03`，锁定可靠版本。
 11. **2025-10-24 · c1b426d – feat: 实现VERSION.json版本管理**：合并了版本管理相关提交，包括添加VERSION文件、更新为JSON格式、删除旧格式、确保Make流程引用。
-15. **2025-10-30 · c3d9394 – 删除test的编译，并修改sock名称**：大幅删除上游文档、测试和示例（重达 20 万行），同时改动顶层 `Makefile` 与若干脚本，使仓库更轻量并调整 sock 命名。
+12. **2025-10-30 · c3d9394 – 删除test的编译，并修改sock名称**：大幅删除上游文档、测试和示例（重达 20 万行），同时改动顶层 `Makefile` 与若干脚本，使仓库更轻量并调整 sock 命名。
 16. **2025-10-30 · ad98c00 – 修改配置文件默认不编译test**：在 `configure` 中默认关闭 test 相关构建，持续压缩依赖。
 17. **2025-10-30 · 813b291 – 修改Makefile的编译程序命名**：微调 `app/spdk_tgt/Makefile`，统一编译生成的程序名为 `mimo_tgt`。
 18. **2025-10-31 · ddbadf5 – 修改无法获取sock问题**：在 `include/spdk/init.h` 修正 socket 获取逻辑，防止初始化失败。
@@ -53,17 +53,17 @@ MIMO 是基于 SPDK 深度定制的高性能存储框架，核心目标包括：
 34. **2025-11-17 · 82e8f8c – 保存所有当前更改**：一次性提交大量文档（包括 FTL 计划、EC 详细指南、demo 教程）及 demo 程序，形成完整学习资料。
 35. **2025-11-17 · 3330a62 – Simplify wear leveling mode handling**：调优 wear-leveling 模式切换逻辑与头文件接口，同时在 Python CLI 中同步行为。
 36. **2025-11-18 · 3ab4483 – feat: 实现RAID模块重建功能改进**：记录重建状态到 superblock、提供 JSON 进度 API、增加状态机/回调、引入恢复文档并修正 wear-leveling 依赖。
-38. **2025-11-18 · 5409926 – 添加RAID/EC/磨损均衡单测**：编写 35 个场景的 `bdev_raid_ec_wear_test.c` 及配套 Makefile/文档，覆盖重建、热插拔与磨损模式。
-39. **2025-11-18 · e630707 – fix: 修复测试框架编译和链接问题**：合并了10个测试修复提交，统一解决测试框架的编译和链接问题，包括修复测试文件编译错误、修复静态函数调用、添加mock函数和依赖、修复unittest.mk配置、调整链接顺序等。
-49. **2025-11-18 · 8f9700f – 添加 RPC 测试命令**：编写 `bdev_raid_test_rpc.c` / `bdev_ec_test_rpc.c`，提供创建、验证、重建进度等 RPC 场景以支撑测试。
-50. **2025-11-18 · 99a293c – 将 bdev_raid_test_rpc.c 加入 Makefile**：确保新增 RPC 被 RAID 模块编译进来。
-51. **2025-11-19 · 9e115f8 – update**：把所有 RPC 测试集中到 `lib/bdev/bdev_test_rpc.c`，移除旧的单测、脚本与文档，并适配 Makefile / CLI。
-52. **2025-11-19 · 528a236 – 优化EC磨损分布代码**：抽取统一的 base bdev 选择辅助函数，重构 encode/io/sb 多处代码，减少重复并提升可读性。
-53. **2025-11-19 · d002c51 – Merge branch 'raid-rebuild-improvements' into feature**：合并 RAID 重建分支，整合新的 bdev 测试 RPC、EC helper、python CLI 以及 unittest 构建修复。
-54. **2025-11-19 · 2965f97 – 全面更新**：继续扩展 `bdev_test_rpc.c`、调整 EC encode/io/internal/ RPC，强化测试命令覆盖与入参校验。
-55. **2025-11-19 · c3f7f2d – 实现了 Go 调用仓库**：新增 `go/notifybridge`（含 README、示例配置、模块依赖）及 C 头文件/入口，把 Go 进程桥接到 `mimo_tgt`。
-56. **2025-11-19 · ee99cbd – Add Go notify hook for NVMe removal**：把 Go 钩子整合进通用 `mk/spdk.app.mk`，并在 `bdev_nvme.c` 中触发 NVMe 删除事件通知，同时精简 `mimo_tgt` Makefile。
-57. **2025-11-20 · 831446d – 将用户可见输出中的 spdk 改为 mimo 并更新通知端口为 9988**：全面更新所有用户可见输出（日志、错误消息、帮助信息、文件路径等）为 MIMO 品牌标识，并实现 Go 通知桥接的 JSON 配置文件支持，支持通过配置文件或环境变量灵活配置所有参数。
+37. **2025-11-18 · 5409926 – 添加RAID/EC/磨损均衡单测**：编写 35 个场景的 `bdev_raid_ec_wear_test.c` 及配套 Makefile/文档，覆盖重建、热插拔与磨损模式。
+38. **2025-11-18 · e630707 – fix: 修复测试框架编译和链接问题**：合并了10个测试修复提交，统一解决测试框架的编译和链接问题，包括修复测试文件编译错误、修复静态函数调用、添加mock函数和依赖、修复unittest.mk配置、调整链接顺序等。
+39. **2025-11-18 · 8f9700f – 添加 RPC 测试命令**：编写 `bdev_raid_test_rpc.c` / `bdev_ec_test_rpc.c`，提供创建、验证、重建进度等 RPC 场景以支撑测试。
+40. **2025-11-18 · 99a293c – 将 bdev_raid_test_rpc.c 加入 Makefile**：确保新增 RPC 被 RAID 模块编译进来。
+41. **2025-11-19 · 9e115f8 – update**：把所有 RPC 测试集中到 `lib/bdev/bdev_test_rpc.c`，移除旧的单测、脚本与文档，并适配 Makefile / CLI。
+42. **2025-11-19 · 528a236 – 优化EC磨损分布代码**：抽取统一的 base bdev 选择辅助函数，重构 encode/io/sb 多处代码，减少重复并提升可读性。
+43. **2025-11-19 · d002c51 – Merge branch 'raid-rebuild-improvements' into feature**：合并 RAID 重建分支，整合新的 bdev 测试 RPC、EC helper、python CLI 以及 unittest 构建修复。
+44. **2025-11-19 · 2965f97 – 全面更新**：继续扩展 `bdev_test_rpc.c`、调整 EC encode/io/internal/ RPC，强化测试命令覆盖与入参校验。
+45. **2025-11-19 · c3f7f2d – 实现了 Go 调用仓库**：新增 `go/notifybridge`（含 README、示例配置、模块依赖）及 C 头文件/入口，把 Go 进程桥接到 `mimo_tgt`。
+46. **2025-11-19 · ee99cbd – Add Go notify hook for NVMe removal**：把 Go 钩子整合进通用 `mk/spdk.app.mk`，并在 `bdev_nvme.c` 中触发 NVMe 删除事件通知，同时精简 `mimo_tgt` Makefile。
+47. **2025-11-20 · 831446d – 将用户可见输出中的 spdk 改为 mimo 并更新通知端口为 9988**：全面更新所有用户可见输出（日志、错误消息、帮助信息、文件路径等）为 MIMO 品牌标识，并实现 Go 通知桥接的 JSON 配置文件支持，支持通过配置文件或环境变量灵活配置所有参数。
 
 ## 快速开始
 
