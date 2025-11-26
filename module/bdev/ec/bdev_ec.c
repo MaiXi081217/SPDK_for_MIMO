@@ -2751,7 +2751,6 @@ ec_bdev_configure_base_bdev_check_sb_cb(const struct ec_bdev_superblock *sb, int
 			 * (slot occupancy check, rebuild decision, etc.)
 			 */
 			bdev = spdk_bdev_desc_get_bdev(base_info->desc);
-			ec_bdev_free_base_bdev_resource(base_info);
 			/* Set UUID from superblock if not already set */
 			if (spdk_uuid_is_null(&base_info->uuid)) {
 				const struct ec_bdev_sb_base_bdev *sb_base = ec_bdev_sb_find_base_bdev_by_uuid(sb, spdk_bdev_get_uuid(bdev));
@@ -2759,7 +2758,12 @@ ec_bdev_configure_base_bdev_check_sb_cb(const struct ec_bdev_superblock *sb, int
 					spdk_uuid_copy(&base_info->uuid, &sb_base->uuid);
 				}
 			}
-			/* Continue with configuration using configure_cont for strict validation */
+			/* Continue with configuration using configure_cont for strict validation
+			 * Note: Do NOT call ec_bdev_free_base_bdev_resource here because
+			 * ec_bdev_configure_base_bdev_cont needs base_info->name, base_info->desc,
+			 * and other resources. The resource cleanup will be handled by configure_cont
+			 * or its error paths if needed.
+			 */
 			ec_bdev_configure_base_bdev_cont(base_info);
 			return;
 		}
@@ -2814,7 +2818,7 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 {
 	struct ec_bdev *ec_bdev = base_info->ec_bdev;
 	struct spdk_bdev *bdev;
-	ec_base_bdev_cb configure_cb;
+	ec_base_bdev_cb configure_cb = NULL;
 	int rc;
 
 	if (base_info->desc == NULL) {
@@ -2846,10 +2850,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 		if (ec_bdev->bdev.blocklen != bdev->blocklen) {
 			SPDK_ERRLOG("EC bdev '%s' blocklen %u differs from base bdev '%s' blocklen %u\n",
 				    ec_bdev->bdev.name, ec_bdev->bdev.blocklen, bdev->name, bdev->blocklen);
-			ec_bdev_free_base_bdev_resource(base_info);
+			/* Clear configure_cb before freeing resources */
 			if (base_info->configure_cb) {
 				configure_cb = base_info->configure_cb;
 				base_info->configure_cb = NULL;
+			}
+			ec_bdev_free_base_bdev_resource(base_info);
+			if (configure_cb) {
 				configure_cb(base_info->configure_cb_ctx, -EINVAL);
 			}
 			return;
@@ -2863,10 +2870,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 		    ec_bdev->bdev.dif_pi_format != bdev->dif_pi_format) {
 			SPDK_ERRLOG("EC bdev '%s' has different metadata format than base bdev '%s'\n",
 				    ec_bdev->bdev.name, bdev->name);
-			ec_bdev_free_base_bdev_resource(base_info);
+			/* Clear configure_cb before freeing resources */
 			if (base_info->configure_cb) {
 				configure_cb = base_info->configure_cb;
 				base_info->configure_cb = NULL;
+			}
+			ec_bdev_free_base_bdev_resource(base_info);
+			if (configure_cb) {
 				configure_cb(base_info->configure_cb_ctx, -EINVAL);
 			}
 			return;
@@ -2877,8 +2887,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 	if (ec_bdev->state == EC_BDEV_STATE_ONLINE && ec_bdev->sb != NULL) {
 		uint8_t slot_idx = (uint8_t)(base_info - ec_bdev->base_bdev_info);
 		
-		/* Check if slot is already occupied by another disk */
-		if (base_info->is_configured || base_info->name != NULL) {
+		/* Check if slot is already occupied by another disk
+		 * Note: We only check is_configured, not name, because name is set
+		 * during the add process before configure_cont is called.
+		 * If is_configured is true, it means this slot was already configured
+		 * and should not be reused for a new disk.
+		 */
+		if (base_info->is_configured) {
 			/* Slot is already occupied - this disk cannot be added */
 			const struct ec_bdev_sb_base_bdev *sb_base = ec_bdev_sb_find_base_bdev_by_slot(ec_bdev, slot_idx);
 			const char *uuid_match_info = "";
@@ -2903,10 +2918,13 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 			SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", base_info->name);
 			SPDK_NOTICELOG("===========================================================\n");
 			
-			ec_bdev_free_base_bdev_resource(base_info);
+			/* Clear configure_cb before freeing resources to ensure proper cleanup order */
 			if (base_info->configure_cb) {
 				configure_cb = base_info->configure_cb;
 				base_info->configure_cb = NULL;
+			}
+			ec_bdev_free_base_bdev_resource(base_info);
+			if (configure_cb) {
 				configure_cb(base_info->configure_cb_ctx, -EEXIST);
 			}
 			return;
@@ -3537,8 +3555,10 @@ ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev
 		 * This is a safety check in examine path: if slot is already occupied,
 		 * we don't auto-replace it to avoid accidental data loss.
 		 * User should manually remove the existing disk first if replacement is intended.
+		 * Note: We only check is_configured, not name, because name may be set
+		 * during configuration but is_configured is the definitive flag.
 		 */
-		if (base_info->is_configured || base_info->name != NULL) {
+		if (base_info->is_configured) {
 			/* EC bdev is already fully configured, this disk cannot be added */
 			/* This can happen if superblock state is CONFIGURED but slot is occupied */
 			SPDK_NOTICELOG("===========================================================\n");
