@@ -2270,9 +2270,21 @@ ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
 void
 ec_bdev_delete(struct ec_bdev *ec_bdev, bool wipe_sb, ec_bdev_destruct_cb cb_fn, void *cb_ctx)
 {
+	struct ec_rebuild_context *rebuild_ctx;
+
 	if (ec_bdev == NULL) {
 		if (cb_fn) {
 			cb_fn(cb_ctx, 0);
+		}
+		return;
+	}
+
+	rebuild_ctx = ec_bdev_get_active_rebuild(ec_bdev);
+	if (rebuild_ctx != NULL) {
+		SPDK_ERRLOG("Cannot delete EC bdev %s while rebuild is in progress\n",
+			    ec_bdev->bdev.name);
+		if (cb_fn) {
+			cb_fn(cb_ctx, -EBUSY);
 		}
 		return;
 	}
@@ -2317,6 +2329,12 @@ ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 	struct ec_base_bdev_info *base_info;
 	uint8_t slot = UINT8_MAX;
 	int rc;
+
+	if (ec_bdev_get_active_rebuild(ec_bdev) != NULL) {
+		SPDK_ERRLOG("Cannot add base bdev '%s' to EC bdev %s while rebuild is running\n",
+			    name, ec_bdev->bdev.name);
+		return -EBUSY;
+	}
 
 	/* Find an available slot */
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
@@ -2396,10 +2414,24 @@ int
 ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, void *cb_ctx)
 {
 	struct ec_base_bdev_info *base_info = ec_bdev_find_base_info_by_bdev(base_bdev);
+	struct ec_bdev *ec_bdev;
 
 	if (base_info == NULL) {
 		SPDK_ERRLOG("Base bdev not found\n");
 		return -ENODEV;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("EC bdev is NULL for base bdev '%s'\n",
+			    base_info->name ? base_info->name : "unknown");
+		return -EINVAL;
+	}
+
+	if (ec_bdev_is_rebuild_target(ec_bdev, base_info)) {
+		SPDK_WARNLOG("Cannot remove base bdev '%s' while rebuild is running\n",
+			     base_info->name ? base_info->name : "unknown");
+		return -EBUSY;
 	}
 
 	base_info->remove_scheduled = true;

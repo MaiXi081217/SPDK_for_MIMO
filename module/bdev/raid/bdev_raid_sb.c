@@ -372,7 +372,9 @@ raid_bdev_write_sb_base_bdev_done(int status, struct raid_bdev_write_sb_ctx *ctx
 	}
 
 	if (--ctx->remaining == 0) {
-		ctx->cb(ctx->status, ctx->raid_bdev, ctx->cb_ctx);
+		if (ctx->cb != NULL) {
+			ctx->cb(ctx->status, ctx->raid_bdev, ctx->cb_ctx);
+		}
 		free(ctx);
 	}
 }

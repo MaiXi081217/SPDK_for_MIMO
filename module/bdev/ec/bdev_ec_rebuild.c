@@ -596,11 +596,7 @@ ec_bdev_stop_rebuild(struct ec_bdev *ec_bdev)
 bool
 ec_bdev_is_rebuilding(struct ec_bdev *ec_bdev)
 {
-	if (ec_bdev == NULL) {
-		return false;
-	}
-
-	return (ec_bdev->rebuild_ctx != NULL && !ec_bdev->rebuild_ctx->paused);
+	return ec_bdev_get_active_rebuild(ec_bdev) != NULL;
 }
 
 /*
@@ -610,16 +606,19 @@ int
 ec_bdev_get_rebuild_progress(struct ec_bdev *ec_bdev, uint64_t *current_stripe,
 			     uint64_t *total_stripes)
 {
+	struct ec_rebuild_context *ctx;
+
 	if (ec_bdev == NULL || current_stripe == NULL || total_stripes == NULL) {
 		return -EINVAL;
 	}
 
-	if (ec_bdev->rebuild_ctx == NULL) {
+	ctx = ec_bdev_get_active_rebuild(ec_bdev);
+	if (ctx == NULL) {
 		return -ENODEV;
 	}
 
-	*current_stripe = ec_bdev->rebuild_ctx->current_stripe;
-	*total_stripes = ec_bdev->rebuild_ctx->total_stripes;
+	*current_stripe = ctx->current_stripe;
+	*total_stripes = ctx->total_stripes;
 
 	return 0;
 }

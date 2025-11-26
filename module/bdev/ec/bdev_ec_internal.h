@@ -263,6 +263,31 @@ struct ec_rebuild_context {
 	bool paused;
 };
 
+static inline struct ec_rebuild_context *
+ec_bdev_get_active_rebuild(struct ec_bdev *ec_bdev)
+{
+	struct ec_rebuild_context *ctx;
+
+	if (ec_bdev == NULL) {
+		return NULL;
+	}
+
+	ctx = ec_bdev->rebuild_ctx;
+	if (ctx == NULL || ctx->paused) {
+		return NULL;
+	}
+
+	return ctx;
+}
+
+static inline bool
+ec_bdev_is_rebuild_target(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *base_info)
+{
+	struct ec_rebuild_context *ctx = ec_bdev_get_active_rebuild(ec_bdev);
+
+	return ctx != NULL && ctx->target_base_info == base_info;
+}
+
 /* I/O completion callbacks */
 void ec_base_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 void ec_base_bdev_reset_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);

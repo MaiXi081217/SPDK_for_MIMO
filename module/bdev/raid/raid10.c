@@ -821,7 +821,8 @@ raid10_submit_process_request(struct raid_bdev_process_request *process_req,
 			     struct raid_bdev_io_channel *raid_ch)
 {
 	struct raid_bdev_io *raid_io = &process_req->raid_io;
-	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	/* Process context always owns the raid_bdev pointer (target may be NULL during setup). */
+	struct raid_bdev *raid_bdev = process_req->process->raid_bdev;
 	struct raid_bdev_io_channel *process_raid_ch = raid_ch;
 	struct spdk_bdev_ext_io_opts io_opts;
 	struct raid_base_bdev_info *base_info;
@@ -838,6 +839,7 @@ raid10_submit_process_request(struct raid_bdev_process_request *process_req,
 	raid_bdev_io_init(raid_io, process_raid_ch, SPDK_BDEV_IO_TYPE_READ,
 			  process_req->offset_blocks, process_req->num_blocks,
 			  &process_req->iov, 1, process_req->md_buf, NULL, NULL);
+	raid_io->raid_bdev = raid_bdev;
 	raid_io->completion_cb = raid10_process_read_completed;
 
 	/* Calculate which strip this I/O belongs to */

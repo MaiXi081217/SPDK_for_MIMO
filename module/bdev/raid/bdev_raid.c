@@ -87,6 +87,38 @@ struct raid_bdev_process {
 	void *rebuild_done_ctx;
 };
 
+static inline struct raid_bdev_process *
+raid_bdev_get_active_process(struct raid_bdev *raid_bdev)
+{
+	struct raid_bdev_process *process;
+
+	if (raid_bdev == NULL) {
+		return NULL;
+	}
+
+	process = raid_bdev->process;
+	if (process == NULL || process->state == RAID_PROCESS_STATE_STOPPED) {
+		return NULL;
+	}
+
+	return process;
+}
+
+static inline bool
+raid_bdev_process_is_running_type(const struct raid_bdev *raid_bdev, enum raid_process_type type)
+{
+	struct raid_bdev_process *process;
+
+	if (raid_bdev == NULL) {
+		return false;
+	}
+
+	process = raid_bdev->process;
+	return process != NULL &&
+	       process->type == type &&
+	       process->state == RAID_PROCESS_STATE_RUNNING;
+}
+
 struct raid_process_finish_action {
 	spdk_msg_fn cb;
 	void *cb_ctx;
@@ -188,6 +220,53 @@ static void	raid_bdev_delete_on_unquiesced(void *arg, int status);
 static void	raid_bdev_delete_wipe_cb(int status, struct raid_bdev *raid_bdev, void *arg);
 static void	raid_bdev_delete_restore_sb_cb(int restore_status, struct raid_bdev *raid_bdev,
 			       void *arg);
+
+struct raid_bdev_async_sb_ctx {
+	uint32_t attempt;
+};
+
+#define RAID_BDEV_ASYNC_SB_MAX_RETRIES 3
+
+static void
+raid_bdev_write_superblock_async_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
+{
+	struct raid_bdev_async_sb_ctx *async_ctx = ctx;
+
+	if (status != 0) {
+		async_ctx->attempt++;
+		if (async_ctx->attempt < RAID_BDEV_ASYNC_SB_MAX_RETRIES) {
+			SPDK_WARNLOG("Asynchronous superblock write failed on raid bdev %s (attempt %u/%u), retrying: %s\n",
+				     raid_bdev->bdev.name, async_ctx->attempt, RAID_BDEV_ASYNC_SB_MAX_RETRIES,
+				     spdk_strerror(-status));
+			raid_bdev_write_superblock(raid_bdev, raid_bdev_write_superblock_async_cb, async_ctx);
+			return;
+		}
+
+		SPDK_ERRLOG("Asynchronous superblock write failed on raid bdev %s after %u attempts: %s\n",
+			    raid_bdev->bdev.name, RAID_BDEV_ASYNC_SB_MAX_RETRIES, spdk_strerror(-status));
+	}
+
+	free(async_ctx);
+}
+
+static void
+raid_bdev_write_superblock_async(struct raid_bdev *raid_bdev)
+{
+	struct raid_bdev_async_sb_ctx *ctx;
+
+	if (raid_bdev == NULL || raid_bdev->sb == NULL) {
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Failed to allocate async context for superblock write on raid bdev %s\n",
+			    raid_bdev->bdev.name);
+		return;
+	}
+
+	raid_bdev_write_superblock(raid_bdev, raid_bdev_write_superblock_async_cb, ctx);
+}
 
 static void
 raid_bdev_ch_process_cleanup(struct raid_bdev_io_channel *raid_ch)
@@ -323,8 +402,10 @@ raid_bdev_create_cb(void *io_device, void *ctx_buf)
 		}
 	}
 
-	if (raid_bdev->process != NULL) {
-		ret = raid_bdev_ch_process_setup(raid_ch, raid_bdev->process);
+	struct raid_bdev_process *process = raid_bdev_get_active_process(raid_bdev);
+
+	if (process != NULL) {
+		ret = raid_bdev_ch_process_setup(raid_ch, process);
 		if (ret != 0) {
 			SPDK_ERRLOG("Failed to setup process io channel\n");
 			goto err;
@@ -1829,12 +1910,14 @@ raid_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void 
 	struct raid_bdev *raid_bdev = event_ctx;
 
 	if (type == SPDK_BDEV_EVENT_REMOVE) {
-		if (raid_bdev->process != NULL) {
-			spdk_thread_send_msg(raid_bdev->process->thread, raid_bdev_unregistering_stop_process,
-					     raid_bdev->process);
-		} else {
-			raid_bdev_unregistering_cont(raid_bdev);
+		struct raid_bdev_process *process = raid_bdev_get_active_process(raid_bdev);
+
+		if (process != NULL) {
+			spdk_thread_send_msg(process->thread, raid_bdev_unregistering_stop_process, process);
+			return;
 		}
+
+		raid_bdev_unregistering_cont(raid_bdev);
 	}
 }
 
@@ -2508,8 +2591,10 @@ raid_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
 		raid_bdev_deconfigure(raid_bdev, cb_fn, cb_ctx);
 		return;
 	}
-	if (raid_bdev->process != NULL) {
-		ret = raid_bdev_process_base_bdev_remove(raid_bdev->process, base_info);
+	struct raid_bdev_process *process = raid_bdev_get_active_process(raid_bdev);
+
+	if (process != NULL) {
+		ret = raid_bdev_process_base_bdev_remove(process, base_info);
 	} else {
 		ret = raid_bdev_remove_base_bdev_quiesce(base_info);
 	}
@@ -2527,6 +2612,7 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 			    raid_base_bdev_cb cb_fn, void *cb_ctx)
 {
 	struct raid_bdev *raid_bdev;
+	struct raid_bdev_process *process;
 	int ret = 0;
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
@@ -2541,6 +2627,7 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 		SPDK_ERRLOG("base_info->raid_bdev is NULL in _raid_bdev_remove_base_bdev\n");
 		return -EINVAL;
 	}
+	process = raid_bdev_get_active_process(raid_bdev);
 
 	SPDK_DEBUGLOG(bdev_raid, "%s\n", base_info->name ? base_info->name : "unknown");
 
@@ -2551,6 +2638,14 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 	if (base_info->desc == NULL) {
 		SPDK_ERRLOG("base_info->desc is NULL, cannot remove base bdev\n");
 		return -ENODEV;
+	}
+
+	if (process != NULL &&
+	    process->type == RAID_PROCESS_REBUILD &&
+	    process->target == base_info) {
+		SPDK_WARNLOG("Cannot remove target base bdev '%s' while rebuild is running\n",
+			     base_info->name ? base_info->name : raid_bdev->bdev.name);
+		return -EBUSY;
 	}
 
 	base_info->remove_scheduled = true;
@@ -2586,8 +2681,8 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 		raid_bdev->num_base_bdevs_operational--;
 		raid_bdev_deconfigure(raid_bdev, cb_fn, cb_ctx);
 	} else {
-		if (raid_bdev->process != NULL) {
-			ret = raid_bdev_process_base_bdev_remove(raid_bdev->process, base_info);
+		if (process != NULL) {
+			ret = raid_bdev_process_base_bdev_remove(process, base_info);
 		} else {
 			ret = raid_bdev_remove_base_bdev_quiesce(base_info);
 		}
@@ -2795,6 +2890,18 @@ void
 raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_arg)
 {
     SPDK_DEBUGLOG(bdev_raid, "delete raid bdev: %s\n", raid_bdev->bdev.name);
+
+	struct raid_bdev_process *process = raid_bdev_get_active_process(raid_bdev);
+
+	if (process != NULL) {
+		SPDK_ERRLOG("Cannot delete raid bdev %s while %s is in progress\n",
+			    raid_bdev->bdev.name,
+			    raid_bdev_process_to_str(process->type));
+		if (cb_fn != NULL) {
+			cb_fn(cb_arg, -EBUSY);
+		}
+		return;
+	}
 
     if (raid_bdev->destroy_started) {
         SPDK_DEBUGLOG(bdev_raid, "destroying raid bdev %s is already started\n",
@@ -3222,7 +3329,7 @@ raid_bdev_process_window_range_unlocked(void *ctx, int status)
 						     process->window_offset,
 						     process->raid_bdev->bdev.blockcnt);
 		/* Write superblock asynchronously (non-blocking) */
-		raid_bdev_write_superblock(process->raid_bdev, NULL, NULL);
+		raid_bdev_write_superblock_async(process->raid_bdev);
 	}
 
 	raid_bdev_process_thread_run(process);
@@ -3638,6 +3745,9 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
 	process->max_window_size = spdk_max(spdk_divide_round_up(g_opts.process_window_size_kb * 1024UL,
 					    spdk_bdev_get_data_block_size(&raid_bdev->bdev)),
 					    raid_bdev->bdev.write_unit_size);
+	if (raid_bdev->level == RAID10) {
+		process->max_window_size = spdk_min(process->max_window_size, raid_bdev->strip_size);
+	}
 	TAILQ_INIT(&process->requests);
 	TAILQ_INIT(&process->finish_actions);
 	/* Initialize rebuild state and callback */
@@ -3735,7 +3845,7 @@ raid_bdev_start_rebuild_with_cb(struct raid_base_bdev_info *target,
 			/* Initialize or update rebuild progress in superblock */
 			raid_bdev_sb_update_rebuild_progress(raid_bdev, target_slot, rebuild_offset,
 							     raid_bdev->bdev.blockcnt);
-			raid_bdev_write_superblock(raid_bdev, NULL, NULL);
+			raid_bdev_write_superblock_async(raid_bdev);
 		}
 	}
 
@@ -4134,7 +4244,8 @@ raid_bdev_configure_base_bdev_check_sb_cb(const struct raid_bdev_superblock *sb,
 		} else {
 			SPDK_ERRLOG("Superblock of a different raid bdev found on bdev %s\n", base_info->name);
 		}
-		status = -EEXIST;
+		/* Use -EINVAL instead of -EEXIST for UUID mismatch, as this is an invalid argument */
+		status = -EINVAL;
 		raid_bdev_free_base_bdev_resource(base_info);
 		break;
 	case -EINVAL:
@@ -4351,7 +4462,7 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 	assert(name != NULL);
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	if (raid_bdev->process != NULL) {
+	if (raid_bdev_get_active_process(raid_bdev) != NULL) {
 		SPDK_ERRLOG("raid bdev '%s' is in process\n",
 			    raid_bdev->bdev.name);
 		return -EPERM;
@@ -4936,13 +5047,7 @@ done:
 bool
 raid_bdev_is_rebuilding(struct raid_bdev *raid_bdev)
 {
-	if (raid_bdev == NULL) {
-		return false;
-	}
-
-	return (raid_bdev->process != NULL &&
-		raid_bdev->process->type == RAID_PROCESS_REBUILD &&
-		raid_bdev->process->state == RAID_PROCESS_STATE_RUNNING);
+	return raid_bdev_process_is_running_type(raid_bdev, RAID_PROCESS_REBUILD);
 }
 
 /*
@@ -4952,16 +5057,18 @@ int
 raid_bdev_get_rebuild_progress(struct raid_bdev *raid_bdev, uint64_t *current_offset,
 			       uint64_t *total_size)
 {
+	struct raid_bdev_process *process;
+
 	if (raid_bdev == NULL || current_offset == NULL || total_size == NULL) {
 		return -EINVAL;
 	}
 
-	if (raid_bdev->process == NULL ||
-	    raid_bdev->process->type != RAID_PROCESS_REBUILD) {
+	process = raid_bdev_get_active_process(raid_bdev);
+	if (process == NULL || process->type != RAID_PROCESS_REBUILD) {
 		return -ENODEV;
 	}
 
-	*current_offset = raid_bdev->process->window_offset;
+	*current_offset = process->window_offset;
 	*total_size = raid_bdev->bdev.blockcnt;
 
 	return 0;

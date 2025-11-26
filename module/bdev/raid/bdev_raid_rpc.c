@@ -230,10 +230,23 @@ rpc_bdev_raid_create_add_base_bdev_cb(void *_ctx, int status)
 
     if (ctx->status != 0) {
         raid_bdev_delete(ctx->raid_bdev, NULL, NULL);
-        spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-                                             "Failed to create RAID bdev %s: %s",
-                                             ctx->req.name,
-                                             spdk_strerror(-ctx->status));
+        /* Provide more specific error message for common error codes */
+        if (ctx->status == -EINVAL) {
+            spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+                                                 "Failed to create RAID bdev %s: Invalid argument. "
+                                                 "One or more base bdevs may have a superblock from a different RAID group. "
+                                                 "Please check the logs for details and use 'bdev_wipe_superblock' if needed.",
+                                                 ctx->req.name);
+        } else if (ctx->status == -EEXIST) {
+            spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+                                                 "Failed to create RAID bdev %s: RAID bdev already exists",
+                                                 ctx->req.name);
+        } else {
+            spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+                                                 "Failed to create RAID bdev %s: %s",
+                                                 ctx->req.name,
+                                                 spdk_strerror(-ctx->status));
+        }
     } else {
         /* Return the created RAID bdev name instead of just 'true' */
         struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(ctx->request);
