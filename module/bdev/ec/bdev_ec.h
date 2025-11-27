@@ -321,8 +321,11 @@ struct ec_bdev {
 	/* Flag to track if alignment warning has been logged (to avoid log spam) */
 	bool				alignment_warned;
 
-	/* Rebuild state and context */
+	/* Rebuild state and context (legacy, kept for compatibility) */
 	struct ec_rebuild_context	*rebuild_ctx;
+	
+	/* EC bdev background process, e.g. rebuild (new process framework) */
+	struct ec_bdev_process		*process;
 	
 	/* Device selection strategy configuration */
 	struct ec_device_selection_config selection_config;
@@ -380,6 +383,13 @@ struct ec_bdev_io_channel {
 	
 	/* RAID5F-style: For async encoding retry queue (if encoding resources unavailable) */
 	TAILQ_HEAD(, ec_stripe_private)	encode_retry_queue;
+	
+	/* Background process data */
+	struct {
+		uint64_t offset;
+		struct spdk_io_channel *target_ch;
+		struct ec_bdev_io_channel *ch_processed;
+	} process;
 };
 
 /* TAIL head for EC bdev list */

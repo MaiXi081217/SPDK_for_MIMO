@@ -207,7 +207,22 @@ struct ec_decode_private {
 	enum ec_decode_state state;
 };
 
-/* Rebuild state enumeration */
+/* Process type enumeration */
+enum ec_process_type {
+	EC_PROCESS_NONE,
+	EC_PROCESS_REBUILD,
+	EC_PROCESS_MAX
+};
+
+/* Process state enumeration */
+enum ec_bdev_process_state {
+	EC_PROCESS_STATE_INIT,
+	EC_PROCESS_STATE_RUNNING,
+	EC_PROCESS_STATE_STOPPING,
+	EC_PROCESS_STATE_STOPPED,
+};
+
+/* Rebuild state enumeration (for fine-grained tracking) */
 enum ec_rebuild_state {
 	EC_REBUILD_STATE_IDLE,
 	EC_REBUILD_STATE_READING,
@@ -215,7 +230,71 @@ enum ec_rebuild_state {
 	EC_REBUILD_STATE_WRITING
 };
 
-/* Rebuild context for recovering data to new disk */
+/* Process QoS structure */
+struct ec_process_qos {
+	bool enable_qos;
+	uint64_t last_tsc;
+	double bytes_per_tsc;
+	double bytes_available;
+	double bytes_max;
+	struct spdk_poller *process_continue_poller;
+};
+
+/* Process finish action */
+struct ec_process_finish_action {
+	void (*cb)(void *ctx);
+	void *cb_ctx;
+	TAILQ_ENTRY(ec_process_finish_action) link;
+};
+
+/* Forward declaration */
+struct ec_bdev_io_channel;
+struct ec_bdev_process_request;
+
+/* EC bdev process structure (similar to RAID's process framework) */
+struct ec_bdev_process {
+	struct ec_bdev		*ec_bdev;
+	enum ec_process_type	type;
+	enum ec_bdev_process_state state;
+	struct spdk_thread	*thread;
+	struct ec_bdev_io_channel *ec_ch;
+	TAILQ_HEAD(, ec_bdev_process_request) requests;
+	uint64_t		max_window_size;
+	uint64_t		window_size;
+	uint64_t		window_remaining;
+	int			window_status;
+	uint64_t		window_offset;
+	bool			window_range_locked;
+	struct ec_base_bdev_info *target;
+	int			status;
+	TAILQ_HEAD(, ec_process_finish_action) finish_actions;
+	struct ec_process_qos	qos;
+	/* Fine-grained rebuild state tracking */
+	enum ec_rebuild_state	rebuild_state;
+	/* Callback for rebuild completion */
+	void (*rebuild_done_cb)(void *ctx, int status);
+	void *rebuild_done_ctx;
+	/* Simplified rebuild: error flag (atomic) for unified error handling */
+	volatile int		error_status;
+};
+
+/* Process request structure */
+struct ec_bdev_process_request {
+	struct ec_bdev_process *process;
+	struct ec_base_bdev_info *target;
+	struct spdk_io_channel *target_ch;
+	uint64_t offset_blocks;
+	uint32_t num_blocks;
+	struct iovec iov;
+	void *md_buf;
+	/* bdev_io is ec_io's driver_ctx - don't reorder them!
+	 * These are needed for re-using EC module I/O functions for process I/O. */
+	struct spdk_bdev_io bdev_io;
+	struct ec_bdev_io ec_io;
+	TAILQ_ENTRY(ec_bdev_process_request) link;
+};
+
+/* Legacy rebuild context for recovering data to new disk (kept for compatibility) */
 struct ec_rebuild_context {
 	/* Target base bdev to rebuild */
 	struct ec_base_bdev_info *target_base_info;
@@ -263,6 +342,31 @@ struct ec_rebuild_context {
 	bool paused;
 };
 
+/* Process framework helper functions */
+static inline struct ec_bdev_process *
+ec_bdev_get_active_process(struct ec_bdev *ec_bdev)
+{
+	struct ec_bdev_process *process;
+
+	if (ec_bdev == NULL) {
+		return NULL;
+	}
+
+	process = ec_bdev->process;
+	if (process == NULL || process->state >= EC_PROCESS_STATE_STOPPING) {
+		return NULL;
+	}
+
+	return process;
+}
+
+static inline uint8_t
+ec_bdev_base_bdev_slot(struct ec_base_bdev_info *base_info)
+{
+	return base_info - base_info->ec_bdev->base_bdev_info;
+}
+
+/* Legacy rebuild context functions (for compatibility) */
 static inline struct ec_rebuild_context *
 ec_bdev_get_active_rebuild(struct ec_bdev *ec_bdev)
 {
@@ -361,7 +465,15 @@ int ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 		uint8_t *data_indices,
 		uint8_t *parity_indices);
 
-/* Rebuild functions */
+/* Process framework functions */
+int ec_bdev_start_process(struct ec_bdev *ec_bdev, enum ec_process_type type,
+			  struct ec_base_bdev_info *target,
+			  void (*done_cb)(void *ctx, int status), void *done_ctx);
+void ec_bdev_stop_process(struct ec_bdev *ec_bdev);
+bool ec_bdev_is_process_in_progress(struct ec_bdev *ec_bdev);
+void ec_bdev_process_request_complete(struct ec_bdev_process_request *process_req, int status);
+
+/* Rebuild functions (legacy - will be replaced by process framework) */
 int ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_base_info,
 			  void (*done_cb)(void *ctx, int status), void *done_ctx);
 void ec_bdev_stop_rebuild(struct ec_bdev *ec_bdev);
