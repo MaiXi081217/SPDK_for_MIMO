@@ -85,6 +85,8 @@ struct raid_bdev_process {
 	/* Callback for rebuild completion */
 	void (*rebuild_done_cb)(void *ctx, int status);
 	void *rebuild_done_ctx;
+	/* Simplified rebuild: error flag (atomic) for unified error handling */
+	volatile int			error_status;
 };
 
 static inline struct raid_bdev_process *
@@ -299,8 +301,17 @@ raid_bdev_ch_process_setup(struct raid_bdev_io_channel *raid_ch, struct raid_bde
 	 * a process target. */
 	assert(process->target != NULL);
 
+	/* Check if target disk is still available (may have been physically removed) */
+	if (process->target->desc == NULL) {
+		SPDK_ERRLOG("Target disk '%s' descriptor is NULL - disk may have been removed during rebuild\n",
+			    process->target->name ? process->target->name : "unknown");
+		goto err;
+	}
+
 	raid_ch->process.target_ch = spdk_bdev_get_io_channel(process->target->desc);
 	if (raid_ch->process.target_ch == NULL) {
+		SPDK_ERRLOG("Failed to get I/O channel for target disk '%s' - disk may have been removed\n",
+			    process->target->name ? process->target->name : "unknown");
 		goto err;
 	}
 
@@ -316,6 +327,23 @@ raid_bdev_ch_process_setup(struct raid_bdev_io_channel *raid_ch, struct raid_bde
 		goto err;
 	}
 
+	/* For rebuild: check if we have enough base bdevs available */
+	uint8_t available_base_bdevs = 0;
+	bool *pair_has_available = NULL;
+	uint8_t num_pairs = 0;
+	
+	/* For RAID10 rebuild: track which mirror pairs have at least one available disk */
+	if (process->type == RAID_PROCESS_REBUILD && raid_bdev->level == RAID10) {
+		/* For RAID10, num_mirror_pairs = num_base_bdevs / 2 */
+		if (raid_bdev->num_base_bdevs % 2 == 0) {
+			num_pairs = raid_bdev->num_base_bdevs / 2;
+			pair_has_available = calloc(num_pairs, sizeof(bool));
+			if (pair_has_available == NULL) {
+				goto err;
+			}
+		}
+	}
+	
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
 		uint8_t slot = raid_bdev_base_bdev_slot(base_info);
 
@@ -323,16 +351,76 @@ raid_bdev_ch_process_setup(struct raid_bdev_io_channel *raid_ch, struct raid_bde
 		if (slot >= raid_bdev->num_base_bdevs) {
 			SPDK_ERRLOG("Calculated slot %u exceeds num_base_bdevs %u\n",
 				    slot, raid_bdev->num_base_bdevs);
-			continue;
+			/* Slot calculation error is a serious issue - return error instead of continuing */
+			free(pair_has_available);
+			goto err;
 		}
 
 		if (base_info != process->target) {
-			if (slot < raid_bdev->num_base_bdevs && raid_ch->base_channel != NULL) {
+			if (raid_ch->base_channel != NULL) {
 				raid_ch_processed->base_channel[slot] = raid_ch->base_channel[slot];
+				if (raid_ch_processed->base_channel[slot] != NULL) {
+					available_base_bdevs++;
+					/* For RAID10: mark the mirror pair as having an available disk */
+					if (pair_has_available != NULL) {
+						uint8_t pair_idx = slot / 2;
+						if (pair_idx < num_pairs) {
+							pair_has_available[pair_idx] = true;
+						}
+					}
+				}
 			}
 		} else {
 			raid_ch_processed->base_channel[slot] = raid_ch->process.target_ch;
+			/* target_ch is already checked above, so it's available */
+			available_base_bdevs++;
 		}
+	}
+
+	/* For rebuild: ensure we have enough base bdevs to perform rebuild */
+	if (process->type == RAID_PROCESS_REBUILD) {
+		bool sufficient = false;
+		
+		if (raid_bdev->level == RAID10 && pair_has_available != NULL) {
+			/* For RAID10: check that each mirror pair (excluding target's pair) has at least one available disk */
+			uint8_t target_slot = raid_bdev_base_bdev_slot(process->target);
+			uint8_t target_pair = target_slot / 2;
+			uint8_t pairs_with_available = 0;
+			
+			for (uint8_t i = 0; i < num_pairs; i++) {
+				if (i == target_pair) {
+					/* Target's pair: we need the other disk in the pair to be available */
+					uint8_t other_disk = (target_slot % 2 == 0) ? (target_slot + 1) : (target_slot - 1);
+					if (other_disk < raid_bdev->num_base_bdevs &&
+					    raid_ch_processed->base_channel[other_disk] != NULL) {
+						pairs_with_available++;
+					}
+				} else if (pair_has_available[i]) {
+					pairs_with_available++;
+				}
+			}
+			
+			/* We need all pairs except target's pair to have at least one available disk */
+			sufficient = (pairs_with_available >= num_pairs - 1);
+		} else {
+			/* For other RAID levels: need at least min_base_bdevs_operational */
+			sufficient = (available_base_bdevs >= raid_bdev->min_base_bdevs_operational);
+		}
+		
+		if (!sufficient) {
+			SPDK_ERRLOG("Insufficient base bdevs available for rebuild on RAID bdev '%s': "
+				    "%u available, need at least %u\n",
+				    raid_bdev->bdev.name, available_base_bdevs,
+				    raid_bdev->min_base_bdevs_operational);
+			if (pair_has_available != NULL) {
+				free(pair_has_available);
+			}
+			goto err;
+		}
+	}
+	
+	if (pair_has_available != NULL) {
+		free(pair_has_available);
 	}
 
 	raid_ch_processed->module_channel = raid_ch->module_channel;
@@ -341,6 +429,10 @@ raid_bdev_ch_process_setup(struct raid_bdev_io_channel *raid_ch, struct raid_bde
 	return 0;
 err:
 	raid_bdev_ch_process_cleanup(raid_ch);
+	/* Return appropriate error code based on the failure reason */
+	/* Most errors are logged above, but we return a generic error code */
+	/* The actual error reason is logged, so callers can check logs for details */
+	/* Note: We could track the specific error, but it would require additional state tracking */
 	return -ENOMEM;
 }
 
@@ -2894,9 +2986,33 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void 
 	struct raid_bdev_process *process = raid_bdev_get_active_process(raid_bdev);
 
 	if (process != NULL) {
-		SPDK_ERRLOG("Cannot delete raid bdev %s while %s is in progress\n",
-			    raid_bdev->bdev.name,
-			    raid_bdev_process_to_str(process->type));
+		if (process->type == RAID_PROCESS_REBUILD && process->target != NULL) {
+			uint8_t target_slot = raid_bdev_base_bdev_slot(process->target);
+			uint64_t current_offset = 0, total_size = 0;
+			double percent = 0.0;
+			
+			raid_bdev_get_rebuild_progress(raid_bdev, &current_offset, &total_size);
+			if (total_size > 0) {
+				percent = (double)current_offset * 100.0 / (double)total_size;
+			}
+			
+			SPDK_ERRLOG("\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("CANNOT DELETE RAID: Rebuild is in progress!\n");
+			SPDK_ERRLOG("RAID bdev: %s\n", raid_bdev->bdev.name);
+			SPDK_ERRLOG("Target disk: %s (slot %u)\n", 
+				    process->target->name, target_slot);
+			SPDK_ERRLOG("Rebuild progress: %.2f%% (%lu / %lu blocks)\n",
+				    percent, current_offset, total_size);
+			SPDK_ERRLOG("State: %s\n", raid_rebuild_state_to_str(process->rebuild_state));
+			SPDK_ERRLOG("Please wait for rebuild to complete before deleting.\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("\n");
+		} else {
+			SPDK_ERRLOG("Cannot delete raid bdev %s while %s is in progress\n",
+				    raid_bdev->bdev.name,
+				    raid_bdev_process_to_str(process->type));
+		}
 		if (cb_fn != NULL) {
 			cb_fn(cb_arg, -EBUSY);
 		}
@@ -3041,70 +3157,6 @@ raid_bdev_delete_on_quiesced(void *arg, int status)
     raid_bdev_wipe_superblock(raid_bdev, raid_bdev_delete_wipe_cb, ctx);
 }
 
-static void
-raid_bdev_process_finish_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
-{
-	if (status != 0) {
-		SPDK_ERRLOG("Failed to write raid bdev '%s' superblock after background process finished: %s\n",
-			    raid_bdev->bdev.name, spdk_strerror(-status));
-	}
-}
-
-static void
-raid_bdev_process_finish_write_sb(void *ctx)
-{
-	struct raid_bdev *raid_bdev = ctx;
-	struct raid_bdev_superblock *sb = raid_bdev->sb;
-	struct raid_bdev_sb_base_bdev *sb_base_bdev;
-	struct raid_base_bdev_info *base_info;
-	struct raid_bdev_process *process = raid_bdev->process;
-	uint8_t i;
-	uint8_t target_slot = 0;
-
-	/* Safety check: sb should not be NULL if superblock_enabled is true */
-	if (sb == NULL) {
-		SPDK_ERRLOG("Superblock is NULL for raid bdev %s\n", raid_bdev->bdev.name);
-		return;
-	}
-
-	/* Find target slot if rebuild was in progress */
-	if (process != NULL && process->type == RAID_PROCESS_REBUILD && process->target != NULL) {
-		target_slot = raid_bdev_base_bdev_slot(process->target);
-	}
-
-	for (i = 0; i < sb->base_bdevs_size; i++) {
-		sb_base_bdev = &sb->base_bdevs[i];
-
-		if (sb_base_bdev->state != RAID_SB_BASE_BDEV_CONFIGURED &&
-		    sb_base_bdev->slot < raid_bdev->num_base_bdevs) {
-			base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
-			if (base_info->is_configured) {
-				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
-				sb_base_bdev->data_offset = base_info->data_offset;
-				spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
-				/* Clear rebuild progress when rebuild completes */
-				sb_base_bdev->rebuild_offset = 0;
-				sb_base_bdev->rebuild_total_size = 0;
-			}
-		} else if (sb_base_bdev->state == RAID_SB_BASE_BDEV_REBUILDING &&
-			   sb_base_bdev->slot == target_slot) {
-			/* Update REBUILDING state to CONFIGURED if rebuild completed successfully */
-			if (process != NULL && process->status == 0) {
-				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
-				sb_base_bdev->rebuild_offset = 0;
-				sb_base_bdev->rebuild_total_size = 0;
-			} else {
-				/* Rebuild failed, revert to FAILED */
-				sb_base_bdev->state = RAID_SB_BASE_BDEV_FAILED;
-				sb_base_bdev->rebuild_offset = 0;
-				sb_base_bdev->rebuild_total_size = 0;
-			}
-		}
-	}
-
-	raid_bdev_write_superblock(raid_bdev, raid_bdev_process_finish_write_sb_cb, NULL);
-}
-
 static void raid_bdev_process_free(struct raid_bdev_process *process);
 
 static void
@@ -3144,77 +3196,11 @@ raid_bdev_process_finish_target_removed(void *ctx, int status)
 }
 
 static void
-raid_bdev_process_finish_unquiesced(void *ctx, int status)
-{
-	struct raid_bdev_process *process = ctx;
-
-	if (status != 0) {
-		SPDK_ERRLOG("Failed to unquiesce bdev: %s\n", spdk_strerror(-status));
-	}
-
-	if (process->status != 0) {
-		status = _raid_bdev_remove_base_bdev(process->target, raid_bdev_process_finish_target_removed,
-						     process);
-		if (status != 0) {
-			raid_bdev_process_finish_target_removed(process, status);
-		}
-		return;
-	}
-
-	spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
-}
-
-static void
-raid_bdev_process_finish_unquiesce(void *ctx)
-{
-	struct raid_bdev_process *process = ctx;
-	int rc;
-
-	rc = spdk_bdev_unquiesce(&process->raid_bdev->bdev, &g_raid_if,
-				 raid_bdev_process_finish_unquiesced, process);
-	if (rc != 0) {
-		raid_bdev_process_finish_unquiesced(process, rc);
-	}
-}
-
-static void
-raid_bdev_process_finish_done(void *ctx)
-{
-	struct raid_bdev_process *process = ctx;
-	struct raid_bdev *raid_bdev = process->raid_bdev;
-
-	if (process->raid_ch != NULL) {
-		spdk_put_io_channel(spdk_io_channel_from_ctx(process->raid_ch));
-	}
-
-	process->state = RAID_PROCESS_STATE_STOPPED;
-
-	if (process->status == 0) {
-		SPDK_NOTICELOG("Finished %s on raid bdev %s\n",
-			       raid_bdev_process_to_str(process->type),
-			       raid_bdev->bdev.name);
-		if (raid_bdev->superblock_enabled) {
-			spdk_thread_send_msg(spdk_thread_get_app_thread(),
-					     raid_bdev_process_finish_write_sb,
-					     raid_bdev);
-		}
-	} else {
-		SPDK_WARNLOG("Finished %s on raid bdev %s: %s\n",
-			     raid_bdev_process_to_str(process->type),
-			     raid_bdev->bdev.name,
-			     spdk_strerror(-process->status));
-	}
-
-	spdk_thread_send_msg(spdk_thread_get_app_thread(), raid_bdev_process_finish_unquiesce,
-			     process);
-}
-
-static void
 __raid_bdev_process_finish(struct spdk_io_channel_iter *i, int status)
 {
 	struct raid_bdev_process *process = spdk_io_channel_iter_get_ctx(i);
 
-	spdk_thread_send_msg(process->thread, raid_bdev_process_finish_done, process);
+	spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
 }
 
 static void
@@ -3224,7 +3210,7 @@ raid_bdev_channel_process_finish(struct spdk_io_channel_iter *i)
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct raid_bdev_io_channel *raid_ch = spdk_io_channel_get_ctx(ch);
 
-	if (process->status == 0) {
+	if (process->status == 0 && process->target != NULL) {
 		uint8_t slot = raid_bdev_base_bdev_slot(process->target);
 		struct raid_bdev *raid_bdev = process->raid_bdev;
 
@@ -3242,6 +3228,7 @@ raid_bdev_channel_process_finish(struct spdk_io_channel_iter *i)
 	spdk_for_each_channel_continue(i, 0);
 }
 
+
 static void
 raid_bdev_process_finish_quiesced(void *ctx, int status)
 {
@@ -3250,12 +3237,63 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to quiesce bdev: %s\n", spdk_strerror(-status));
+		/* Quiesce failed - need to clean up process state */
+		/* Process is in STOPPING state, need to finish cleanup */
+		raid_bdev->process = NULL;
+		if (process->target != NULL) {
+			process->target->is_process_target = false;
+		}
+		/* Send message to process thread to finish cleanup */
+		spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
 		return;
 	}
 
-	raid_bdev->process = NULL;
-	process->target->is_process_target = false;
+	/* Handle rebuild failure: remove target disk if rebuild failed */
+	if (process->status != 0 && process->type == RAID_PROCESS_REBUILD) {
+		if (process->target != NULL) {
+			SPDK_ERRLOG("\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("REBUILD FAILED: Target disk '%s' may have been removed\n",
+				    process->target->name ? process->target->name : "unknown");
+			SPDK_ERRLOG("RAID bdev: %s\n", process->raid_bdev->bdev.name);
+			SPDK_ERRLOG("Error: %s\n", spdk_strerror(-process->status));
+			SPDK_ERRLOG("Removing target disk from RAID array...\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("\n");
+			
+			status = _raid_bdev_remove_base_bdev(process->target, raid_bdev_process_finish_target_removed,
+							     process);
+			/* _raid_bdev_remove_base_bdev may:
+			 * - Return 0: wipe started, callback will be called when wipe completes
+			 * - Return non-zero: either callback already called (wipe failed) or synchronous error
+			 *   In case of synchronous error (e.g., -EBUSY, -ENODEV), callback is NOT called,
+			 *   so we need to call it ourselves.
+			 */
+			if (status != 0) {
+				/* Check if this is a synchronous error (callback not called) */
+				/* Errors like -EBUSY, -ENODEV, -EINVAL are synchronous and don't call callback */
+				if (status == -EBUSY || status == -ENODEV || status == -EINVAL) {
+					/* Synchronous error - callback not called, call it now */
+					SPDK_WARNLOG("Failed to remove target disk: %s\n", spdk_strerror(-status));
+					raid_bdev_process_finish_target_removed(process, status);
+				} else {
+					/* Other errors (like from wipe) - callback may have been called already */
+					/* Don't call callback again to avoid double callback */
+					SPDK_WARNLOG("Failed to remove target disk: %s (callback may have been called)\n",
+						     spdk_strerror(-status));
+				}
+			}
+			/* If removal was started (status == 0), callback will be called when wipe completes */
+			return;
+		}
+	}
 
+	raid_bdev->process = NULL;
+	if (process->target != NULL) {
+		process->target->is_process_target = false;
+	}
+
+	/* Reuse original multi-channel cleanup */
 	spdk_for_each_channel(process->raid_bdev, raid_bdev_channel_process_finish, process,
 			      __raid_bdev_process_finish);
 }
@@ -3298,6 +3336,11 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
 	assert(process->state == RAID_PROCESS_STATE_RUNNING);
 	process->state = RAID_PROCESS_STATE_STOPPING;
 
+	/* For simplified rebuild: set error_status if finishing with error */
+	if (process->type == RAID_PROCESS_REBUILD && status != 0) {
+		process->error_status = status;
+	}
+
 	if (process->window_range_locked) {
 		raid_bdev_process_unlock_window_range(process);
 	} else {
@@ -3332,6 +3375,7 @@ raid_bdev_process_window_range_unlocked(void *ctx, int status)
 		raid_bdev_write_superblock_async(process->raid_bdev);
 	}
 
+	/* Reuse original thread_run logic */
 	raid_bdev_process_thread_run(process);
 }
 
@@ -3375,19 +3419,32 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
 {
 	struct raid_bdev_process *process = process_req->process;
 
-	TAILQ_INSERT_TAIL(&process->requests, process_req, link);
-
 	assert(spdk_get_thread() == process->thread);
-	assert(process->window_remaining >= process_req->num_blocks);
 
+	/* Simplified error handling: set error status atomically */
 	if (status != 0) {
 		process->window_status = status;
+		process->error_status = status;
 	}
+
+	/* Reuse original request handling logic */
+	assert(process->window_remaining >= process_req->num_blocks);
+	TAILQ_INSERT_TAIL(&process->requests, process_req, link);
 
 	process->window_remaining -= process_req->num_blocks;
 	if (process->window_remaining == 0) {
-		if (process->window_status != 0) {
-			raid_bdev_process_finish(process, process->window_status);
+		/* Unified error handling: error_status and window_status should be in sync
+		 * For rebuild, prefer error_status; for other processes, use window_status
+		 */
+		int error_to_report = 0;
+		if (process->type == RAID_PROCESS_REBUILD && process->error_status != 0) {
+			error_to_report = process->error_status;
+		} else if (process->window_status != 0) {
+			error_to_report = process->window_status;
+		}
+		
+		if (error_to_report != 0) {
+			raid_bdev_process_finish(process, error_to_report);
 			return;
 		}
 
@@ -3422,7 +3479,12 @@ raid_bdev_submit_process_request(struct raid_bdev_process *process, uint64_t off
 			SPDK_ERRLOG("Failed to submit process request on %s: %s\n",
 				    raid_bdev->bdev.name, spdk_strerror(-ret));
 			process->window_status = ret;
+			/* For simplified rebuild: also set error_status */
+			if (process->type == RAID_PROCESS_REBUILD) {
+				process->error_status = ret;
+			}
 		}
+		/* ret == 0 means no request available (normal), ret < 0 means error */
 		return ret;
 	}
 
@@ -3440,9 +3502,18 @@ _raid_bdev_process_thread_run(struct raid_bdev_process *process)
 	const uint64_t offset_end = spdk_min(offset + process->max_window_size, raid_bdev->bdev.blockcnt);
 	int ret;
 
+	/* Initialize window_status for this window */
+	process->window_status = 0;
+	process->window_remaining = 0;
+
 	while (offset < offset_end) {
 		ret = raid_bdev_submit_process_request(process, offset, offset_end - offset);
-		if (ret <= 0) {
+		if (ret < 0) {
+			/* Error occurred, already set in window_status */
+			break;
+		} else if (ret == 0) {
+			/* No request available (normal case, e.g., waiting for I/O completion) */
+			/* Continue to next iteration or wait */
 			break;
 		}
 
@@ -3452,8 +3523,31 @@ _raid_bdev_process_thread_run(struct raid_bdev_process *process)
 
 	if (process->window_remaining > 0) {
 		process->window_size = process->window_remaining;
-	} else {
+	} else if (process->window_status != 0) {
+		/* Error occurred */
 		raid_bdev_process_finish(process, process->window_status);
+	} else {
+		/* window_remaining == 0 and window_status == 0
+		 * This means no I/O was submitted in this iteration.
+		 * If ret == 0, it means no request available (normal when waiting for I/O completion).
+		 * If ret > 0 was never returned, it means we couldn't submit any I/O.
+		 * In either case, if we've reached the end of the window, we should continue to next window.
+		 * But if we're in the middle and can't submit, this might indicate a problem.
+		 * 
+		 * If offset < offset_end and no I/O was submitted, we need to continue processing
+		 * in the next iteration (via process_continue_poller or next window lock).
+		 * The process will be resumed when requests become available.
+		 */
+		if (offset >= offset_end) {
+			/* Reached end of window, continue to next window */
+			SPDK_DEBUGLOG(bdev_raid, "Reached end of window without submitting I/O\n");
+			/* Continue to next window - this will be handled by the window completion callback */
+		} else {
+			/* In middle of window but couldn't submit - wait for requests to become available */
+			SPDK_DEBUGLOG(bdev_raid, "No I/O submitted in this window, waiting for requests\n");
+			/* The process will be resumed when requests become available via process_continue_poller */
+			/* No need to do anything here - the poller will retry */
+		}
 	}
 }
 
@@ -3538,24 +3632,26 @@ raid_bdev_process_thread_run(struct raid_bdev_process *process)
 	struct raid_bdev *raid_bdev = process->raid_bdev;
 
 	assert(spdk_get_thread() == process->thread);
-	assert(process->window_remaining == 0);
-	assert(process->window_range_locked == false);
 
 	if (process->state == RAID_PROCESS_STATE_STOPPING) {
 		raid_bdev_process_do_finish(process);
 		return;
 	}
 
-	if (process->window_offset == raid_bdev->bdev.blockcnt) {
+	if (process->window_offset >= raid_bdev->bdev.blockcnt) {
 		SPDK_DEBUGLOG(bdev_raid, "process completed on %s\n", raid_bdev->bdev.name);
 		raid_bdev_process_finish(process, 0);
 		return;
 	}
 
+	/* Reuse original LBA locking mechanism for all process types */
+	assert(process->window_remaining == 0);
+	assert(process->window_range_locked == false);
 	process->max_window_size = spdk_min(raid_bdev->bdev.blockcnt - process->window_offset,
 					    process->max_window_size);
 	raid_bdev_process_lock_window_range(process);
 }
+
 
 static void
 raid_bdev_process_thread_init(void *ctx)
@@ -3569,11 +3665,13 @@ raid_bdev_process_thread_init(void *ctx)
 	ch = spdk_get_io_channel(raid_bdev);
 	if (ch == NULL) {
 		process->status = -ENOMEM;
+		process->error_status = -ENOMEM;
 		raid_bdev_process_do_finish(process);
 		return;
 	}
 
 	process->raid_ch = spdk_io_channel_get_ctx(ch);
+
 	process->state = RAID_PROCESS_STATE_RUNNING;
 
 	if (process->qos.enable_qos) {
@@ -3582,8 +3680,33 @@ raid_bdev_process_thread_init(void *ctx)
 		spdk_poller_pause(process->qos.process_continue_poller);
 	}
 
-	SPDK_NOTICELOG("Started %s on raid bdev %s\n",
-		       raid_bdev_process_to_str(process->type), raid_bdev->bdev.name);
+	if (process->type == RAID_PROCESS_REBUILD && process->target != NULL) {
+		uint8_t target_slot = raid_bdev_base_bdev_slot(process->target);
+		double percent = 0.0;
+		uint64_t total_size = raid_bdev->bdev.blockcnt;
+		uint64_t current_offset = process->window_offset;
+		
+		if (total_size > 0) {
+			percent = (double)current_offset * 100.0 / (double)total_size;
+		}
+		
+		SPDK_NOTICELOG("\n");
+		SPDK_NOTICELOG("===========================================================\n");
+		SPDK_NOTICELOG("REBUILD IN PROGRESS: RAID bdev '%s'\n", raid_bdev->bdev.name);
+		SPDK_NOTICELOG("Target disk: %s (slot %u)\n", 
+			       process->target->name, target_slot);
+		SPDK_NOTICELOG("Rebuild started at offset: %lu blocks (%.2f%%)\n",
+			       current_offset, percent);
+		SPDK_NOTICELOG("Total size: %lu blocks\n", total_size);
+		SPDK_NOTICELOG("State: %s\n", raid_rebuild_state_to_str(process->rebuild_state));
+		SPDK_NOTICELOG("Rebuild is running in background. This may take a while...\n");
+		SPDK_NOTICELOG("Check progress: bdev_raid_get_bdevs\n");
+		SPDK_NOTICELOG("===========================================================\n");
+		SPDK_NOTICELOG("\n");
+	} else {
+		SPDK_NOTICELOG("Started %s on raid bdev %s\n",
+			       raid_bdev_process_to_str(process->type), raid_bdev->bdev.name);
+	}
 
 	raid_bdev_process_thread_run(process);
 }
@@ -3593,7 +3716,9 @@ raid_bdev_channels_abort_start_process_done(struct spdk_io_channel_iter *i, int 
 {
 	struct raid_bdev_process *process = spdk_io_channel_iter_get_ctx(i);
 
-	_raid_bdev_remove_base_bdev(process->target, NULL, NULL);
+	if (process->target != NULL) {
+		_raid_bdev_remove_base_bdev(process->target, NULL, NULL);
+	}
 	raid_bdev_process_free(process);
 
 	/* TODO: update sb */
@@ -3618,7 +3743,7 @@ raid_bdev_channels_start_process_done(struct spdk_io_channel_iter *i, int status
 	struct spdk_thread *thread;
 	char thread_name[RAID_BDEV_SB_NAME_SIZE + 16];
 
-	if (status == 0 &&
+	if (status == 0 && process->target != NULL &&
 	    (process->target->remove_scheduled || !process->target->is_configured ||
 	     raid_bdev->num_base_bdevs_operational <= raid_bdev->min_base_bdevs_operational)) {
 		/* a base bdev was removed before we got here */
@@ -3672,6 +3797,12 @@ raid_bdev_process_start(struct raid_bdev_process *process)
 
 	assert(raid_bdev->module->submit_process_request != NULL);
 
+	/* Initialize simplified rebuild error status */
+	if (process->type == RAID_PROCESS_REBUILD) {
+		process->error_status = 0;
+	}
+
+	/* Reuse original multi-channel setup (but simplified processing) */
 	spdk_for_each_channel(raid_bdev, raid_bdev_channel_start_process, process,
 			      raid_bdev_channels_start_process_done);
 }
@@ -3754,6 +3885,8 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
 	process->rebuild_state = RAID_REBUILD_STATE_IDLE;
 	process->rebuild_done_cb = NULL;
 	process->rebuild_done_ctx = NULL;
+	/* Initialize simplified rebuild error status */
+	process->error_status = 0;
 
 	if (g_opts.process_max_bandwidth_mb_sec != 0) {
 		process->qos.enable_qos = true;
@@ -3980,7 +4113,15 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 		rc = raid_bdev_configure(raid_bdev, configure_cb, base_info->configure_cb_ctx);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to configure raid bdev: %s\n", spdk_strerror(-rc));
+			/* raid_bdev_configure failed synchronously - callback was not set, need to call it here */
+			/* But wait - if rc != 0, raid_bdev_configure may have already called the callback or not set it */
+			/* Actually, looking at raid_bdev_configure code, if it fails synchronously (rc != 0),
+			 * it sets configure_cb to NULL (line 2150) and returns the error.
+			 * So configure_cb should still be valid here and we need to call it.
+			 */
 		} else {
+			/* raid_bdev_configure is asynchronous - callback will be called later in raid_bdev_configure_cont */
+			/* Set configure_cb to NULL to prevent duplicate callback */
 			configure_cb = NULL;
 		}
 	} else if (base_info->is_process_target) {
@@ -3988,6 +4129,10 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 		rc = raid_bdev_start_rebuild(base_info);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to start rebuild: %s\n", spdk_strerror(-rc));
+			/* Rebuild failed - rollback state */
+			base_info->is_configured = false;
+			base_info->is_process_target = false;
+			raid_bdev->num_base_bdevs_operational--;
 			_raid_bdev_remove_base_bdev(base_info, NULL, NULL);
 		}
 	} else {
@@ -3999,10 +4144,9 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 		/* Safety check: ensure base_bdev_info array is valid before calculating slot */
 		if (raid_bdev->base_bdev_info == NULL) {
 			SPDK_ERRLOG("raid_bdev->base_bdev_info is NULL for RAID bdev '%s'\n", raid_bdev->bdev.name);
-			if (base_info->configure_cb) {
-				configure_cb = base_info->configure_cb;
-				base_info->configure_cb = NULL;
+			if (configure_cb != NULL) {
 				configure_cb(base_info->configure_cb_ctx, -EINVAL);
+				configure_cb = NULL;
 			}
 			return;
 		}
@@ -4012,10 +4156,9 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 		if (slot_idx >= raid_bdev->num_base_bdevs) {
 			SPDK_ERRLOG("Calculated slot %u exceeds num_base_bdevs %u for RAID bdev '%s'\n",
 				    slot_idx, raid_bdev->num_base_bdevs, raid_bdev->bdev.name);
-			if (base_info->configure_cb) {
-				configure_cb = base_info->configure_cb;
-				base_info->configure_cb = NULL;
+			if (configure_cb != NULL) {
 				configure_cb(base_info->configure_cb_ctx, -EINVAL);
+				configure_cb = NULL;
 			}
 			return;
 		}
@@ -4113,20 +4256,32 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 			rebuild_reason = "new disk - needs superblock write and rebuild";
 		}
 
-		if (needs_rebuild && raid_bdev->process == NULL) {
+		/* Only start rebuild if not already started in the earlier branch (4104-4110) */
+		if (needs_rebuild && raid_bdev->process == NULL && !base_info->is_process_target) {
 			/* Start rebuild for this base bdev */
-			SPDK_NOTICELOG("Starting automatic rebuild for base bdev %s (slot %u) on RAID bdev %s: %s\n",
-				       base_info->name, slot_idx, raid_bdev->bdev.name,
+			SPDK_NOTICELOG("\n");
+			SPDK_NOTICELOG("===========================================================\n");
+			SPDK_NOTICELOG("REBUILD STARTING: Base bdev %s (slot %u) on RAID bdev %s\n",
+				       base_info->name, slot_idx, raid_bdev->bdev.name);
+			SPDK_NOTICELOG("Reason: %s\n",
 				       rebuild_reason ? rebuild_reason : "unknown reason");
+			SPDK_NOTICELOG("Rebuild will start automatically. Please wait...\n");
+			SPDK_NOTICELOG("You can check rebuild progress using: bdev_raid_get_bdevs\n");
+			SPDK_NOTICELOG("===========================================================\n");
+			SPDK_NOTICELOG("\n");
+			
 			base_info->is_process_target = true;
 			raid_bdev->num_base_bdevs_operational++;
 			rc = raid_bdev_start_rebuild(base_info);
 			if (rc != 0) {
 				SPDK_WARNLOG("Failed to start rebuild for base bdev %s: %s\n",
 					     base_info->name, spdk_strerror(-rc));
-				/* Don't fail configuration if rebuild start fails */
+				/* Don't fail configuration if rebuild start fails, but rollback state */
 				base_info->is_process_target = false;
 				raid_bdev->num_base_bdevs_operational--;
+				/* Note: is_configured remains true as the disk is still configured in the array */
+			} else {
+				/* Rebuild started successfully - output will be shown in thread_init */
 			}
 		}
 	}

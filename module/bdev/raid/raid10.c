@@ -822,7 +822,7 @@ raid10_submit_process_request(struct raid_bdev_process_request *process_req,
 {
 	struct raid_bdev_io *raid_io = &process_req->raid_io;
 	/* Process context always owns the raid_bdev pointer (target may be NULL during setup). */
-	struct raid_bdev *raid_bdev = process_req->process->raid_bdev;
+	struct raid_bdev *raid_bdev = process_req->target->raid_bdev;
 	struct raid_bdev_io_channel *process_raid_ch = raid_ch;
 	struct spdk_bdev_ext_io_opts io_opts;
 	struct raid_base_bdev_info *base_info;

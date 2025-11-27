@@ -390,10 +390,18 @@ bdev_raid_delete_done(void *cb_arg, int rc)
 	struct spdk_jsonrpc_request *request = ctx->request;
 
 	if (rc != 0) {
-		SPDK_ERRLOG("Failed to delete raid bdev %s (%d): %s\n",
-			    ctx->req.name, rc, spdk_strerror(-rc));
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						 spdk_strerror(-rc));
+		if (rc == -EBUSY) {
+			/* Rebuild is in progress - provide detailed error message */
+			SPDK_ERRLOG("Cannot delete raid bdev %s: Rebuild is in progress\n", ctx->req.name);
+			spdk_jsonrpc_send_error_response_fmt(request, rc,
+				"Cannot delete RAID bdev '%s' while rebuild is in progress. Please wait for rebuild to complete.",
+				ctx->req.name);
+		} else {
+			SPDK_ERRLOG("Failed to delete raid bdev %s (%d): %s\n",
+				    ctx->req.name, rc, spdk_strerror(-rc));
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+							 spdk_strerror(-rc));
+		}
 		goto exit;
 	}
 
