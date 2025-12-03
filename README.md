@@ -6,8 +6,18 @@ MIMO 是基于 SPDK 深度定制的高性能存储框架，核心目标包括：
 ## 关键特性
 
 ### 核心功能
-- **RAID / EC 增强**：从零实现 EC bdev 模块、补充重建逻辑、引入 RAID10、提供 superblock 清理流程，并交付详细的 RPC/CLI 与测试工具链
-- **磨损均衡**：实现 NVMe SMART 采集与 wear-leveling 扩展，支持多策略选择、快速路径、健康信息缓存及降级逻辑
+- **RAID / EC 增强**：
+  - 从零实现 EC bdev 模块，支持完整的编码/解码、重建、故障恢复
+  - 补充 RAID 重建逻辑，引入 RAID10，提供 superblock 清理流程
+  - **智能状态处理**：改进 CONFIGURING 状态处理，不自动删除用户设备，通过 UUID 匹配智能判断，明确提示冲突让用户决定
+  - **UUID 匹配优化**：EC/RAID 模块支持通过 UUID 匹配 base bdev 到原始 slot，支持设备热插拔恢复
+  - **Process 框架**：将 RAID 的 process 框架移植到 EC 模块，支持 window 机制和 superblock 集成
+  - 交付详细的 RPC/CLI 与测试工具链
+- **磨损均衡**：
+  - 实现 NVMe SMART 采集与 wear-leveling 扩展
+  - 支持多策略选择、快速路径、健康信息缓存及降级逻辑
+  - 内置容错保证，确保同组条带不共享设备
+  - 支持磨损配置文件（Wear Profile）和条带分配缓存
 - **Go 通知桥接**：新增 `go/notifybridge` 模块，支持通过 JSON 配置文件灵活配置，在 NVMe 设备移除等事件时触发外部通知，方便与管控系统联动
 
 ### 品牌化与配置
@@ -64,6 +74,10 @@ MIMO 是基于 SPDK 深度定制的高性能存储框架，核心目标包括：
 45. **2025-11-19 · c3f7f2d – 实现了 Go 调用仓库**：新增 `go/notifybridge`（含 README、示例配置、模块依赖）及 C 头文件/入口，把 Go 进程桥接到 `mimo_tgt`。
 46. **2025-11-19 · ee99cbd – Add Go notify hook for NVMe removal**：把 Go 钩子整合进通用 `mk/spdk.app.mk`，并在 `bdev_nvme.c` 中触发 NVMe 删除事件通知，同时精简 `mimo_tgt` Makefile。
 47. **2025-11-20 · 831446d – 将用户可见输出中的 spdk 改为 mimo 并更新通知端口为 9988**：全面更新所有用户可见输出（日志、错误消息、帮助信息、文件路径等）为 MIMO 品牌标识，并实现 Go 通知桥接的 JSON 配置文件支持，支持通过配置文件或环境变量灵活配置所有参数。
+48. **2025-11-26 · 9dba85e – 解决了添加base bdev后空指针崩溃的问题并同步至EC**：修复 RAID 和 EC 模块在添加 base bdev 时的空指针崩溃问题，确保设备添加流程的稳定性。
+49. **2025-11-27 · 36b9280 – 移植RAID的process框架到EC模块**：完成基础结构、window 机制和 superblock 集成，使 EC 模块具备与 RAID 模块相同的 process 框架能力，支持更精细的重建状态跟踪和进度管理。
+50. **2025-11-27 · ef0581a – RAID10重建框架优化**：简化错误处理、添加状态输出、防止重建中删除，提升 RAID10 重建的可靠性和可观测性。
+51. **2025-12-03 · c8f62d8 – 改进raid和EC的重建模块**：解决了添加删除会崩溃的问题，修改了 slot 的匹配逻辑（通过 UUID 匹配到原始 slot），改进 CONFIGURING 状态处理（不自动删除用户设备，通过 UUID 智能判断并明确提示冲突），提升用户体验和数据安全性。
 
 ## 快速开始
 
@@ -107,16 +121,26 @@ export MIMO_NOTIFY_CONFIG=/path/to/notify_config.json
 
 ## 主要模块
 
-- **RAID/EC 模块**：支持 RAID0/1/5/10 和 EC（Erasure Coding），提供完整的重建、superblock 管理功能
-- **磨损均衡**：基于 NVMe SMART 数据的智能磨损均衡策略
+- **RAID/EC 模块**：
+  - 支持 RAID0/1/5/10 和 EC（Erasure Coding）
+  - 提供完整的重建、superblock 管理功能
+  - **智能状态处理**：CONFIGURING 状态智能判断，不自动删除用户设备
+  - **UUID 匹配**：支持通过 UUID 匹配设备到原始 slot，支持热插拔恢复
+  - **Process 框架**：EC 模块已集成 process 框架，支持 window 机制
+- **磨损均衡**：
+  - 基于 NVMe SMART 数据的智能磨损均衡策略
+  - 支持磨损配置文件、条带分配缓存
+  - 内置容错保证，确保同组条带不共享设备
 - **Go 通知桥接**：灵活的事件通知系统，支持 JSON 配置
 - **MIMO Target**：高性能存储目标应用，统一 MIMO 品牌标识
 
 ## 文档
 
 - [Go 通知桥接文档](go/notifybridge/README.md)
-- [EC 模块文档](module/bdev/ec/README.md)
-- [RAID 模块文档](module/bdev/raid/README.md)
+- [EC 模块详细指南](module/bdev/ec/EC_MODULE_DETAILED_GUIDE.md) - 包含磨损均衡、编码优化等详细说明
+- [EC 模块架构文档](module/bdev/ec/EC_BDEV_ARCHITECTURE.md) - EC 模块架构与实现详解
+- [EC I/O 流程指南](module/bdev/ec/EC_IO_FLOW_GUIDE.md) - I/O 流转过程详解
+- [RAID 重建改进文档](module/bdev/raid/RAID_REBUILD_IMPROVEMENTS.md) - 包含 CONFIGURING 状态处理改进说明
 
 > 如需查询某次提交的详细 diff，可执行 `git show <hash>`。
 
