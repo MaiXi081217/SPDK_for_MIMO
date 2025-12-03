@@ -80,13 +80,6 @@ struct raid_bdev_process {
 	int				status;
 	TAILQ_HEAD(, raid_process_finish_action) finish_actions;
 	struct raid_process_qos		qos;
-	/* Fine-grained rebuild state tracking */
-	enum raid_rebuild_state		rebuild_state;
-	/* Callback for rebuild completion */
-	void (*rebuild_done_cb)(void *ctx, int status);
-	void *rebuild_done_ctx;
-	/* Simplified rebuild: error flag (atomic) for unified error handling */
-	volatile int			error_status;
 };
 
 static inline struct raid_bdev_process *
@@ -222,53 +215,6 @@ static void	raid_bdev_delete_on_unquiesced(void *arg, int status);
 static void	raid_bdev_delete_wipe_cb(int status, struct raid_bdev *raid_bdev, void *arg);
 static void	raid_bdev_delete_restore_sb_cb(int restore_status, struct raid_bdev *raid_bdev,
 			       void *arg);
-
-struct raid_bdev_async_sb_ctx {
-	uint32_t attempt;
-};
-
-#define RAID_BDEV_ASYNC_SB_MAX_RETRIES 3
-
-static void
-raid_bdev_write_superblock_async_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
-{
-	struct raid_bdev_async_sb_ctx *async_ctx = ctx;
-
-	if (status != 0) {
-		async_ctx->attempt++;
-		if (async_ctx->attempt < RAID_BDEV_ASYNC_SB_MAX_RETRIES) {
-			SPDK_WARNLOG("Asynchronous superblock write failed on raid bdev %s (attempt %u/%u), retrying: %s\n",
-				     raid_bdev->bdev.name, async_ctx->attempt, RAID_BDEV_ASYNC_SB_MAX_RETRIES,
-				     spdk_strerror(-status));
-			raid_bdev_write_superblock(raid_bdev, raid_bdev_write_superblock_async_cb, async_ctx);
-			return;
-		}
-
-		SPDK_ERRLOG("Asynchronous superblock write failed on raid bdev %s after %u attempts: %s\n",
-			    raid_bdev->bdev.name, RAID_BDEV_ASYNC_SB_MAX_RETRIES, spdk_strerror(-status));
-	}
-
-	free(async_ctx);
-}
-
-static void
-raid_bdev_write_superblock_async(struct raid_bdev *raid_bdev)
-{
-	struct raid_bdev_async_sb_ctx *ctx;
-
-	if (raid_bdev == NULL || raid_bdev->sb == NULL) {
-		return;
-	}
-
-	ctx = calloc(1, sizeof(*ctx));
-	if (ctx == NULL) {
-		SPDK_ERRLOG("Failed to allocate async context for superblock write on raid bdev %s\n",
-			    raid_bdev->bdev.name);
-		return;
-	}
-
-	raid_bdev_write_superblock(raid_bdev, raid_bdev_write_superblock_async_cb, ctx);
-}
 
 static void
 raid_bdev_ch_process_cleanup(struct raid_bdev_io_channel *raid_ch)
@@ -674,8 +620,10 @@ raid_bdev_free_base_bdev_resource(struct raid_base_bdev_info *base_info)
 		base_info->app_thread_ch = NULL;
 	}
 
-	/* Clear remove_scheduled flag to allow this slot to be reused */
-	base_info->remove_scheduled = false;
+	/* NOTE: Do NOT clear remove_scheduled here - it must be cleared in raid_bdev_remove_base_bdev_done
+	 * to ensure proper state tracking during the removal process. Clearing it here would cause
+	 * assertion failures in raid_bdev_remove_base_bdev_done when called from unquiesce callback.
+	 */
 }
 
 static void
@@ -1187,6 +1135,16 @@ static void
 raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct raid_bdev_io *raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
+	struct raid_bdev *raid_bdev = spdk_io_channel_get_io_device(ch);
+
+	/* Check if RAID bdev is in ONLINE state before processing IO */
+	if (raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
+		SPDK_ERRLOG("RAID bdev '%s' is not ONLINE (state: %s), rejecting IO request\n",
+			    raid_bdev->bdev.name ? raid_bdev->bdev.name : "unknown",
+			    raid_bdev_state_to_str(raid_bdev->state));
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
 
 	raid_bdev_io_init(raid_io, spdk_io_channel_get_ctx(ch), bdev_io->type,
 			  bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
@@ -1359,9 +1317,6 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
 		spdk_json_write_named_uint64(w, "current_offset", offset);
 		spdk_json_write_named_uint64(w, "total_size", total_size);
 		spdk_json_write_named_double(w, "percent", percent);
-		if (process->type == RAID_PROCESS_REBUILD) {
-			spdk_json_write_named_string(w, "state", raid_rebuild_state_to_str(process->rebuild_state));
-		}
 		spdk_json_write_object_end(w);
 		spdk_json_write_object_end(w);
 	}
@@ -1639,22 +1594,6 @@ raid_bdev_process_to_str(enum raid_process_type value)
 	return g_raid_process_type_names[value];
 }
 
-static const char *g_raid_rebuild_state_names[] = {
-	[RAID_REBUILD_STATE_IDLE]		= "idle",
-	[RAID_REBUILD_STATE_READING]		= "reading",
-	[RAID_REBUILD_STATE_WRITING]		= "writing",
-	[RAID_REBUILD_STATE_CALCULATING]	= "calculating",
-};
-
-const char *
-raid_rebuild_state_to_str(enum raid_rebuild_state state)
-{
-	if (state > RAID_REBUILD_STATE_CALCULATING) {
-		return "";
-	}
-
-	return g_raid_rebuild_state_names[state];
-}
 
 /*
  * brief:
@@ -1788,9 +1727,66 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		return -EINVAL;
 	}
 
-	if (raid_bdev_find_by_name(name) != NULL) {
-		SPDK_ERRLOG("Duplicate raid bdev name found: %s\n", name);
-		return -EEXIST;
+	raid_bdev = raid_bdev_find_by_name(name);
+	if (raid_bdev != NULL) {
+		/* If RAID bdev exists but is in CONFIGURING state with no base bdevs discovered,
+		 * it was likely created from superblock during examine but failed to complete.
+		 * Check if UUID matches - if it does, we can continue using this device.
+		 * If UUID doesn't match or device has base bdevs, it's a real conflict.
+		 */
+		if (raid_bdev->state == RAID_BDEV_STATE_CONFIGURING &&
+		    raid_bdev->num_base_bdevs_discovered == 0) {
+			/* Check if UUID matches */
+			if (uuid != NULL && !spdk_uuid_is_null(uuid) &&
+			    spdk_uuid_compare(&raid_bdev->bdev.uuid, uuid) == 0) {
+				/* Same UUID - this is the same RAID device, allow continuing configuration */
+				SPDK_NOTICELOG("RAID bdev %s exists in CONFIGURING state with matching UUID. "
+					      "Continuing configuration.\n", name);
+				*raid_bdev_out = raid_bdev;
+				return 0;
+		} else {
+			/* Different UUID or no UUID provided - do not delete, let user decide */
+			if (uuid != NULL && !spdk_uuid_is_null(uuid)) {
+				/* UUID provided but doesn't match - name conflict with different UUID */
+				char existing_uuid_str[SPDK_UUID_STRING_LEN];
+				char provided_uuid_str[SPDK_UUID_STRING_LEN];
+				spdk_uuid_fmt_lower(existing_uuid_str, sizeof(existing_uuid_str),
+						   &raid_bdev->bdev.uuid);
+				spdk_uuid_fmt_lower(provided_uuid_str, sizeof(provided_uuid_str), uuid);
+				SPDK_ERRLOG("RAID bdev name '%s' already exists in CONFIGURING state "
+					    "with different UUID. Existing UUID: %s, Provided UUID: %s. "
+					    "Please delete the existing device first or use a different name.\n",
+					    name, existing_uuid_str, provided_uuid_str);
+				return -EEXIST;
+			} else {
+				/* UUID not provided - cannot determine if it's the same device */
+				if (!spdk_uuid_is_null(&raid_bdev->bdev.uuid) && raid_bdev->sb != NULL) {
+					/* Existing device has superblock UUID - likely created by examine */
+					char existing_uuid_str[SPDK_UUID_STRING_LEN];
+					spdk_uuid_fmt_lower(existing_uuid_str, sizeof(existing_uuid_str),
+							   &raid_bdev->bdev.uuid);
+					SPDK_ERRLOG("RAID bdev name '%s' already exists in CONFIGURING state "
+						    "(UUID: %s, likely created by examine). "
+						    "Please provide UUID to continue configuration, "
+						    "or delete the existing device first.\n",
+						    name, existing_uuid_str);
+					return -EEXIST;
+				} else {
+					/* Existing device has no UUID - cannot determine identity */
+					SPDK_ERRLOG("RAID bdev name '%s' already exists in CONFIGURING state "
+						    "but UUID information is missing. "
+						    "Please provide UUID or delete the existing device first.\n",
+						    name);
+					return -EEXIST;
+				}
+			}
+		}
+		} else {
+			SPDK_ERRLOG("Duplicate raid bdev name found: %s (state: %s, base_bdevs: %u)\n",
+				    name, raid_bdev_state_to_str(raid_bdev->state),
+				    raid_bdev->num_base_bdevs_discovered);
+			return -EEXIST;
+		}
 	}
 
 	if (level == RAID1) {
@@ -1890,6 +1886,11 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 	raid_bdev_gen->module = &g_raid_if;
 	raid_bdev_gen->write_cache = 0;
 	spdk_uuid_copy(&raid_bdev_gen->uuid, uuid);
+	
+	/* Set default blocklen (will be updated during configure) */
+	raid_bdev_gen->blocklen = 512;
+	/* Set blockcnt to 0 initially (will be updated during configure) */
+	raid_bdev_gen->blockcnt = 0;
 
 	TAILQ_INSERT_TAIL(&g_raid_bdev_list, raid_bdev, global_link);
 
@@ -2164,8 +2165,7 @@ raid_bdev_configure(struct raid_bdev *raid_bdev, raid_bdev_configure_cb cb, void
 /*
  * brief:
  * If raid bdev is online and registered, change the bdev state to
- * configuring and unregister this raid device. Queue this raid device
- * in configuring list
+ * offline. The bdev remains registered so it's visible in bdev_get_bdevs.
  * params:
  * raid_bdev - pointer to raid bdev
  * cb_fn - callback function
@@ -2214,7 +2214,7 @@ raid_bdev_deconfigure(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn,
 	raid_bdev->deconfigure_cb_fn = cb_fn;
 	raid_bdev->deconfigure_cb_arg = cb_arg;
 
-	/* Use wrapper callback that will close self_desc and then call user callback */
+	/* Unregister bdev - this will automatically unregister IO device as well */
 	spdk_bdev_unregister(&raid_bdev->bdev, raid_bdev_deconfigure_unregister_done, raid_bdev);
 }
 
@@ -2248,6 +2248,7 @@ static void
 raid_bdev_remove_base_bdev_done(struct raid_base_bdev_info *base_info, int status)
 {
 	struct raid_bdev *raid_bdev;
+	uint8_t i;
 
 	if (base_info == NULL) {
 		SPDK_ERRLOG("base_info is NULL in raid_bdev_remove_base_bdev_done\n");
@@ -2264,11 +2265,45 @@ raid_bdev_remove_base_bdev_done(struct raid_base_bdev_info *base_info, int statu
 		return;
 	}
 
-	assert(base_info->remove_scheduled);
+	/* Verify remove_scheduled before clearing it (aligned with EC framework)
+	 * Use defensive check instead of assert to avoid crashes in edge cases
+	 */
+	if (!base_info->remove_scheduled) {
+		SPDK_ERRLOG("remove_scheduled is false in raid_bdev_remove_base_bdev_done - this should not happen\n");
+		/* Continue anyway to avoid resource leak - callback may still need to be called */
+	}
 	base_info->remove_scheduled = false;
 
 	if (status == 0) {
 		raid_bdev->num_base_bdevs_operational--;
+
+		/* For RAID10, the real data-safety condition is: every mirror pair must still
+		 * have at least one surviving base bdev. 仅靠全局 num_base_bdevs_operational
+		 * 会漏掉 “两块盘都在同一组 mirror pair 挂掉” 这种情况——这时即使还剩多块盘，
+		 * 该 pair 的数据也已经完全丢失，阵列应该被视为不可用。
+		 *
+		 * 这里按 slot 成对检查：假设 RAID10 始终是每组 2 盘的 mirror pair。
+		 */
+		if (raid_bdev->level == RAID10 && raid_bdev->num_base_bdevs >= 2) {
+			bool pair_has_disk;
+
+			for (i = 0; i + 1 < raid_bdev->num_base_bdevs; i += 2) {
+				struct raid_base_bdev_info *b0 = &raid_bdev->base_bdev_info[i];
+				struct raid_base_bdev_info *b1 = &raid_bdev->base_bdev_info[i + 1];
+
+				/* 只要 pair 里还有一块 is_configured 的盘，就认为这组还“活着”。 */
+				pair_has_disk = (b0->is_configured || b1->is_configured);
+				if (!pair_has_disk) {
+					SPDK_ERRLOG("RAID10 bdev '%s': mirror pair [%u,%u] has lost all disks - "
+						    "array can no longer provide valid data, deconfiguring.\n",
+						    raid_bdev->bdev.name, i, i + 1);
+					raid_bdev_deconfigure(raid_bdev, base_info->remove_cb,
+							      base_info->remove_cb_ctx);
+					return;
+				}
+			}
+		}
+
 		if (raid_bdev->num_base_bdevs_operational < raid_bdev->min_base_bdevs_operational) {
 			/* There is not enough base bdevs to keep the raid bdev operational. */
 			raid_bdev_deconfigure(raid_bdev, base_info->remove_cb, base_info->remove_cb_ctx);
@@ -2372,10 +2407,16 @@ raid_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int sta
 	raid_bdev = base_info->raid_bdev;
 	if (raid_bdev == NULL) {
 		SPDK_ERRLOG("base_info->raid_bdev is NULL in raid_bdev_channels_remove_base_bdev_done\n");
+		/* Clear remove_scheduled before freeing resources since we won't call remove_base_bdev_done */
+		base_info->remove_scheduled = false;
 		raid_bdev_free_base_bdev_resource(base_info);
 		return;
 	}
 
+	/* Free base bdev resources, but keep remove_scheduled flag set - it will be cleared
+	 * in raid_bdev_remove_base_bdev_done after unquiesce completes. This ensures proper
+	 * state tracking throughout the removal process.
+	 */
 	raid_bdev_free_base_bdev_resource(base_info);
 
 	spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_remove_base_bdev_on_unquiesced,
@@ -2634,6 +2675,32 @@ static int _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 				       raid_base_bdev_cb cb_fn, void *cb_ctx);
 
 /*
+ * Context for wrapping deconfigure callback to clear remove_scheduled
+ */
+struct raid_bdev_deconfigure_wrapper_ctx {
+	struct raid_base_bdev_info *base_info;
+	raid_base_bdev_cb user_cb;
+	void *user_ctx;
+};
+
+/*
+ * Wrapper callback for raid_bdev_deconfigure to clear remove_scheduled flag
+ */
+static void
+raid_bdev_deconfigure_wrapper_cb(void *ctx, int status)
+{
+	struct raid_bdev_deconfigure_wrapper_ctx *wrapper_ctx = ctx;
+	
+	if (wrapper_ctx->base_info != NULL) {
+		wrapper_ctx->base_info->remove_scheduled = false;
+	}
+	if (wrapper_ctx->user_cb != NULL) {
+		wrapper_ctx->user_cb(wrapper_ctx->user_ctx, status);
+	}
+	free(wrapper_ctx);
+}
+
+/*
  * Callback after wiping superblock - continue with removal
  */
 static void
@@ -2680,7 +2747,24 @@ raid_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
 
 	if (raid_bdev->min_base_bdevs_operational == raid_bdev->num_base_bdevs) {
 		raid_bdev->num_base_bdevs_operational--;
-		raid_bdev_deconfigure(raid_bdev, cb_fn, cb_ctx);
+		/* When deconfiguring the entire raid bdev, we need to clear remove_scheduled
+		 * since we're bypassing the normal quiesce/unquiesce flow that would call
+		 * raid_bdev_remove_base_bdev_done. Create a wrapper callback to clear the flag.
+		 */
+		struct raid_bdev_deconfigure_wrapper_ctx *wrapper_ctx = calloc(1, sizeof(*wrapper_ctx));
+		if (wrapper_ctx == NULL) {
+			SPDK_ERRLOG("Failed to allocate wrapper context for deconfigure\n");
+			base_info->remove_scheduled = false;
+			if (cb_fn != NULL) {
+				cb_fn(cb_ctx, -ENOMEM);
+			}
+			return;
+		}
+		wrapper_ctx->base_info = base_info;
+		wrapper_ctx->user_cb = cb_fn;
+		wrapper_ctx->user_ctx = cb_ctx;
+		
+		raid_bdev_deconfigure(raid_bdev, raid_bdev_deconfigure_wrapper_cb, wrapper_ctx);
 		return;
 	}
 	struct raid_bdev_process *process = raid_bdev_get_active_process(raid_bdev);
@@ -2750,11 +2834,25 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 								     raid_bdev_remove_base_bdev_after_wipe,
 								     base_info);
 		if (rc == 0) {
+			/* Wipe started successfully - callback will be called when wipe completes */
 			return 0;
 		}
-		/* Wipe failed - callback already called. Don't clear remove_scheduled/remove_cb/remove_cb_ctx. */
-		SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s', removal handled by wipe callback\n",
-			     base_info->name ? base_info->name : "unknown");
+		/* Wipe failed to start - check if callback was called
+		 * If callback was called, it will handle removal. Otherwise, we need to handle it here.
+		 * For synchronous errors (like -EINVAL, -ENODEV), callback is called immediately, so removal is handled.
+		 * For other errors (like -ENOMEM with queue wait), callback may be called later.
+		 */
+		if (rc == -EINVAL || rc == -ENODEV) {
+			/* Synchronous error - callback was called immediately, removal handled by callback */
+			SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s': %s (removal handled by wipe callback)\n",
+				     base_info->name ? base_info->name : "unknown", spdk_strerror(-rc));
+			return rc;
+		}
+		/* Other errors - callback may have been called (e.g., -ENOMEM with queue wait)
+		 * Don't clear remove_scheduled/remove_cb/remove_cb_ctx - callback will handle it
+		 */
+		SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s': %s (callback may be called later)\n",
+			     base_info->name ? base_info->name : "unknown", spdk_strerror(-rc));
 		return rc;
 	}
 	SPDK_DEBUGLOG(bdev_raid, "Cannot wipe superblock - base bdev desc or channel is NULL\n");
@@ -2771,7 +2869,25 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 		}
 	} else if (raid_bdev->min_base_bdevs_operational == raid_bdev->num_base_bdevs) {
 		raid_bdev->num_base_bdevs_operational--;
-		raid_bdev_deconfigure(raid_bdev, cb_fn, cb_ctx);
+		/* When deconfiguring the entire raid bdev, we need to clear remove_scheduled
+		 * since we're bypassing the normal quiesce/unquiesce flow that would call
+		 * raid_bdev_remove_base_bdev_done. Create a wrapper callback to clear the flag.
+		 */
+		struct raid_bdev_deconfigure_wrapper_ctx *wrapper_ctx = calloc(1, sizeof(*wrapper_ctx));
+		if (wrapper_ctx == NULL) {
+			SPDK_ERRLOG("Failed to allocate wrapper context for deconfigure\n");
+			base_info->remove_scheduled = false;
+			if (cb_fn != NULL) {
+				cb_fn(cb_ctx, -ENOMEM);
+			}
+			return -ENOMEM;
+		}
+		wrapper_ctx->base_info = base_info;
+		wrapper_ctx->user_cb = cb_fn;
+		wrapper_ctx->user_ctx = cb_ctx;
+		
+		raid_bdev_deconfigure(raid_bdev, raid_bdev_deconfigure_wrapper_cb, wrapper_ctx);
+		return 0;
 	} else {
 		if (process != NULL) {
 			ret = raid_bdev_process_base_bdev_remove(process, base_info);
@@ -3004,7 +3120,6 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void 
 				    process->target->name, target_slot);
 			SPDK_ERRLOG("Rebuild progress: %.2f%% (%lu / %lu blocks)\n",
 				    percent, current_offset, total_size);
-			SPDK_ERRLOG("State: %s\n", raid_rebuild_state_to_str(process->rebuild_state));
 			SPDK_ERRLOG("Please wait for rebuild to complete before deleting.\n");
 			SPDK_ERRLOG("===========================================================\n");
 			SPDK_ERRLOG("\n");
@@ -3171,11 +3286,6 @@ _raid_bdev_process_finish_done(void *ctx)
 		free(finish_action);
 	}
 
-	/* Call rebuild done callback if rebuild was in progress */
-	if (process->type == RAID_PROCESS_REBUILD && process->rebuild_done_cb != NULL) {
-		process->rebuild_done_cb(process->rebuild_done_ctx, process->status);
-	}
-
 	spdk_poller_unregister(&process->qos.process_continue_poller);
 
 	raid_bdev_process_free(process);
@@ -3195,12 +3305,112 @@ raid_bdev_process_finish_target_removed(void *ctx, int status)
 	spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
 }
 
+static void raid_bdev_process_finish_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *ctx)
+{
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to write raid bdev '%s' superblock after background process finished: %s\n",
+			    raid_bdev->bdev.name, spdk_strerror(-status));
+	}
+}
+
+static void
+raid_bdev_process_finish_write_sb(void *ctx)
+{
+	struct raid_bdev *raid_bdev = ctx;
+	struct raid_bdev_superblock *sb = raid_bdev->sb;
+	struct raid_bdev_sb_base_bdev *sb_base_bdev;
+	struct raid_base_bdev_info *base_info;
+	uint8_t i;
+
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		sb_base_bdev = &sb->base_bdevs[i];
+
+		if (sb_base_bdev->state != RAID_SB_BASE_BDEV_CONFIGURED &&
+		    sb_base_bdev->slot < raid_bdev->num_base_bdevs) {
+			base_info = &raid_bdev->base_bdev_info[sb_base_bdev->slot];
+			if (base_info->is_configured) {
+				sb_base_bdev->state = RAID_SB_BASE_BDEV_CONFIGURED;
+				sb_base_bdev->data_offset = base_info->data_offset;
+				spdk_uuid_copy(&sb_base_bdev->uuid, &base_info->uuid);
+			}
+		}
+	}
+
+	raid_bdev_write_superblock(raid_bdev, raid_bdev_process_finish_write_sb_cb, NULL);
+}
+
+static void
+raid_bdev_process_finish_unquiesced(void *ctx, int status)
+{
+	struct raid_bdev_process *process = ctx;
+
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to unquiesce bdev: %s\n", spdk_strerror(-status));
+	}
+
+	if (process->status != 0) {
+		status = _raid_bdev_remove_base_bdev(process->target, raid_bdev_process_finish_target_removed,
+						     process);
+		if (status != 0) {
+			raid_bdev_process_finish_target_removed(process, status);
+		}
+		return;
+	}
+
+	spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
+}
+
+static void
+raid_bdev_process_finish_unquiesce(void *ctx)
+{
+	struct raid_bdev_process *process = ctx;
+	int rc;
+
+	rc = spdk_bdev_unquiesce(&process->raid_bdev->bdev, &g_raid_if,
+				 raid_bdev_process_finish_unquiesced, process);
+	if (rc != 0) {
+		raid_bdev_process_finish_unquiesced(process, rc);
+	}
+}
+
+static void
+raid_bdev_process_finish_done(void *ctx)
+{
+	struct raid_bdev_process *process = ctx;
+	struct raid_bdev *raid_bdev = process->raid_bdev;
+
+	if (process->raid_ch != NULL) {
+		spdk_put_io_channel(spdk_io_channel_from_ctx(process->raid_ch));
+	}
+
+	process->state = RAID_PROCESS_STATE_STOPPED;
+
+	if (process->status == 0) {
+		SPDK_NOTICELOG("Finished %s on raid bdev %s\n",
+			       raid_bdev_process_to_str(process->type),
+			       raid_bdev->bdev.name);
+		if (raid_bdev->superblock_enabled) {
+			spdk_thread_send_msg(spdk_thread_get_app_thread(),
+					     raid_bdev_process_finish_write_sb,
+					     raid_bdev);
+		}
+	} else {
+		SPDK_WARNLOG("Finished %s on raid bdev %s: %s\n",
+			     raid_bdev_process_to_str(process->type),
+			     raid_bdev->bdev.name,
+			     spdk_strerror(-process->status));
+	}
+
+	spdk_thread_send_msg(spdk_thread_get_app_thread(), raid_bdev_process_finish_unquiesce,
+			     process);
+}
+
 static void
 __raid_bdev_process_finish(struct spdk_io_channel_iter *i, int status)
 {
 	struct raid_bdev_process *process = spdk_io_channel_iter_get_ctx(i);
 
-	spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
+	spdk_thread_send_msg(process->thread, raid_bdev_process_finish_done, process);
 }
 
 static void
@@ -3210,17 +3420,11 @@ raid_bdev_channel_process_finish(struct spdk_io_channel_iter *i)
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct raid_bdev_io_channel *raid_ch = spdk_io_channel_get_ctx(ch);
 
-	if (process->status == 0 && process->target != NULL) {
+	if (process->status == 0) {
 		uint8_t slot = raid_bdev_base_bdev_slot(process->target);
-		struct raid_bdev *raid_bdev = process->raid_bdev;
 
-		/* Safety check: ensure slot is within valid range */
-		if (slot < raid_bdev->num_base_bdevs && raid_ch->base_channel != NULL) {
-			raid_ch->base_channel[slot] = raid_ch->process.target_ch;
-			raid_ch->process.target_ch = NULL;
-		} else {
-			SPDK_ERRLOG("Invalid slot %u or base_channel is NULL\n", slot);
-		}
+		raid_ch->base_channel[slot] = raid_ch->process.target_ch;
+		raid_ch->process.target_ch = NULL;
 	}
 
 	raid_bdev_ch_process_cleanup(raid_ch);
@@ -3237,63 +3441,12 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to quiesce bdev: %s\n", spdk_strerror(-status));
-		/* Quiesce failed - need to clean up process state */
-		/* Process is in STOPPING state, need to finish cleanup */
-		raid_bdev->process = NULL;
-		if (process->target != NULL) {
-			process->target->is_process_target = false;
-		}
-		/* Send message to process thread to finish cleanup */
-		spdk_thread_send_msg(process->thread, _raid_bdev_process_finish_done, process);
 		return;
 	}
 
-	/* Handle rebuild failure: remove target disk if rebuild failed */
-	if (process->status != 0 && process->type == RAID_PROCESS_REBUILD) {
-		if (process->target != NULL) {
-			SPDK_ERRLOG("\n");
-			SPDK_ERRLOG("===========================================================\n");
-			SPDK_ERRLOG("REBUILD FAILED: Target disk '%s' may have been removed\n",
-				    process->target->name ? process->target->name : "unknown");
-			SPDK_ERRLOG("RAID bdev: %s\n", process->raid_bdev->bdev.name);
-			SPDK_ERRLOG("Error: %s\n", spdk_strerror(-process->status));
-			SPDK_ERRLOG("Removing target disk from RAID array...\n");
-			SPDK_ERRLOG("===========================================================\n");
-			SPDK_ERRLOG("\n");
-			
-			status = _raid_bdev_remove_base_bdev(process->target, raid_bdev_process_finish_target_removed,
-							     process);
-			/* _raid_bdev_remove_base_bdev may:
-			 * - Return 0: wipe started, callback will be called when wipe completes
-			 * - Return non-zero: either callback already called (wipe failed) or synchronous error
-			 *   In case of synchronous error (e.g., -EBUSY, -ENODEV), callback is NOT called,
-			 *   so we need to call it ourselves.
-			 */
-			if (status != 0) {
-				/* Check if this is a synchronous error (callback not called) */
-				/* Errors like -EBUSY, -ENODEV, -EINVAL are synchronous and don't call callback */
-				if (status == -EBUSY || status == -ENODEV || status == -EINVAL) {
-					/* Synchronous error - callback not called, call it now */
-					SPDK_WARNLOG("Failed to remove target disk: %s\n", spdk_strerror(-status));
-					raid_bdev_process_finish_target_removed(process, status);
-				} else {
-					/* Other errors (like from wipe) - callback may have been called already */
-					/* Don't call callback again to avoid double callback */
-					SPDK_WARNLOG("Failed to remove target disk: %s (callback may have been called)\n",
-						     spdk_strerror(-status));
-				}
-			}
-			/* If removal was started (status == 0), callback will be called when wipe completes */
-			return;
-		}
-	}
-
 	raid_bdev->process = NULL;
-	if (process->target != NULL) {
-		process->target->is_process_target = false;
-	}
+	process->target->is_process_target = false;
 
-	/* Reuse original multi-channel cleanup */
 	spdk_for_each_channel(process->raid_bdev, raid_bdev_channel_process_finish, process,
 			      __raid_bdev_process_finish);
 }
@@ -3336,11 +3489,6 @@ raid_bdev_process_finish(struct raid_bdev_process *process, int status)
 	assert(process->state == RAID_PROCESS_STATE_RUNNING);
 	process->state = RAID_PROCESS_STATE_STOPPING;
 
-	/* For simplified rebuild: set error_status if finishing with error */
-	if (process->type == RAID_PROCESS_REBUILD && status != 0) {
-		process->error_status = status;
-	}
-
 	if (process->window_range_locked) {
 		raid_bdev_process_unlock_window_range(process);
 	} else {
@@ -3362,20 +3510,6 @@ raid_bdev_process_window_range_unlocked(void *ctx, int status)
 	process->window_range_locked = false;
 	process->window_offset += process->window_size;
 
-	/* Update rebuild progress in superblock periodically (every window) */
-	if (process->type == RAID_PROCESS_REBUILD && 
-	    process->raid_bdev->sb != NULL && 
-	    process->target != NULL) {
-		uint8_t target_slot = raid_bdev_base_bdev_slot(process->target);
-		/* Update progress every window (can be optimized to update less frequently) */
-		raid_bdev_sb_update_rebuild_progress(process->raid_bdev, target_slot,
-						     process->window_offset,
-						     process->raid_bdev->bdev.blockcnt);
-		/* Write superblock asynchronously (non-blocking) */
-		raid_bdev_write_superblock_async(process->raid_bdev);
-	}
-
-	/* Reuse original thread_run logic */
 	raid_bdev_process_thread_run(process);
 }
 
@@ -3421,30 +3555,17 @@ raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req
 
 	assert(spdk_get_thread() == process->thread);
 
-	/* Simplified error handling: set error status atomically */
 	if (status != 0) {
 		process->window_status = status;
-		process->error_status = status;
 	}
 
-	/* Reuse original request handling logic */
 	assert(process->window_remaining >= process_req->num_blocks);
 	TAILQ_INSERT_TAIL(&process->requests, process_req, link);
 
 	process->window_remaining -= process_req->num_blocks;
 	if (process->window_remaining == 0) {
-		/* Unified error handling: error_status and window_status should be in sync
-		 * For rebuild, prefer error_status; for other processes, use window_status
-		 */
-		int error_to_report = 0;
-		if (process->type == RAID_PROCESS_REBUILD && process->error_status != 0) {
-			error_to_report = process->error_status;
-		} else if (process->window_status != 0) {
-			error_to_report = process->window_status;
-		}
-		
-		if (error_to_report != 0) {
-			raid_bdev_process_finish(process, error_to_report);
+		if (process->window_status != 0) {
+			raid_bdev_process_finish(process, process->window_status);
 			return;
 		}
 
@@ -3479,10 +3600,6 @@ raid_bdev_submit_process_request(struct raid_bdev_process *process, uint64_t off
 			SPDK_ERRLOG("Failed to submit process request on %s: %s\n",
 				    raid_bdev->bdev.name, spdk_strerror(-ret));
 			process->window_status = ret;
-			/* For simplified rebuild: also set error_status */
-			if (process->type == RAID_PROCESS_REBUILD) {
-				process->error_status = ret;
-			}
 		}
 		/* ret == 0 means no request available (normal), ret < 0 means error */
 		return ret;
@@ -3665,7 +3782,6 @@ raid_bdev_process_thread_init(void *ctx)
 	ch = spdk_get_io_channel(raid_bdev);
 	if (ch == NULL) {
 		process->status = -ENOMEM;
-		process->error_status = -ENOMEM;
 		raid_bdev_process_do_finish(process);
 		return;
 	}
@@ -3698,7 +3814,6 @@ raid_bdev_process_thread_init(void *ctx)
 		SPDK_NOTICELOG("Rebuild started at offset: %lu blocks (%.2f%%)\n",
 			       current_offset, percent);
 		SPDK_NOTICELOG("Total size: %lu blocks\n", total_size);
-		SPDK_NOTICELOG("State: %s\n", raid_rebuild_state_to_str(process->rebuild_state));
 		SPDK_NOTICELOG("Rebuild is running in background. This may take a while...\n");
 		SPDK_NOTICELOG("Check progress: bdev_raid_get_bdevs\n");
 		SPDK_NOTICELOG("===========================================================\n");
@@ -3797,10 +3912,6 @@ raid_bdev_process_start(struct raid_bdev_process *process)
 
 	assert(raid_bdev->module->submit_process_request != NULL);
 
-	/* Initialize simplified rebuild error status */
-	if (process->type == RAID_PROCESS_REBUILD) {
-		process->error_status = 0;
-	}
 
 	/* Reuse original multi-channel setup (but simplified processing) */
 	spdk_for_each_channel(raid_bdev, raid_bdev_channel_start_process, process,
@@ -3881,12 +3992,6 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
 	}
 	TAILQ_INIT(&process->requests);
 	TAILQ_INIT(&process->finish_actions);
-	/* Initialize rebuild state and callback */
-	process->rebuild_state = RAID_REBUILD_STATE_IDLE;
-	process->rebuild_done_cb = NULL;
-	process->rebuild_done_ctx = NULL;
-	/* Initialize simplified rebuild error status */
-	process->error_status = 0;
 
 	if (g_opts.process_max_bandwidth_mb_sec != 0) {
 		process->qos.enable_qos = true;
@@ -3910,76 +4015,16 @@ raid_bdev_process_alloc(struct raid_bdev *raid_bdev, enum raid_process_type type
 	return process;
 }
 
-/* Forward declarations */
-static const struct raid_bdev_sb_base_bdev *
-raid_bdev_sb_find_base_bdev_by_slot(const struct raid_bdev *raid_bdev, uint8_t slot);
-static int
-raid_bdev_start_rebuild_with_cb(struct raid_base_bdev_info *target,
-				void (*done_cb)(void *ctx, int status), void *done_ctx);
-
 static int
 raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
 {
-	return raid_bdev_start_rebuild_with_cb(target, NULL, NULL);
-}
-
-static int
-raid_bdev_start_rebuild_with_cb(struct raid_base_bdev_info *target,
-				void (*done_cb)(void *ctx, int status), void *done_ctx)
-{
 	struct raid_bdev_process *process;
-	struct raid_bdev *raid_bdev = target->raid_bdev;
-	uint8_t target_slot;
-	uint64_t rebuild_offset = 0;
 
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	process = raid_bdev_process_alloc(raid_bdev, RAID_PROCESS_REBUILD, target);
+	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
 	if (process == NULL) {
 		return -ENOMEM;
-	}
-
-	/* Set rebuild callback */
-	process->rebuild_done_cb = done_cb;
-	process->rebuild_done_ctx = done_ctx;
-
-	/* Find target slot */
-	target_slot = raid_bdev_base_bdev_slot(target);
-
-	/* Safety check: ensure target_slot is within valid range */
-	if (target_slot >= raid_bdev->num_base_bdevs) {
-		SPDK_ERRLOG("Calculated target_slot %u exceeds num_base_bdevs %u for RAID bdev '%s'\n",
-			    target_slot, raid_bdev->num_base_bdevs, raid_bdev->bdev.name);
-		return -EINVAL;
-	}
-
-	/* Check if we're resuming a previous rebuild (REBUILDING state) */
-	if (raid_bdev->sb != NULL) {
-		const struct raid_bdev_sb_base_bdev *sb_base = raid_bdev_sb_find_base_bdev_by_slot(raid_bdev, target_slot);
-		if (sb_base != NULL && sb_base->state == RAID_SB_BASE_BDEV_REBUILDING) {
-			/* Resume from previous progress */
-			rebuild_offset = sb_base->rebuild_offset;
-			/* Validate rebuild_offset: ensure it's within valid range */
-			if (rebuild_offset > raid_bdev->bdev.blockcnt) {
-				SPDK_WARNLOG("Invalid rebuild_offset %lu (exceeds blockcnt %lu), resetting to 0\n",
-					     rebuild_offset, raid_bdev->bdev.blockcnt);
-				rebuild_offset = 0;
-			}
-			process->window_offset = rebuild_offset;
-			SPDK_NOTICELOG("Resuming rebuild for base bdev %s (slot %u) from offset %lu blocks\n",
-				       target->name, target_slot, rebuild_offset);
-		}
-	}
-
-	/* Update superblock to mark base bdev as REBUILDING before starting rebuild */
-	if (raid_bdev->sb != NULL) {
-		if (raid_bdev_sb_update_base_bdev_state(raid_bdev, target_slot,
-							 RAID_SB_BASE_BDEV_REBUILDING)) {
-			/* Initialize or update rebuild progress in superblock */
-			raid_bdev_sb_update_rebuild_progress(raid_bdev, target_slot, rebuild_offset,
-							     raid_bdev->bdev.blockcnt);
-			raid_bdev_write_superblock_async(raid_bdev);
-		}
 	}
 
 	raid_bdev_process_start(process);
@@ -4004,6 +4049,8 @@ raid_bdev_ch_sync(struct spdk_io_channel_iter *i)
 }
 
 /* Forward declarations for helper functions */
+static const struct raid_bdev_sb_base_bdev *
+raid_bdev_sb_find_base_bdev_by_slot(const struct raid_bdev *raid_bdev, uint8_t slot);
 
 static void
 raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
@@ -4027,11 +4074,23 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 	    base_info->is_process_target == false) {
 		/* TODO: defer if rebuild in progress on another base bdev */
 		assert(raid_bdev->process == NULL);
-		assert(raid_bdev->state == RAID_BDEV_STATE_ONLINE);
-		base_info->is_process_target = true;
-		/* To assure is_process_target is set before is_configured when checked in raid_bdev_create_cb() */
-		spdk_for_each_channel(raid_bdev, raid_bdev_ch_sync, base_info, _raid_bdev_configure_base_bdev_cont);
-		return;
+		
+		/* If RAID is OFFLINE (deconfigured), we need to reconfigure it first.
+		 * Don't enter the rebuild path, instead go through normal configuration flow.
+		 */
+		if (raid_bdev->state == RAID_BDEV_STATE_OFFLINE) {
+			/* Change state to CONFIGURING to allow raid_bdev_configure to proceed */
+			raid_bdev->state = RAID_BDEV_STATE_CONFIGURING;
+			SPDK_DEBUGLOG(bdev_raid, "raid bdev state changing from offline to configuring for reconfigure\n");
+			/* Continue with normal configuration flow below */
+		} else {
+			/* RAID is ONLINE, we can start rebuild process */
+			assert(raid_bdev->state == RAID_BDEV_STATE_ONLINE);
+			base_info->is_process_target = true;
+			/* To assure is_process_target is set before is_configured when checked in raid_bdev_create_cb() */
+			spdk_for_each_channel(raid_bdev, raid_bdev_ch_sync, base_info, _raid_bdev_configure_base_bdev_cont);
+			return;
+		}
 	}
 
 	/* For RAID10: Check if this slot is already occupied (scenario 4: old disk re-inserted after rebuild) */
@@ -4099,10 +4158,28 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 	raid_bdev->num_base_bdevs_discovered++;
 	assert(raid_bdev->num_base_bdevs_discovered <= raid_bdev->num_base_bdevs);
 	assert(raid_bdev->num_base_bdevs_operational <= raid_bdev->num_base_bdevs);
-	assert(raid_bdev->num_base_bdevs_operational >= raid_bdev->min_base_bdevs_operational);
+	/* When RAID is in CONFIGURING state (reconfiguring after deconfigure), 
+	 * num_base_bdevs_operational may temporarily be less than min_base_bdevs_operational
+	 * because it will be updated during the configuration process.
+	 */
+	if (raid_bdev->state != RAID_BDEV_STATE_CONFIGURING) {
+		assert(raid_bdev->num_base_bdevs_operational >= raid_bdev->min_base_bdevs_operational);
+	}
 
 	configure_cb = base_info->configure_cb;
 	base_info->configure_cb = NULL;
+	
+	/* When reconfiguring after deconfigure, num_base_bdevs_operational may be less than
+	 * num_base_bdevs_discovered. We need to update it to match num_base_bdevs_discovered
+	 * so that the configuration can proceed.
+	 */
+	if (raid_bdev->state == RAID_BDEV_STATE_CONFIGURING &&
+	    raid_bdev->num_base_bdevs_operational < raid_bdev->num_base_bdevs_discovered) {
+		raid_bdev->num_base_bdevs_operational = raid_bdev->num_base_bdevs_discovered;
+		SPDK_DEBUGLOG(bdev_raid, "Updating num_base_bdevs_operational to %u for reconfigure\n",
+			      raid_bdev->num_base_bdevs_operational);
+	}
+	
 	/*
 	 * Configure the raid bdev when the number of discovered base bdevs reaches the number
 	 * of base bdevs we know to be operational members of the array. Usually this is equal
@@ -4637,11 +4714,36 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 		}
 	}
 
-	if (base_info == NULL || raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
-		RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
-			if (iter->name == NULL && spdk_uuid_is_null(&iter->uuid)) {
-				base_info = iter;
-				break;
+	/* For ONLINE state: try to match UUID to original slot first */
+	if (base_info == NULL && raid_bdev->state == RAID_BDEV_STATE_ONLINE) {
+		struct spdk_bdev *bdev = spdk_bdev_get_by_name(name);
+
+		if (bdev != NULL && raid_bdev->superblock_enabled && raid_bdev->sb != NULL) {
+			/* Try to find the original slot from superblock by UUID */
+			const struct raid_bdev_sb_base_bdev *sb_base = 
+				raid_bdev_sb_find_base_bdev_by_uuid(raid_bdev->sb, spdk_bdev_get_uuid(bdev));
+			
+			if (sb_base != NULL && sb_base->slot < raid_bdev->num_base_bdevs) {
+				/* Found matching UUID in superblock - check if the slot is available */
+				iter = &raid_bdev->base_bdev_info[sb_base->slot];
+				if (iter->name == NULL) {
+					/* Slot is available - use it to restore original position */
+					base_info = iter;
+					/* Copy UUID from superblock to slot if not already set */
+					if (spdk_uuid_is_null(&base_info->uuid)) {
+						spdk_uuid_copy(&base_info->uuid, &sb_base->uuid);
+					}
+				}
+			}
+		}
+
+		/* If UUID matching failed or slot is occupied, fall back to first empty slot */
+		if (base_info == NULL) {
+			RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
+				if (iter->name == NULL && spdk_uuid_is_null(&iter->uuid)) {
+					base_info = iter;
+					break;
+				}
 			}
 		}
 	}
@@ -4956,7 +5058,11 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
 				SPDK_NOTICELOG("Example: bdev_wipe_superblock -b %s\n", bdev->name);
 				SPDK_NOTICELOG("===========================================================\n");
 				rc = 0; /* Don't treat as error, just inform user */
-				goto out;
+				/* Must call callback even when rc == 0 to complete examine flow */
+				if (cb_fn != NULL) {
+					cb_fn(cb_ctx, rc);
+				}
+				return;
 			}
 		}
 
@@ -5042,7 +5148,8 @@ raid_bdev_examine_sb(const struct raid_bdev_superblock *sb, struct spdk_bdev *bd
 	/* If rc == 0, raid_bdev_configure_base_bdev will call the callback asynchronously */
 	return;
 out:
-	if (rc != 0 && cb_fn != 0) {
+	/* Always call callback if provided, regardless of rc value, to complete examine flow */
+	if (cb_fn != NULL) {
 		cb_fn(cb_ctx, rc);
 	}
 }

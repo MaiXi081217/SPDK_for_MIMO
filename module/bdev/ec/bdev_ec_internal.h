@@ -222,13 +222,7 @@ enum ec_bdev_process_state {
 	EC_PROCESS_STATE_STOPPED,
 };
 
-/* Rebuild state enumeration (for fine-grained tracking) */
-enum ec_rebuild_state {
-	EC_REBUILD_STATE_IDLE,
-	EC_REBUILD_STATE_READING,
-	EC_REBUILD_STATE_DECODING,
-	EC_REBUILD_STATE_WRITING
-};
+/* Rebuild state enumeration is now defined in bdev_ec.h (public API) */
 
 /* Process QoS structure */
 struct ec_process_qos {
@@ -258,10 +252,13 @@ struct ec_bdev_process {
 	enum ec_bdev_process_state state;
 	struct spdk_thread	*thread;
 	struct ec_bdev_io_channel *ec_ch;
+	struct spdk_io_channel	*io_ch;  /* Keep reference to io_channel for cleanup */
 	TAILQ_HEAD(, ec_bdev_process_request) requests;
 	uint64_t		max_window_size;
 	uint64_t		window_size;
-	uint64_t		window_remaining;
+	uint64_t		window_remaining;  /* Remaining stripes in current window */
+	uint64_t		window_stripes_submitted;  /* Number of stripes submitted in current window */
+	uint64_t		window_stripes_total;  /* Total stripes in current window */
 	int			window_status;
 	uint64_t		window_offset;
 	bool			window_range_locked;

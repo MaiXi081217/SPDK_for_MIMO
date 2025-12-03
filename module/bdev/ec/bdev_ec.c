@@ -60,6 +60,7 @@ static void ec_bdev_examine(struct spdk_bdev *bdev);
 static void ec_bdev_examine_no_sb(struct spdk_bdev *bdev);
 static int ec_bdev_init(void);
 static void ec_bdev_deconfigure(struct ec_bdev *ec_bdev, ec_bdev_destruct_cb cb_fn, void *cb_arg);
+static void ec_bdev_cleanup(struct ec_bdev *ec_bdev);
 static void ec_bdev_configure_cont(struct ec_bdev *ec_bdev);
 static void ec_bdev_configure_write_sb_cb(int status, struct ec_bdev *ec_bdev, void *ctx);
 static void ec_bdev_configure_register_bdev(struct ec_bdev *ec_bdev);
@@ -68,12 +69,25 @@ static int ec_start(struct ec_bdev *ec_bdev);
 static void ec_stop(struct ec_bdev *ec_bdev);
 static struct ec_bdev *ec_bdev_find_by_uuid(const struct spdk_uuid *uuid);
 static struct ec_base_bdev_info *ec_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
-static const char *ec_rebuild_state_to_str(enum ec_rebuild_state state);
+/* ec_rebuild_state_to_str is now public - declared in bdev_ec.h */
 static int ec_bdev_create_from_sb(const struct ec_bdev_superblock *sb, struct ec_bdev **ec_bdev_out);
 static int ec_bdev_configure_base_bdev(struct ec_base_bdev_info *base_info, bool existing,
 				       ec_base_bdev_cb cb_fn, void *cb_ctx);
 static void ec_bdev_event_base_bdev(enum spdk_bdev_event_type event, struct spdk_bdev *bdev, void *event_ctx);
 static void ec_bdev_event_cb(enum spdk_bdev_event_type event, struct spdk_bdev *bdev, void *event_ctx);
+static void ec_bdev_remove_base_bdev_on_unquiesced(void *ctx, int status);
+static void ec_bdev_remove_base_bdev_on_quiesced(void *ctx, int status);
+static void ec_bdev_remove_base_bdev_cont(struct ec_base_bdev_info *base_info);
+static void ec_bdev_remove_base_bdev_reset_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
+static void ec_bdev_remove_base_bdev_do_remove(struct ec_base_bdev_info *base_info);
+static void ec_bdev_deconfigure_base_bdev(struct ec_base_bdev_info *base_info);
+static void ec_bdev_channel_remove_base_bdev(struct spdk_io_channel_iter *i);
+static void ec_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int status);
+static void ec_bdev_remove_base_bdev_write_sb_cb(int status, struct ec_bdev *ec_bdev, void *ctx);
+static int ec_bdev_remove_base_bdev_quiesce(struct ec_base_bdev_info *base_info);
+static int ec_bdev_process_add_finish_action(struct ec_bdev_process *process, spdk_msg_fn cb, void *cb_ctx);
+static int ec_bdev_process_base_bdev_remove(struct ec_bdev_process *process,
+					    struct ec_base_bdev_info *base_info);
 static void ec_bdev_examine_cont(const struct ec_bdev_superblock *sb, struct spdk_bdev *bdev,
 				 ec_base_bdev_cb cb_fn, void *cb_ctx);
 static void ec_bdev_examine_others(void *_ctx, int status);
@@ -802,6 +816,16 @@ void
 ec_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct ec_bdev_io *ec_io = (struct ec_bdev_io *)bdev_io->driver_ctx;
+	struct ec_bdev *ec_bdev = spdk_io_channel_get_io_device(ch);
+
+	/* Check if EC bdev is in ONLINE state before processing IO */
+	if (ec_bdev->state != EC_BDEV_STATE_ONLINE) {
+		SPDK_ERRLOG("EC bdev '%s' is not ONLINE (state: %s), rejecting IO request\n",
+			    ec_bdev->bdev.name ? ec_bdev->bdev.name : "unknown",
+			    ec_bdev_state_to_str(ec_bdev->state));
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
 
 	ec_bdev_io_init(ec_io, spdk_io_channel_get_ctx(ch), bdev_io->type,
 			bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
@@ -1413,7 +1437,11 @@ ec_bdev_free_base_bdev_resource(struct ec_base_bdev_info *base_info)
 	}
 	
 	base_info->is_configured = false;
-	base_info->remove_scheduled = false;
+	
+	/* NOTE: Do NOT clear remove_scheduled here - it must be cleared in ec_bdev_remove_base_bdev_done
+	 * to ensure proper state tracking during the removal process. Clearing it here would cause
+	 * assertion failures in ec_bdev_remove_base_bdev_done when called from unquiesce callback.
+	 */
 }
 
 /*
@@ -2025,18 +2053,6 @@ ec_bdev_configure_register_bdev(struct ec_bdev *ec_bdev)
 {
 	int rc;
 	
-	/* Check if EC bdev is already registered */
-	struct spdk_bdev *registered_bdev = spdk_bdev_get_by_name(ec_bdev->bdev.name);
-	if (registered_bdev != NULL && registered_bdev == &ec_bdev->bdev) {
-		SPDK_DEBUGLOG(bdev_ec, "EC bdev %s already registered, skipping registration\n",
-			      ec_bdev->bdev.name);
-		/* Already registered, just update state if needed */
-		if (ec_bdev->state != EC_BDEV_STATE_ONLINE) {
-			ec_bdev->state = EC_BDEV_STATE_ONLINE;
-		}
-		return;
-	}
-	
 	ec_bdev->state = EC_BDEV_STATE_ONLINE;
 	
 	/* Register IO device before registering bdev (similar to raid module) */
@@ -2231,6 +2247,7 @@ ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
 
 	/* Set block size and block count */
 	ec_bdev_gen->blocklen = 512; /* Default block size */
+	ec_bdev_gen->blockcnt = 0; /* Will be updated during configure */
 	ec_bdev_gen->write_cache = 0;
 	ec_bdev_gen->optimal_io_boundary = 0;
 	ec_bdev_gen->split_on_optimal_io_boundary = false;
@@ -2327,30 +2344,90 @@ ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 		     ec_base_bdev_cb cb_fn, void *cb_ctx)
 {
 	struct ec_base_bdev_info *base_info;
+	struct ec_base_bdev_info *iter;
 	uint8_t slot = UINT8_MAX;
 	int rc;
+	struct spdk_bdev *bdev;
 
-	if (ec_bdev_get_active_rebuild(ec_bdev) != NULL) {
-		SPDK_ERRLOG("Cannot add base bdev '%s' to EC bdev %s while rebuild is running\n",
-			    name, ec_bdev->bdev.name);
+	/* Check if rebuild is in progress (legacy or process framework) */
+	if (ec_bdev_is_rebuilding(ec_bdev)) {
+		struct ec_bdev_process *process = ec_bdev->process;
+		if (process != NULL && process->state < EC_PROCESS_STATE_STOPPING && 
+		    process->type == EC_PROCESS_REBUILD) {
+			/* Process framework rebuild - show progress */
+			uint64_t total_blocks = ec_bdev->bdev.blockcnt;
+			uint64_t completed_blocks = process->window_offset;
+			uint32_t percent = total_blocks > 0 ? 
+				(uint32_t)((completed_blocks * 100) / total_blocks) : 0;
+			SPDK_ERRLOG("\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("Cannot add base bdev '%s' to EC bdev %s: Rebuild is in progress!\n",
+				    name, ec_bdev->bdev.name);
+			SPDK_ERRLOG("Target disk: %s (slot %u)\n",
+				    process->target->name ? process->target->name : "unknown",
+				    ec_bdev_base_bdev_slot(process->target));
+			SPDK_ERRLOG("Rebuild progress: %u%% (%lu / %lu blocks)\n",
+				    percent, completed_blocks, total_blocks);
+			SPDK_ERRLOG("Please wait for rebuild to complete before adding base bdev.\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("\n");
+		} else {
+			/* Legacy rebuild */
+			SPDK_ERRLOG("Cannot add base bdev '%s' to EC bdev %s while rebuild is running\n",
+				    name, ec_bdev->bdev.name);
+		}
 		return -EBUSY;
 	}
 
+	/* Check if base bdev exists immediately (like RAID does) to avoid waiting */
+	bdev = spdk_bdev_get_by_name(name);
+	if (bdev == NULL) {
+		/* Base bdev doesn't exist - return immediately instead of waiting */
+		return -ENODEV;
+	}
+
 	/* Find an available slot */
-	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
-		if (base_info->name == NULL) {
-			slot = (uint8_t)(base_info - ec_bdev->base_bdev_info);
-			break;
+	base_info = NULL;
+	
+	/* For ONLINE state: try to match UUID to original slot first */
+	if (ec_bdev->state == EC_BDEV_STATE_ONLINE) {
+		if (bdev != NULL && ec_bdev->superblock_enabled && ec_bdev->sb != NULL) {
+			/* Try to find the original slot from superblock by UUID */
+			const struct ec_bdev_sb_base_bdev *sb_base = 
+				ec_bdev_sb_find_base_bdev_by_uuid(ec_bdev->sb, spdk_bdev_get_uuid(bdev));
+			
+			if (sb_base != NULL && sb_base->slot < ec_bdev->num_base_bdevs) {
+				/* Found matching UUID in superblock - check if the slot is available */
+				iter = &ec_bdev->base_bdev_info[sb_base->slot];
+				if (iter->name == NULL) {
+					/* Slot is available - use it to restore original position */
+					base_info = iter;
+					slot = sb_base->slot;
+					/* Copy UUID from superblock to slot if not already set */
+					if (spdk_uuid_is_null(&base_info->uuid)) {
+						spdk_uuid_copy(&base_info->uuid, &sb_base->uuid);
+					}
+				}
+			}
+		}
+	}
+
+	/* If UUID matching failed or slot is occupied, fall back to first empty slot */
+	if (base_info == NULL) {
+		EC_FOR_EACH_BASE_BDEV(ec_bdev, iter) {
+			if (iter->name == NULL && spdk_uuid_is_null(&iter->uuid)) {
+				base_info = iter;
+				slot = (uint8_t)(iter - ec_bdev->base_bdev_info);
+				break;
+			}
 		}
 	}
 
 	/* Check if we found an available slot */
-	if (slot == UINT8_MAX) {
+	if (base_info == NULL || slot == UINT8_MAX) {
 		SPDK_ERRLOG("No available slots for EC bdev %s\n", ec_bdev->bdev.name);
 		return -ENOSPC;
 	}
-
-	base_info = &ec_bdev->base_bdev_info[slot];
 	base_info->name = strdup(name);
 	if (base_info->name == NULL) {
 		SPDK_ERRLOG("Failed to allocate memory for base bdev name\n");
@@ -2377,11 +2454,82 @@ ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
  * Callback after wiping superblock - continue with removal
  */
 static void
+ec_bdev_remove_base_bdev_done(struct ec_base_bdev_info *base_info, int status)
+{
+	struct ec_bdev *ec_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_remove_base_bdev_done\n");
+		return;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("base_info->ec_bdev is NULL in ec_bdev_remove_base_bdev_done\n");
+		if (base_info->remove_scheduled) {
+			base_info->remove_scheduled = false;
+		}
+		if (base_info->remove_cb != NULL) {
+			base_info->remove_cb(base_info->remove_cb_ctx, -EINVAL);
+		}
+		return;
+	}
+
+	/* Verify remove_scheduled before clearing it (aligned with RAID framework)
+	 * Use defensive check instead of assert to avoid crashes in edge cases
+	 */
+	if (!base_info->remove_scheduled) {
+		SPDK_ERRLOG("remove_scheduled is false in ec_bdev_remove_base_bdev_done - this should not happen\n");
+		/* Continue anyway to avoid resource leak - callback may still need to be called */
+	}
+	base_info->remove_scheduled = false;
+
+	if (status == 0) {
+		/* Check if there are enough operational base bdevs to keep EC bdev operational */
+		if (ec_bdev->num_base_bdevs_operational < ec_bdev->min_base_bdevs_operational) {
+			/* There is not enough base bdevs to keep the EC bdev operational. */
+			ec_bdev_deconfigure(ec_bdev, base_info->remove_cb, base_info->remove_cb_ctx);
+			return;
+		}
+	}
+
+	/* Call callback if set */
+	if (base_info->remove_cb != NULL) {
+		ec_base_bdev_cb cb_fn = base_info->remove_cb;
+		void *cb_ctx = base_info->remove_cb_ctx;
+		base_info->remove_cb = NULL;
+		base_info->remove_cb_ctx = NULL;
+		cb_fn(cb_ctx, status);
+	}
+}
+
+struct ec_bdev_deconfigure_wrapper_ctx {
+	struct ec_base_bdev_info *base_info;
+	ec_base_bdev_cb user_cb;
+	void *user_ctx;
+};
+
+/*
+ * Wrapper callback for ec_bdev_deconfigure to clear remove_scheduled flag
+ */
+static void
+ec_bdev_deconfigure_wrapper_cb(void *ctx, int status)
+{
+	struct ec_bdev_deconfigure_wrapper_ctx *wrapper_ctx = ctx;
+	
+	if (wrapper_ctx->base_info != NULL) {
+		wrapper_ctx->base_info->remove_scheduled = false;
+	}
+	if (wrapper_ctx->user_cb != NULL) {
+		wrapper_ctx->user_cb(wrapper_ctx->user_ctx, status);
+	}
+	free(wrapper_ctx);
+}
+
+static void
 ec_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
 {
 	struct ec_base_bdev_info *base_info = ctx;
-	ec_base_bdev_cb cb_fn = base_info->remove_cb;
-	void *cb_ctx = base_info->remove_cb_ctx;
 
 	if (status != 0) {
 		/* Wipe failed, but continue with removal anyway */
@@ -2392,10 +2540,42 @@ ec_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
 	/* Now free the base bdev resources */
 	ec_bdev_free_base_bdev_resource(base_info);
 
-	/* Always call callback */
-	if (cb_fn) {
-		cb_fn(cb_ctx, 0);
+	/* Call done callback (which will assert remove_scheduled and call user callback) */
+	ec_bdev_remove_base_bdev_done(base_info, 0);
+}
+
+/*
+ * brief:
+ * ec_bdev_cleanup is used to cleanup ec_bdev related data
+ * structures.
+ * params:
+ * ec_bdev - pointer to ec_bdev
+ * returns:
+ * none
+ */
+static void
+ec_bdev_cleanup(struct ec_bdev *ec_bdev)
+{
+	struct ec_base_bdev_info *base_info;
+
+	SPDK_DEBUGLOG(bdev_ec, "ec_bdev_cleanup, %p name %s, state %s\n",
+		      ec_bdev, ec_bdev->bdev.name, ec_bdev_state_to_str(ec_bdev->state));
+	assert(ec_bdev->state != EC_BDEV_STATE_ONLINE);
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		assert(base_info->desc == NULL);
+		free(base_info->name);
 	}
+
+	TAILQ_REMOVE(&g_ec_bdev_list, ec_bdev, global_link);
+}
+
+static void
+ec_bdev_cleanup_and_free(struct ec_bdev *ec_bdev)
+{
+	ec_bdev_cleanup(ec_bdev);
+	ec_bdev_free(ec_bdev);
 }
 
 /*
@@ -2410,27 +2590,66 @@ ec_bdev_remove_base_bdev_after_wipe(void *ctx, int status)
  * returns:
  * 0 on success, non-zero on failure
  */
-int
-ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, void *cb_ctx)
+static int
+_ec_bdev_remove_base_bdev(struct ec_base_bdev_info *base_info,
+			  ec_base_bdev_cb cb_fn, void *cb_ctx)
 {
-	struct ec_base_bdev_info *base_info = ec_bdev_find_base_info_by_bdev(base_bdev);
 	struct ec_bdev *ec_bdev;
+	struct ec_bdev_process *process;
+	int ret = 0;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
 	if (base_info == NULL) {
-		SPDK_ERRLOG("Base bdev not found\n");
-		return -ENODEV;
+		SPDK_ERRLOG("base_info is NULL in _ec_bdev_remove_base_bdev\n");
+		return -EINVAL;
 	}
 
 	ec_bdev = base_info->ec_bdev;
 	if (ec_bdev == NULL) {
-		SPDK_ERRLOG("EC bdev is NULL for base bdev '%s'\n",
-			    base_info->name ? base_info->name : "unknown");
+		SPDK_ERRLOG("base_info->ec_bdev is NULL in _ec_bdev_remove_base_bdev\n");
 		return -EINVAL;
 	}
+	process = ec_bdev->process;
 
+	SPDK_DEBUGLOG(bdev_ec, "%s\n", base_info->name ? base_info->name : "unknown");
+
+	if (base_info->remove_scheduled || !base_info->is_configured) {
+		return -ENODEV;
+	}
+
+	if (base_info->desc == NULL) {
+		SPDK_ERRLOG("base_info->desc is NULL, cannot remove base bdev\n");
+		return -ENODEV;
+	}
+
+	/* Check if this base bdev is the rebuild target */
 	if (ec_bdev_is_rebuild_target(ec_bdev, base_info)) {
-		SPDK_WARNLOG("Cannot remove base bdev '%s' while rebuild is running\n",
-			     base_info->name ? base_info->name : "unknown");
+		struct ec_bdev_process *process = ec_bdev->process;
+		if (process != NULL && process->state < EC_PROCESS_STATE_STOPPING && 
+		    process->type == EC_PROCESS_REBUILD) {
+			/* Process framework rebuild - show progress */
+			uint64_t total_blocks = ec_bdev->bdev.blockcnt;
+			uint64_t completed_blocks = process->window_offset;
+			uint32_t percent = total_blocks > 0 ? 
+				(uint32_t)((completed_blocks * 100) / total_blocks) : 0;
+			SPDK_ERRLOG("\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("Cannot remove base bdev '%s': Rebuild is in progress!\n",
+				    base_info->name ? base_info->name : "unknown");
+			SPDK_ERRLOG("EC bdev: %s\n", ec_bdev->bdev.name);
+			SPDK_ERRLOG("Target disk: %s (slot %u)\n",
+				    base_info->name ? base_info->name : "unknown",
+				    ec_bdev_base_bdev_slot(base_info));
+			SPDK_ERRLOG("Rebuild progress: %u%% (%lu / %lu blocks)\n",
+				    percent, completed_blocks, total_blocks);
+			SPDK_ERRLOG("Please wait for rebuild to complete before removing base bdev.\n");
+			SPDK_ERRLOG("===========================================================\n");
+			SPDK_ERRLOG("\n");
+		} else {
+			SPDK_WARNLOG("Cannot remove base bdev '%s' while rebuild is running\n",
+				     base_info->name ? base_info->name : "unknown");
+		}
 		return -EBUSY;
 	}
 
@@ -2444,20 +2663,468 @@ ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, voi
 								   ec_bdev_remove_base_bdev_after_wipe,
 								   base_info);
 		if (rc == 0) {
+			/* Wipe started successfully - callback will be called when wipe completes */
 			return 0;
 		}
-		/* Wipe failed - callback already called. Don't clear remove_scheduled/remove_cb/remove_cb_ctx. */
-		SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s', removal handled by wipe callback\n",
-			     base_info->name ? base_info->name : "unknown");
+		/* Wipe failed to start - check if callback was called
+		 * If callback was called, it will handle removal. Otherwise, we need to handle it here.
+		 * For synchronous errors (like -EINVAL), callback is NOT called, so we handle removal here.
+		 */
+		if (rc == -EINVAL || rc == -ENODEV) {
+			/* Synchronous error - callback was called immediately, removal handled by callback */
+			SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s': %s (removal handled by wipe callback)\n",
+				     base_info->name ? base_info->name : "unknown", spdk_strerror(-rc));
+			return rc;
+		}
+		/* Other errors - callback may have been called (e.g., -ENOMEM with queue wait)
+		 * Don't clear remove_scheduled/remove_cb/remove_cb_ctx - callback will handle it
+		 */
+		SPDK_WARNLOG("Failed to start superblock wipe for base bdev '%s': %s (callback may be called later)\n",
+			     base_info->name ? base_info->name : "unknown", spdk_strerror(-rc));
 		return rc;
 	}
 	SPDK_DEBUGLOG(bdev_ec, "Cannot wipe superblock - base bdev desc or channel is NULL\n");
 
-	ec_bdev_free_base_bdev_resource(base_info);
-	if (cb_fn) {
-		cb_fn(cb_ctx, 0);
+	if (ec_bdev->state != EC_BDEV_STATE_ONLINE) {
+		ec_bdev_free_base_bdev_resource(base_info);
+		base_info->remove_scheduled = false;
+		if (ec_bdev->num_base_bdevs_discovered == 0 &&
+		    ec_bdev->state == EC_BDEV_STATE_OFFLINE) {
+			ec_bdev_cleanup_and_free(ec_bdev);
+		}
+		if (cb_fn != NULL) {
+			cb_fn(cb_ctx, 0);
+		}
+	} else if (ec_bdev->min_base_bdevs_operational == ec_bdev->num_base_bdevs) {
+		ec_bdev->num_base_bdevs_operational--;
+		/* When deconfiguring the entire EC bdev, we need to clear remove_scheduled
+		 * since we're bypassing the normal quiesce/unquiesce flow that would call
+		 * ec_bdev_remove_base_bdev_done. Create a wrapper callback to clear the flag.
+		 */
+		struct ec_bdev_deconfigure_wrapper_ctx *wrapper_ctx = calloc(1, sizeof(*wrapper_ctx));
+		if (wrapper_ctx == NULL) {
+			SPDK_ERRLOG("Failed to allocate wrapper context for deconfigure\n");
+			base_info->remove_scheduled = false;
+			if (cb_fn != NULL) {
+				cb_fn(cb_ctx, -ENOMEM);
+			}
+			return -ENOMEM;
+		}
+		wrapper_ctx->base_info = base_info;
+		wrapper_ctx->user_cb = cb_fn;
+		wrapper_ctx->user_ctx = cb_ctx;
+		
+		ec_bdev_deconfigure(ec_bdev, ec_bdev_deconfigure_wrapper_cb, wrapper_ctx);
+		return 0;
+	} else {
+		if (process != NULL) {
+			ret = ec_bdev_process_base_bdev_remove(process, base_info);
+		} else {
+			ret = ec_bdev_remove_base_bdev_quiesce(base_info);
+		}
+		if (ret != 0) {
+			base_info->remove_scheduled = false;
+		}
 	}
+
+	return ret;
+}
+
+static void
+ec_bdev_remove_base_bdev_on_unquiesced(void *ctx, int status)
+{
+	struct ec_base_bdev_info *base_info = ctx;
+	struct ec_bdev *ec_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_remove_base_bdev_on_unquiesced\n");
+		return;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("base_info->ec_bdev is NULL in ec_bdev_remove_base_bdev_on_unquiesced\n");
+		ec_bdev_remove_base_bdev_done(base_info, -EINVAL);
+		return;
+	}
+
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to unquiesce EC bdev %s: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-status));
+	}
+
+	ec_bdev_remove_base_bdev_done(base_info, status);
+}
+
+static void
+ec_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
+{
+	struct ec_base_bdev_info *base_info = ctx;
+	struct ec_bdev *ec_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_remove_base_bdev_on_quiesced\n");
+		return;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("base_info->ec_bdev is NULL in ec_bdev_remove_base_bdev_on_quiesced\n");
+		return;
+	}
+
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to quiesce EC bdev %s: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-status));
+		ec_bdev_remove_base_bdev_done(base_info, status);
+		return;
+	}
+
+	if (ec_bdev->sb) {
+		struct ec_bdev_superblock *sb = ec_bdev->sb;
+		uint8_t slot = ec_bdev_base_bdev_slot(base_info);
+		uint8_t i;
+
+		/* Safety check: ensure base_bdev_info array is valid before calculating slot */
+		if (ec_bdev->base_bdev_info == NULL) {
+			SPDK_ERRLOG("ec_bdev->base_bdev_info is NULL for EC bdev '%s'\n", ec_bdev->bdev.name);
+			ec_bdev_remove_base_bdev_done(base_info, -EINVAL);
+			return;
+		}
+
+		for (i = 0; i < sb->base_bdevs_size; i++) {
+			struct ec_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
+
+			if (sb_base_bdev->state == EC_SB_BASE_BDEV_CONFIGURED &&
+			    sb_base_bdev->slot == slot) {
+				if (base_info->is_failed) {
+					sb_base_bdev->state = EC_SB_BASE_BDEV_FAILED;
+				} else {
+					sb_base_bdev->state = EC_SB_BASE_BDEV_MISSING;
+				}
+
+				ec_bdev_write_superblock(ec_bdev, ec_bdev_remove_base_bdev_write_sb_cb, base_info);
+				return;
+			}
+		}
+	}
+
+	ec_bdev_remove_base_bdev_cont(base_info);
+}
+
+static void
+ec_bdev_remove_base_bdev_cont(struct ec_base_bdev_info *base_info)
+{
+	int rc;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_remove_base_bdev_cont\n");
+		return;
+	}
+
+	if (base_info->desc == NULL || base_info->app_thread_ch == NULL) {
+		SPDK_WARNLOG("base_info->desc or app_thread_ch is NULL, proceeding with removal\n");
+		ec_bdev_remove_base_bdev_do_remove(base_info);
+		return;
+	}
+
+	/* Reset the base bdev to ensure all I/O is complete */
+	rc = spdk_bdev_reset(base_info->desc, base_info->app_thread_ch,
+			     ec_bdev_remove_base_bdev_reset_done, base_info);
+	if (rc != 0) {
+		if (rc == -ENOMEM) {
+			SPDK_ERRLOG("No memory to reset base bdev '%s'\n",
+				    base_info->name ? base_info->name : "unknown");
+		} else {
+			SPDK_ERRLOG("Failed to reset base bdev '%s': %s\n",
+				    base_info->name ? base_info->name : "unknown", spdk_strerror(-rc));
+		}
+		ec_bdev_remove_base_bdev_do_remove(base_info);
+	}
+}
+
+static void
+ec_bdev_remove_base_bdev_reset_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ec_base_bdev_info *base_info = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_remove_base_bdev_reset_done\n");
+		return;
+	}
+
+	ec_bdev_remove_base_bdev_do_remove(base_info);
+}
+
+static void
+ec_bdev_remove_base_bdev_do_remove(struct ec_base_bdev_info *base_info)
+{
+	struct ec_bdev *ec_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_remove_base_bdev_do_remove\n");
+		return;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("base_info->ec_bdev is NULL in ec_bdev_remove_base_bdev_do_remove\n");
+		return;
+	}
+
+	ec_bdev_deconfigure_base_bdev(base_info);
+
+	spdk_for_each_channel(ec_bdev, ec_bdev_channel_remove_base_bdev, base_info,
+			      ec_bdev_channels_remove_base_bdev_done);
+}
+
+static void
+ec_bdev_channel_remove_base_bdev(struct spdk_io_channel_iter *i)
+{
+	struct ec_base_bdev_info *base_info = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct ec_bdev_io_channel *ec_ch = spdk_io_channel_get_ctx(ch);
+	struct ec_bdev *ec_bdev;
+	uint8_t idx;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_channel_remove_base_bdev\n");
+		spdk_for_each_channel_continue(i, -EINVAL);
+		return;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL || ec_bdev->base_bdev_info == NULL) {
+		SPDK_ERRLOG("ec_bdev or base_bdev_info is NULL in ec_bdev_channel_remove_base_bdev\n");
+		spdk_for_each_channel_continue(i, -EINVAL);
+		return;
+	}
+
+	idx = ec_bdev_base_bdev_slot(base_info);
+
+	/* Safety check: ensure idx is within valid range */
+	if (idx >= ec_bdev->num_base_bdevs) {
+		SPDK_ERRLOG("Calculated slot %u exceeds num_base_bdevs %u for EC bdev '%s'\n",
+			    idx, ec_bdev->num_base_bdevs, ec_bdev->bdev.name);
+		spdk_for_each_channel_continue(i, -EINVAL);
+		return;
+	}
+
+	SPDK_DEBUGLOG(bdev_ec, "slot: %u ec_ch: %p\n", idx, ec_ch);
+
+	/* Safety check: ensure base_channel array is allocated */
+	if (ec_ch->base_channel != NULL) {
+		if (ec_ch->base_channel[idx] != NULL) {
+			spdk_put_io_channel(ec_ch->base_channel[idx]);
+			ec_ch->base_channel[idx] = NULL;
+		}
+	}
+
+	if (ec_ch->process.ch_processed != NULL && ec_ch->process.ch_processed->base_channel != NULL) {
+		if (idx < ec_bdev->num_base_bdevs) {
+			ec_ch->process.ch_processed->base_channel[idx] = NULL;
+		}
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+ec_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct ec_base_bdev_info *base_info = spdk_io_channel_iter_get_ctx(i);
+	struct ec_bdev *ec_bdev;
+
+	if (base_info == NULL) {
+		SPDK_ERRLOG("base_info is NULL in ec_bdev_channels_remove_base_bdev_done\n");
+		return;
+	}
+
+	ec_bdev = base_info->ec_bdev;
+	if (ec_bdev == NULL) {
+		SPDK_ERRLOG("base_info->ec_bdev is NULL in ec_bdev_channels_remove_base_bdev_done\n");
+		/* Clear remove_scheduled before freeing resources since we won't call remove_base_bdev_done */
+		base_info->remove_scheduled = false;
+		ec_bdev_free_base_bdev_resource(base_info);
+		return;
+	}
+
+	/* Free base bdev resources, but keep remove_scheduled flag set - it will be cleared
+	 * in ec_bdev_remove_base_bdev_done after unquiesce completes. This ensures proper
+	 * state tracking throughout the removal process.
+	 */
+	ec_bdev_free_base_bdev_resource(base_info);
+
+	spdk_bdev_unquiesce(&ec_bdev->bdev, &g_ec_if, ec_bdev_remove_base_bdev_on_unquiesced,
+			    base_info);
+}
+
+static void
+ec_bdev_remove_base_bdev_write_sb_cb(int status, struct ec_bdev *ec_bdev, void *ctx)
+{
+	struct ec_base_bdev_info *base_info = ctx;
+
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to write EC bdev '%s' superblock: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-status));
+	}
+
+	ec_bdev_remove_base_bdev_cont(base_info);
+}
+
+static int
+ec_bdev_remove_base_bdev_quiesce(struct ec_base_bdev_info *base_info)
+{
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	return spdk_bdev_quiesce(&base_info->ec_bdev->bdev, &g_ec_if,
+				 ec_bdev_remove_base_bdev_on_quiesced, base_info);
+}
+
+struct ec_bdev_process_base_bdev_remove_ctx {
+	struct ec_bdev_process *process;
+	struct ec_base_bdev_info *base_info;
+	uint8_t num_base_bdevs_operational;
+};
+
+static void
+_ec_bdev_process_base_bdev_remove_cont(void *ctx)
+{
+	struct ec_base_bdev_info *base_info = ctx;
+	int ret;
+
+	ret = ec_bdev_remove_base_bdev_quiesce(base_info);
+	if (ret != 0) {
+		ec_bdev_remove_base_bdev_done(base_info, ret);
+	}
+}
+
+static void
+ec_bdev_process_base_bdev_remove_cont(void *_ctx)
+{
+	struct ec_bdev_process_base_bdev_remove_ctx *ctx = _ctx;
+	struct ec_base_bdev_info *base_info = ctx->base_info;
+
+	free(ctx);
+
+	spdk_thread_send_msg(spdk_thread_get_app_thread(), _ec_bdev_process_base_bdev_remove_cont,
+			     base_info);
+}
+
+static void
+_ec_bdev_process_base_bdev_remove(void *_ctx)
+{
+	struct ec_bdev_process_base_bdev_remove_ctx *ctx = _ctx;
+	struct ec_bdev_process *process = ctx->process;
+	int ret;
+
+	if (ctx->base_info != process->target &&
+	    ctx->num_base_bdevs_operational > process->ec_bdev->min_base_bdevs_operational) {
+		/* process doesn't need to be stopped */
+		ec_bdev_process_base_bdev_remove_cont(ctx);
+		return;
+	}
+
+	assert(process->state > EC_PROCESS_STATE_INIT &&
+	       process->state < EC_PROCESS_STATE_STOPPED);
+
+	ret = ec_bdev_process_add_finish_action(process, ec_bdev_process_base_bdev_remove_cont, ctx);
+	if (ret != 0) {
+		ec_bdev_remove_base_bdev_done(ctx->base_info, ret);
+		free(ctx);
+		return;
+	}
+
+	process->state = EC_PROCESS_STATE_STOPPING;
+
+	if (process->status == 0) {
+		process->status = -ENODEV;
+	}
+}
+
+static int
+ec_bdev_process_add_finish_action(struct ec_bdev_process *process, spdk_msg_fn cb, void *cb_ctx)
+{
+	struct ec_process_finish_action *finish_action;
+
+	assert(spdk_get_thread() == process->thread);
+	assert(process->state < EC_PROCESS_STATE_STOPPED);
+
+	finish_action = calloc(1, sizeof(*finish_action));
+	if (finish_action == NULL) {
+		return -ENOMEM;
+	}
+
+	finish_action->cb = cb;
+	finish_action->cb_ctx = cb_ctx;
+
+	TAILQ_INSERT_TAIL(&process->finish_actions, finish_action, link);
+
 	return 0;
+}
+
+static int
+ec_bdev_process_base_bdev_remove(struct ec_bdev_process *process,
+				 struct ec_base_bdev_info *base_info)
+{
+	struct ec_bdev_process_base_bdev_remove_ctx *ctx;
+
+	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+
+	/*
+	 * We have to send the process and num_base_bdevs_operational in the message ctx
+	 * because the process thread should not access ec_bdev's properties. Particularly,
+	 * ec_bdev->process may be cleared by the time the message is handled, but ctx->process
+	 * will still be valid until the process is fully stopped.
+	 */
+	ctx->base_info = base_info;
+	ctx->process = process;
+	/*
+	 * ec_bdev->num_base_bdevs_operational can't be used here because it is decremented
+	 * after the removal and more than one base bdev may be removed at the same time
+	 */
+	EC_FOR_EACH_BASE_BDEV(process->ec_bdev, base_info) {
+		if (base_info->is_configured && !base_info->remove_scheduled) {
+			ctx->num_base_bdevs_operational++;
+		}
+	}
+
+	spdk_thread_send_msg(process->thread, _ec_bdev_process_base_bdev_remove, ctx);
+
+	return 0;
+}
+
+static void
+ec_bdev_deconfigure_base_bdev(struct ec_base_bdev_info *base_info)
+{
+	struct ec_bdev *ec_bdev = base_info->ec_bdev;
+
+	assert(base_info->is_configured);
+	assert(ec_bdev->num_base_bdevs_discovered);
+	ec_bdev->num_base_bdevs_discovered--;
+	base_info->is_configured = false;
+}
+
+int
+ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, void *cb_ctx)
+{
+	struct ec_base_bdev_info *base_info;
+
+	/* Find the ec_bdev which has claimed this base_bdev */
+	base_info = ec_bdev_find_base_info_by_bdev(base_bdev);
+	if (!base_info) {
+		SPDK_ERRLOG("bdev to remove '%s' not found\n", base_bdev->name);
+		return -ENODEV;
+	}
+
+	return _ec_bdev_remove_base_bdev(base_info, cb_fn, cb_ctx);
 }
 
 /*
@@ -2985,7 +3652,31 @@ ec_bdev_configure_base_bdev_cont(struct ec_base_bdev_info *base_info)
 	
 	assert(ec_bdev->num_base_bdevs_discovered <= ec_bdev->num_base_bdevs);
 	assert(ec_bdev->num_base_bdevs_operational <= ec_bdev->num_base_bdevs);
-	assert(ec_bdev->num_base_bdevs_operational >= ec_bdev->min_base_bdevs_operational);
+	
+	/* Relax assertion for CONFIGURING state - during reconfiguration, we may temporarily
+	 * have fewer operational base bdevs than minimum required, but we're rebuilding.
+	 */
+	if (ec_bdev->state != EC_BDEV_STATE_CONFIGURING) {
+		assert(ec_bdev->num_base_bdevs_operational >= ec_bdev->min_base_bdevs_operational);
+	}
+	
+	/* If EC bdev is OFFLINE (deconfigured), we need to reconfigure it first.
+	 * Transition to CONFIGURING state to allow configuration to proceed.
+	 */
+	if (ec_bdev->state == EC_BDEV_STATE_OFFLINE) {
+		ec_bdev->state = EC_BDEV_STATE_CONFIGURING;
+		SPDK_DEBUGLOG(bdev_ec, "EC bdev state changing from offline to configuring for reconfigure\n");
+	}
+	
+	/* During reconfiguration in CONFIGURING state, update num_base_bdevs_operational
+	 * to match num_base_bdevs_discovered if needed.
+	 */
+	if (ec_bdev->state == EC_BDEV_STATE_CONFIGURING &&
+	    ec_bdev->num_base_bdevs_operational < ec_bdev->num_base_bdevs_discovered) {
+		ec_bdev->num_base_bdevs_operational = ec_bdev->num_base_bdevs_discovered;
+		SPDK_DEBUGLOG(bdev_ec, "Updating num_base_bdevs_operational to %u for reconfigure\n",
+			      ec_bdev->num_base_bdevs_operational);
+	}
 
 	/* Continue configuration */
 	ec_bdev_configure_cont(ec_bdev);

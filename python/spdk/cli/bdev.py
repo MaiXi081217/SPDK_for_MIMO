@@ -1609,7 +1609,7 @@ def add_parser(subparsers):
             sys.exit(1)
 
         # Print the created EC name (RPC returns a string)
-        # Build request params - only include wear_leveling_mode if explicitly set
+        # Build request params
         params = {
             'name': args.name,
             'k': args.k,
@@ -1622,7 +1622,10 @@ def add_parser(subparsers):
             params['uuid'] = args.uuid
         if args.superblock:
             params['superblock'] = args.superblock
-        # Note: wear_leveling_mode is not supported by RPC interface, so we don't include it
+        if args.wear_leveling_enabled:
+            params['wear_leveling_enabled'] = args.wear_leveling_enabled
+        if args.debug_enabled:
+            params['debug_enabled'] = args.debug_enabled
         
         print_json(args.client.bdev_ec_create(**params))
     
@@ -1640,8 +1643,8 @@ def add_parser(subparsers):
     p.add_argument('--uuid', help='UUID for this EC bdev')
     p.add_argument('-s', '--superblock', help='information about EC bdev will be stored in superblock on each base bdev, '
                                               'disabled by default', action='store_true')
-    # Note: wear_leveling_mode parameter removed - not supported by RPC interface
-    # p.add_argument('-w', '--wear-leveling-mode', dest='wear_leveling_mode', ...)
+    p.add_argument('-w', '--wear-leveling-enabled', help='Enable wear leveling for device selection', action='store_true')
+    p.add_argument('--debug-enabled', help='Enable debug logging for device selection', action='store_true')
     p.set_defaults(func=bdev_ec_create)
 
     def bdev_ec_delete(args):
@@ -1666,6 +1669,32 @@ def add_parser(subparsers):
     p = subparsers.add_parser('bdev_ec_remove_base_bdev', help='Remove base bdev from existing EC bdev')
     p.add_argument('name', help='base bdev name')
     p.set_defaults(func=bdev_ec_remove_base_bdev)
+
+    def bdev_ec_set_selection_strategy(args):
+        params = {'name': args.name}
+        if hasattr(args, 'wear_leveling_enabled') and args.wear_leveling_enabled is not None:
+            params['wear_leveling_enabled'] = args.wear_leveling_enabled
+        if hasattr(args, 'debug_enabled') and args.debug_enabled is not None:
+            params['debug_enabled'] = args.debug_enabled
+        if hasattr(args, 'stripe_group_size') and args.stripe_group_size is not None:
+            params['stripe_group_size'] = args.stripe_group_size
+        if hasattr(args, 'refresh_wear_levels') and args.refresh_wear_levels:
+            params['refresh_wear_levels'] = True
+        args.client.bdev_ec_set_selection_strategy(**params)
+    
+    p = subparsers.add_parser('bdev_ec_set_selection_strategy', help='Configure device selection strategy for EC bdev (wear leveling, debug, etc.)')
+    p.add_argument('name', help='EC bdev name')
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('-w', '--enable-wear-leveling', dest='wear_leveling_enabled', help='Enable wear leveling', action='store_true')
+    group.add_argument('--disable-wear-leveling', dest='wear_leveling_enabled', help='Disable wear leveling', action='store_false')
+    p.set_defaults(wear_leveling_enabled=None)
+    group2 = p.add_mutually_exclusive_group()
+    group2.add_argument('--enable-debug', dest='debug_enabled', help='Enable debug logging', action='store_true')
+    group2.add_argument('--disable-debug', dest='debug_enabled', help='Disable debug logging', action='store_false')
+    p.set_defaults(debug_enabled=None)
+    p.add_argument('-g', '--stripe-group-size', help='Stripe group size for fault tolerance (default: number of base bdevs)', type=int)
+    p.add_argument('-r', '--refresh-wear-levels', help='Refresh wear levels from all devices', action='store_true')
+    p.set_defaults(func=bdev_ec_set_selection_strategy)
 
     def bdev_wipe_superblock(args):
         if args.size > 0:

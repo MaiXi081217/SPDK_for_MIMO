@@ -144,6 +144,12 @@ struct rpc_bdev_ec_create {
 
 	/* If set, information about EC bdev will be stored in superblock on each base bdev */
 	bool                                 superblock_enabled;
+
+	/* Enable wear leveling for device selection */
+	bool                                 wear_leveling_enabled;
+
+	/* Enable debug logging for device selection */
+	bool                                 debug_enabled;
 };
 
 /*
@@ -221,6 +227,8 @@ static const struct spdk_json_object_decoder rpc_bdev_ec_create_decoders[] = {
 	{"base_bdevs", offsetof(struct rpc_bdev_ec_create, base_bdevs), decode_ec_base_bdevs},
 	{"uuid", offsetof(struct rpc_bdev_ec_create, uuid), spdk_json_decode_uuid, true},
 	{"superblock", offsetof(struct rpc_bdev_ec_create, superblock_enabled), spdk_json_decode_bool, true},
+	{"wear_leveling_enabled", offsetof(struct rpc_bdev_ec_create, wear_leveling_enabled), spdk_json_decode_bool, true},
+	{"debug_enabled", offsetof(struct rpc_bdev_ec_create, debug_enabled), spdk_json_decode_bool, true},
 };
 
 struct rpc_bdev_ec_create_ctx {
@@ -233,6 +241,89 @@ struct rpc_bdev_ec_create_ctx {
 	uint8_t p;
 	char *missing_base_bdev_name; /* Name of base bdev that was not found (for error reporting) */
 };
+
+/* Forward declaration for context free helper used in error cleanup */
+static void free_rpc_bdev_ec_create_ctx(struct rpc_bdev_ec_create_ctx *ctx);
+
+/*
+ * Helper to cleanup EC bdev (if allocated) and send a detailed error response
+ * for bdev_ec_create failures. Used by both the synchronous error path in
+ * rpc_bdev_ec_create and the asynchronous callback path.
+ */
+static void
+rpc_bdev_ec_create_cleanup_and_send_error(struct rpc_bdev_ec_create_ctx *ctx)
+{
+	if (ctx->ec_bdev != NULL) {
+		/* Cleanup EC bdev.
+		 * If EC bdev is still in CONFIGURING state and no base bdevs were configured,
+		 * we can delete it directly without going through the full delete process.
+		 * Otherwise, use ec_bdev_delete for proper cleanup.
+		 */
+		if (ctx->ec_bdev->state == EC_BDEV_STATE_CONFIGURING &&
+		    ctx->ec_bdev->num_base_bdevs_discovered == 0) {
+			struct ec_bdev *iter;
+			bool found = false;
+
+			TAILQ_FOREACH(iter, &g_ec_bdev_list, global_link) {
+				if (iter == ctx->ec_bdev) {
+					found = true;
+					break;
+				}
+			}
+			if (found) {
+				ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
+			} else {
+				ec_bdev_free(ctx->ec_bdev);
+			}
+		} else {
+			ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
+		}
+	}
+
+	/* Send error response with detailed error reason */
+	if (ctx->status == -ENODEV) {
+		if (ctx->missing_base_bdev_name != NULL) {
+			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+							     "Failed to create EC bdev %s: base bdev '%s' not found (device may not exist or not be registered)",
+							     ctx->req.name, ctx->missing_base_bdev_name);
+		} else {
+			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+							     "Failed to create EC bdev %s: base bdev not found (device may not exist or not be registered)",
+							     ctx->req.name);
+		}
+	} else if (ctx->status == -EPERM) {
+		if (ctx->missing_base_bdev_name != NULL) {
+			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+							     "Failed to create EC bdev %s: base bdev '%s' is already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdev first",
+							     ctx->req.name, ctx->missing_base_bdev_name);
+		} else {
+			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+							     "Failed to create EC bdev %s: one or more base bdevs are already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdevs first",
+							     ctx->req.name);
+		}
+	} else if (ctx->status == -EINVAL) {
+		spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+						     "Failed to create EC bdev %s: invalid parameter (check base bdev configuration, UUID mismatch, or other validation errors)",
+						     ctx->req.name);
+	} else if (ctx->status == -ENOMEM) {
+		spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+						     "Failed to create EC bdev %s: out of memory",
+						     ctx->req.name);
+	} else {
+		/* ctx->status is negative errno, normalize for spdk_strerror */
+		int err = ctx->status;
+
+		if (err > 0) {
+			err = -err;
+		}
+		spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+						     "Failed to create EC bdev %s: %s (error code: %d)",
+						     ctx->req.name,
+						     spdk_strerror(-err), ctx->status);
+	}
+
+	free_rpc_bdev_ec_create_ctx(ctx);
+}
 
 static void
 free_rpc_bdev_ec_create_ctx(struct rpc_bdev_ec_create_ctx *ctx)
@@ -264,114 +355,50 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 		ctx->status = status;
 	}
 
-	/* Handle error case: if remaining is already 0, it means all base bdevs failed
-	 * and we've already processed the error. This can happen when multiple base bdevs
-	 * fail synchronously. In this case, we should just return to avoid double processing.
-	 */
-	if (ctx->remaining == 0) {
-		/* This is expected when all base bdevs fail - error already handled */
-		if (ctx->status != 0) {
-			SPDK_DEBUGLOG(bdev_ec, "All base bdevs failed, error already handled\n");
-		} else {
-			SPDK_ERRLOG("Invalid state: remaining counter is 0 but no error status\n");
-		}
-		free_rpc_bdev_ec_create_ctx(ctx);
-		return;
-	}
-
 	if (--ctx->remaining > 0) {
 		/* Still waiting for more base bdevs to be added */
 		return;
 	}
 
 	if (ctx->status != 0) {
-		/* Only cleanup if ec_bdev was successfully created */
-		if (ctx->ec_bdev != NULL) {
-			/* If EC bdev is still in CONFIGURING state and no base bdevs were configured,
-			 * we can directly free it without going through the full delete process.
-			 * This avoids potential issues with uninitialized resources.
-			 *
-			 * Note: This direct free path is safe because:
-			 * 1. No base bdevs have been configured (num_base_bdevs_discovered == 0)
-			 * 2. EC bdev is not registered with bdev layer yet (still CONFIGURING)
-			 * 3. No I/O channels or other resources have been allocated
-			 * 4. No other components hold references to this ec_bdev
-			 *
-			 * If any base bdevs were configured, we must use the full delete process
-			 * to properly clean up resources (I/O channels, base bdev claims, etc.)
-			 */
-			if (ctx->ec_bdev->state == EC_BDEV_STATE_CONFIGURING &&
-			    ctx->ec_bdev->num_base_bdevs_discovered == 0) {
-				/* Direct cleanup for EC bdev that hasn't been fully configured.
-				 * Since ec_bdev_delete checks destroy_started and removes from list,
-				 * we need to check if it's already in the list before removing.
-				 * However, since we're in the create callback and deletion hasn't
-				 * started yet, we can safely remove it here. But to be consistent
-				 * with ec_bdev_delete, let's use it instead of direct free.
-				 */
-				/* Check if ec_bdev is still in the list */
-				struct ec_bdev *iter;
-				bool found = false;
-				TAILQ_FOREACH(iter, &g_ec_bdev_list, global_link) {
-					if (iter == ctx->ec_bdev) {
-						found = true;
-						break;
-					}
-				}
-				if (found) {
-					/* Use ec_bdev_delete for consistent cleanup - don't wipe superblock on error */
-					ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
+		rpc_bdev_ec_create_cleanup_and_send_error(ctx);
+	} else {
+		/* All base bdevs added successfully, configure wear leveling if requested */
+		if (ctx->req.wear_leveling_enabled || ctx->req.debug_enabled) {
+			struct ec_device_selection_config *config = &ctx->ec_bdev->selection_config;
+			bool need_reinit = false;
+
+			/* Update wear leveling settings if provided */
+			if (ctx->req.wear_leveling_enabled != config->wear_leveling_enabled) {
+				config->wear_leveling_enabled = ctx->req.wear_leveling_enabled;
+				need_reinit = true;
+			}
+
+			/* Update debug flag if provided */
+			if (ctx->req.debug_enabled) {
+				config->debug_enabled = ctx->req.debug_enabled;
+			}
+
+			/* Re-initialize selection config if wear leveling was enabled */
+			if (need_reinit && config->wear_leveling_enabled) {
+				int rc = ec_bdev_init_selection_config(ctx->ec_bdev);
+				if (rc != 0) {
+					SPDK_WARNLOG("EC bdev %s: Failed to initialize wear leveling: %s\n",
+						     ctx->req.name, spdk_strerror(-rc));
+					/* Don't fail creation if wear leveling init fails */
 				} else {
-					/* Already removed, just free */
-					ec_bdev_free(ctx->ec_bdev);
+					SPDK_NOTICELOG("EC bdev %s: Wear leveling enabled during creation\n",
+						       ctx->req.name);
 				}
-			} else {
-				/* Use full delete process for configured EC bdevs - don't wipe superblock on error */
-				ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
+			}
+
+			/* Save configuration to superblock if enabled */
+			if (ctx->ec_bdev->superblock_enabled && ctx->ec_bdev->sb != NULL) {
+				ec_bdev_sb_save_selection_metadata(ctx->ec_bdev);
+				ec_bdev_write_superblock(ctx->ec_bdev, NULL, NULL);
 			}
 		}
-		
-		/* Send error response with detailed error reason */
-		if (ctx->status == -ENODEV) {
-			if (ctx->missing_base_bdev_name != NULL) {
-				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-							     "Failed to create EC bdev %s: base bdev '%s' not found (device may not exist or not be registered)",
-							     ctx->req.name, ctx->missing_base_bdev_name);
-			} else {
-				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-							     "Failed to create EC bdev %s: base bdev not found (device may not exist or not be registered)",
-							     ctx->req.name);
-			}
-		} else if (ctx->status == -EPERM) {
-			if (ctx->missing_base_bdev_name != NULL) {
-				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-							     "Failed to create EC bdev %s: base bdev '%s' is already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdev first",
-							     ctx->req.name, ctx->missing_base_bdev_name);
-			} else {
-				spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-							     "Failed to create EC bdev %s: one or more base bdevs are already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdevs first",
-							     ctx->req.name);
-			}
-		} else if (ctx->status == -EINVAL) {
-			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-						     "Failed to create EC bdev %s: invalid parameter (check base bdev configuration, UUID mismatch, or other validation errors)",
-						     ctx->req.name);
-		} else if (ctx->status == -ENOMEM) {
-			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-						     "Failed to create EC bdev %s: out of memory",
-						     ctx->req.name);
-		} else {
-			/* ctx->status is negative errno, normalize for spdk_strerror */
-			int err = ctx->status;
-			if (err > 0) {
-				err = -err;
-			}
-			spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-						     "Failed to create EC bdev %s: %s (error code: %d)",
-						     ctx->req.name,
-						     spdk_strerror(-err), ctx->status);
-		}
-    } else {
+
         /* Return the created EC bdev name */
 		struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(ctx->request);
 		spdk_json_write_string(w, ctx->req.name);
@@ -484,14 +511,14 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 		const char *base_bdev_name = req->base_bdevs.base_bdevs[i].name;
 
 		rc = ec_bdev_add_base_bdev(ec_bdev, base_bdev_name,
-				   rpc_bdev_ec_create_add_base_bdev_cb, ctx);
+					   rpc_bdev_ec_create_add_base_bdev_cb, ctx);
 		if (rc != 0) {
 			/* ec_bdev_add_base_bdev failed - it doesn't call the callback on error,
 			 * so we need to handle it here to avoid hanging.
 			 */
 			SPDK_DEBUGLOG(bdev_ec, "Failed to add base bdev %s: %s\n",
 				      base_bdev_name, spdk_strerror(-rc));
-			
+
 			if (rc == -ENODEV) {
 				/* Base bdev doesn't exist - fail immediately */
 				ctx->status = -ENODEV;
@@ -523,94 +550,10 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 					}
 				}
 			}
-			
-			/* Decrement remaining for all base bdevs that haven't been added yet.
-			 * Note: We need to account for:
-			 * - The current base bdev that failed (i)
-			 * - All remaining base bdevs that won't be added (num_base_bdevs - i - 1)
-			 * Total to cancel: (num_base_bdevs - i) base bdevs
-			 * Since ec_bdev_add_base_bdev doesn't call the callback on error,
-			 * we need to cancel all remaining base bdevs including the current one.
-			 */
-			size_t remaining_to_cancel = req->base_bdevs.num_base_bdevs - i;
-			if (remaining_to_cancel > 0 && remaining_to_cancel <= ctx->remaining) {
-				ctx->remaining -= (uint8_t)remaining_to_cancel;
-			}
-			
-			/* If remaining is now 0, we need to handle the error directly
-			 * because the callback will see remaining == 0 and return early.
-			 * Otherwise, call the callback which will handle it when remaining reaches 0.
-			 */
-			if (ctx->remaining == 0) {
-				/* All base bdevs failed - handle error directly */
-				if (ctx->ec_bdev != NULL) {
-					/* Cleanup EC bdev */
-					if (ctx->ec_bdev->state == EC_BDEV_STATE_CONFIGURING &&
-					    ctx->ec_bdev->num_base_bdevs_discovered == 0) {
-						struct ec_bdev *iter;
-						bool found = false;
-						TAILQ_FOREACH(iter, &g_ec_bdev_list, global_link) {
-							if (iter == ctx->ec_bdev) {
-								found = true;
-								break;
-							}
-						}
-						if (found) {
-							ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
-						} else {
-							ec_bdev_free(ctx->ec_bdev);
-						}
-					} else {
-						ec_bdev_delete(ctx->ec_bdev, false, NULL, NULL);
-					}
-				}
-				
-				/* Send error response with detailed error reason */
-				if (ctx->status == -ENODEV) {
-					if (ctx->missing_base_bdev_name != NULL) {
-						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-									     "Failed to create EC bdev %s: base bdev '%s' not found (device may not exist or not be registered)",
-									     ctx->req.name, ctx->missing_base_bdev_name);
-					} else {
-						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-									     "Failed to create EC bdev %s: base bdev not found (device may not exist or not be registered)",
-									     ctx->req.name);
-					}
-				} else if (ctx->status == -EPERM) {
-					if (ctx->missing_base_bdev_name != NULL) {
-						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-									     "Failed to create EC bdev %s: base bdev '%s' is already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdev first",
-									     ctx->req.name, ctx->missing_base_bdev_name);
-					} else {
-						spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-									     "Failed to create EC bdev %s: one or more base bdevs are already claimed by another module (RAID, FTL, or another EC bdev). Please remove the existing bdevs first",
-									     ctx->req.name);
-					}
-				} else if (ctx->status == -EINVAL) {
-					spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-								     "Failed to create EC bdev %s: invalid parameter (check base bdev configuration, UUID mismatch, or other validation errors)",
-								     ctx->req.name);
-				} else if (ctx->status == -ENOMEM) {
-					spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-								     "Failed to create EC bdev %s: out of memory",
-								     ctx->req.name);
-				} else {
-					int err = ctx->status;
-					if (err > 0) {
-						err = -err;
-					}
-					spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
-								     "Failed to create EC bdev %s: %s (error code: %d)",
-								     ctx->req.name,
-								     spdk_strerror(-err), ctx->status);
-				}
-				
-				free_rpc_bdev_ec_create_ctx(ctx);
-			} else {
-				/* Call callback - it will handle when remaining reaches 0 */
-				rpc_bdev_ec_create_add_base_bdev_cb(ctx, rc);
-			}
-			break;
+
+			/* Synchronous error: cleanup and respond immediately */
+			rpc_bdev_ec_create_cleanup_and_send_error(ctx);
+			return;
 		}
 		/* else: rc == 0, callback will be called asynchronously by ec_bdev_configure_base_bdev */
 	}
@@ -896,7 +839,7 @@ struct rpc_bdev_ec_set_selection_strategy {
 	uint8_t stripe_group_size;  /* For fault tolerance in wear leveling (built-in) */
 	bool wear_leveling_enabled;
 	bool debug_enabled;
-	uint32_t selection_seed;
+	bool refresh_wear_levels;  /* Refresh wear levels from devices */
 };
 
 static void
@@ -910,7 +853,7 @@ static const struct spdk_json_object_decoder rpc_bdev_ec_set_selection_strategy_
 	{"stripe_group_size", offsetof(struct rpc_bdev_ec_set_selection_strategy, stripe_group_size), spdk_json_decode_uint8, true},
 	{"wear_leveling_enabled", offsetof(struct rpc_bdev_ec_set_selection_strategy, wear_leveling_enabled), spdk_json_decode_bool, true},
 	{"debug_enabled", offsetof(struct rpc_bdev_ec_set_selection_strategy, debug_enabled), spdk_json_decode_bool, true},
-	{"selection_seed", offsetof(struct rpc_bdev_ec_set_selection_strategy, selection_seed), spdk_json_decode_uint32, true},
+	{"refresh_wear_levels", offsetof(struct rpc_bdev_ec_set_selection_strategy, refresh_wear_levels), spdk_json_decode_bool, true},
 };
 
 /*
@@ -978,17 +921,31 @@ rpc_bdev_ec_set_selection_strategy(struct spdk_jsonrpc_request *request,
 	}
 
 	/* Update debug flag (if provided) */
-	config->debug_enabled = req.debug_enabled;
-	if (config->debug_enabled) {
-		SPDK_NOTICELOG("EC bdev %s: Debug logging enabled for device selection\n",
-			       req.name);
+	if (req.debug_enabled) {
+		config->debug_enabled = req.debug_enabled;
+		if (config->debug_enabled) {
+			SPDK_NOTICELOG("EC bdev %s: Debug logging enabled for device selection\n",
+				       req.name);
+		}
 	}
 
-	/* Update selection seed (if provided and valid) */
-	if (req.selection_seed > 0) {
-		config->selection_seed = req.selection_seed;
-		SPDK_NOTICELOG("EC bdev %s: Selection seed set to %u\n",
-			       req.name, config->selection_seed);
+	/* Refresh wear levels if requested */
+	if (req.refresh_wear_levels) {
+		if (!config->wear_leveling_enabled) {
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+							     "Wear leveling is not enabled for EC bdev %s", req.name);
+			goto cleanup;
+		}
+
+		SPDK_NOTICELOG("EC bdev %s: Refreshing wear levels for all devices...\n", req.name);
+		rc = ec_selection_create_profile_from_devices(ec_bdev, true, true);
+		if (rc != 0) {
+			spdk_jsonrpc_send_error_response_fmt(request, rc,
+							     "Failed to refresh wear levels: %s",
+							     spdk_strerror(-rc));
+			goto cleanup;
+		}
+		SPDK_NOTICELOG("EC bdev %s: Wear levels refreshed successfully\n", req.name);
 	}
 
 	/* Update selection function based on current configuration

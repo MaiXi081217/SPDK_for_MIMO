@@ -231,7 +231,12 @@ rpc_bdev_raid_create_add_base_bdev_cb(void *_ctx, int status)
     if (ctx->status != 0) {
         raid_bdev_delete(ctx->raid_bdev, NULL, NULL);
         /* Provide more specific error message for common error codes */
-        if (ctx->status == -EINVAL) {
+        if (ctx->status == -ENODEV) {
+            spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
+                                                 "Failed to create RAID bdev %s: One or more base bdevs do not exist. "
+                                                 "Please ensure all base bdevs are available before creating the RAID bdev.",
+                                                 ctx->req.name);
+        } else if (ctx->status == -EINVAL) {
             spdk_jsonrpc_send_error_response_fmt(ctx->request, ctx->status,
                                                  "Failed to create RAID bdev %s: Invalid argument. "
                                                  "One or more base bdevs may have a superblock from a different RAID group. "
@@ -323,13 +328,14 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
 
 		rc = raid_bdev_add_base_bdev(raid_bdev, base_bdev_name,
 					     rpc_bdev_raid_create_add_base_bdev_cb, ctx);
-		if (rc == -ENODEV) {
-			SPDK_DEBUGLOG(bdev_raid, "base bdev %s doesn't exist now\n", base_bdev_name);
-			assert(ctx->remaining > 1 || i + 1 == num_base_bdevs);
-			rpc_bdev_raid_create_add_base_bdev_cb(ctx, 0);
-		} else if (rc != 0) {
-			SPDK_DEBUGLOG(bdev_raid, "Failed to add base bdev %s to RAID bdev %s: %s",
-				      base_bdev_name, req->name, spdk_strerror(-rc));
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to add base bdev %s to RAID bdev %s: %s\n",
+				    base_bdev_name, req->name, spdk_strerror(-rc));
+			/* If base bdev doesn't exist, treat it as an error */
+			if (rc == -ENODEV) {
+				SPDK_ERRLOG("Base bdev %s does not exist. All base bdevs must be available before creating RAID bdev.\n",
+					    base_bdev_name);
+			}
 			ctx->remaining -= (num_base_bdevs - i - 1);
 			rpc_bdev_raid_create_add_base_bdev_cb(ctx, rc);
 			break;

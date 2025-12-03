@@ -438,6 +438,16 @@ int ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 struct ec_bdev *ec_bdev_find_by_name(const char *name);
 enum ec_bdev_state ec_bdev_str_to_state(const char *str);
 const char *ec_bdev_state_to_str(enum ec_bdev_state state);
+
+/* Rebuild state enumeration (for fine-grained tracking) */
+enum ec_rebuild_state {
+	EC_REBUILD_STATE_IDLE,
+	EC_REBUILD_STATE_READING,
+	EC_REBUILD_STATE_DECODING,
+	EC_REBUILD_STATE_WRITING
+};
+
+const char *ec_rebuild_state_to_str(enum ec_rebuild_state state);
 void ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w);
 void ec_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
 int ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, void *cb_ctx);

@@ -443,21 +443,18 @@ handle_select_error:
 }
 
 /*
- * Start rebuild for a target base bdev
+ * Start rebuild for a target base bdev (using process framework)
  */
 int
 ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_base_info,
 		      void (*done_cb)(void *ctx, int status), void *done_ctx)
 {
-	struct ec_rebuild_context *rebuild_ctx;
-	uint32_t strip_size_bytes;
-	uint8_t i;
-
 	if (ec_bdev == NULL || target_base_info == NULL) {
 		return -EINVAL;
 	}
 
-	if (ec_bdev->rebuild_ctx != NULL) {
+	/* Check if rebuild already in progress (legacy or new framework) */
+	if (ec_bdev->rebuild_ctx != NULL || ec_bdev->process != NULL) {
 		SPDK_WARNLOG("Rebuild already in progress for EC bdev %s\n", ec_bdev->bdev.name);
 		return -EBUSY;
 	}
@@ -467,158 +464,90 @@ ec_bdev_start_rebuild(struct ec_bdev *ec_bdev, struct ec_base_bdev_info *target_
 		return -ENODEV;
 	}
 
-	/* Allocate rebuild context */
-	rebuild_ctx = calloc(1, sizeof(*rebuild_ctx));
-	if (rebuild_ctx == NULL) {
-		return -ENOMEM;
-	}
-
-	rebuild_ctx->target_base_info = target_base_info;
-	rebuild_ctx->target_slot = 0;
-	/* Find target slot */
-	for (i = 0; i < ec_bdev->num_base_bdevs; i++) {
-		if (&ec_bdev->base_bdev_info[i] == target_base_info) {
-			rebuild_ctx->target_slot = i;
-			break;
-		}
-	}
-
-	/* Update superblock to mark base bdev as REBUILDING before starting rebuild */
-	if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
-					       EC_SB_BASE_BDEV_REBUILDING)) {
-		ec_bdev_write_superblock(ec_bdev, NULL, NULL);
-	}
-
-	/* Calculate total stripes */
-	uint64_t total_strips = ec_bdev->bdev.blockcnt / ec_bdev->strip_size;
-	rebuild_ctx->total_stripes = total_strips / ec_bdev->k;
-	rebuild_ctx->current_stripe = 0;
-	rebuild_ctx->state = EC_REBUILD_STATE_IDLE;
-	rebuild_ctx->rebuild_done_cb = done_cb;
-	rebuild_ctx->rebuild_done_ctx = done_ctx;
-	rebuild_ctx->paused = false;
-
-	/* Get I/O channel for rebuild */
-	rebuild_ctx->rebuild_ch = spdk_get_io_channel(&ec_bdev->bdev);
-	if (rebuild_ctx->rebuild_ch == NULL) {
-		SPDK_ERRLOG("Failed to get I/O channel for rebuild\n");
-		/* Revert superblock state from REBUILDING to FAILED */
-		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
-						       EC_SB_BASE_BDEV_FAILED)) {
-			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
-		}
-		free(rebuild_ctx);
-		return -ENOMEM;
-	}
-
-	/* Allocate buffers */
-	strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
-	struct ec_bdev_io_channel *ec_ch = spdk_io_channel_get_ctx(rebuild_ctx->rebuild_ch);
-	rebuild_ctx->stripe_buf = ec_get_rmw_stripe_buf(ec_ch, ec_bdev,
-						       strip_size_bytes * ec_bdev->k);
-	if (rebuild_ctx->stripe_buf == NULL) {
-		SPDK_ERRLOG("Failed to allocate stripe buffer for rebuild\n");
-		/* Revert superblock state from REBUILDING to FAILED */
-		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
-						       EC_SB_BASE_BDEV_FAILED)) {
-			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
-		}
-		spdk_put_io_channel(rebuild_ctx->rebuild_ch);
-		free(rebuild_ctx);
-		return -ENOMEM;
-	}
-
-	rebuild_ctx->recover_buf = spdk_dma_malloc(strip_size_bytes, ec_bdev->buf_alignment, NULL);
-	if (rebuild_ctx->recover_buf == NULL) {
-		SPDK_ERRLOG("Failed to allocate recovery buffer for rebuild\n");
-		/* Revert superblock state from REBUILDING to FAILED */
-		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, rebuild_ctx->target_slot,
-						       EC_SB_BASE_BDEV_FAILED)) {
-			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
-		}
-		ec_put_rmw_stripe_buf(ec_ch, rebuild_ctx->stripe_buf,
-				      strip_size_bytes * ec_bdev->k);
-		spdk_put_io_channel(rebuild_ctx->rebuild_ch);
-		free(rebuild_ctx);
-		return -ENOMEM;
-	}
-
-	/* Initialize wait entry */
-	rebuild_ctx->wait_entry.bdev = NULL;
-	rebuild_ctx->wait_entry.cb_fn = ec_rebuild_next_stripe;
-	rebuild_ctx->wait_entry.cb_arg = rebuild_ctx;
-	rebuild_ctx->wait_entry.dep_unblock = true;
-
-	ec_bdev->rebuild_ctx = rebuild_ctx;
-
-	SPDK_NOTICELOG("Starting rebuild for base bdev %s (slot %u) on EC bdev %s\n",
-		       target_base_info->name, rebuild_ctx->target_slot, ec_bdev->bdev.name);
-
-	/* Start rebuilding first stripe */
-	spdk_thread_send_msg(spdk_get_thread(), ec_rebuild_next_stripe, rebuild_ctx);
-
-	return 0;
+	/* Use process framework for rebuild */
+	return ec_bdev_start_process(ec_bdev, EC_PROCESS_REBUILD, target_base_info, done_cb, done_ctx);
 }
 
 /*
- * Stop rebuild
+ * Stop rebuild (using process framework)
  */
 void
 ec_bdev_stop_rebuild(struct ec_bdev *ec_bdev)
 {
-	if (ec_bdev == NULL || ec_bdev->rebuild_ctx == NULL) {
+	if (ec_bdev == NULL) {
 		return;
 	}
 
-	SPDK_NOTICELOG("Stopping rebuild for EC bdev %s\n", ec_bdev->bdev.name);
-	
-	/* Update superblock to mark rebuild as FAILED (revert REBUILDING to FAILED) */
+	/* Stop legacy rebuild if active */
 	if (ec_bdev->rebuild_ctx != NULL) {
+		SPDK_NOTICELOG("Stopping legacy rebuild for EC bdev %s\n", ec_bdev->bdev.name);
+		
+		/* Update superblock to mark rebuild as FAILED */
 		if (ec_bdev_sb_update_base_bdev_state(ec_bdev, ec_bdev->rebuild_ctx->target_slot,
 						      EC_SB_BASE_BDEV_FAILED)) {
 			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
 		}
-	}
-	
-	ec_bdev->rebuild_ctx->paused = true;
+		
+		ec_bdev->rebuild_ctx->paused = true;
 
-	if (ec_bdev->rebuild_ctx->rebuild_done_cb) {
-		ec_bdev->rebuild_ctx->rebuild_done_cb(ec_bdev->rebuild_ctx->rebuild_done_ctx, -ECANCELED);
+		if (ec_bdev->rebuild_ctx->rebuild_done_cb) {
+			ec_bdev->rebuild_ctx->rebuild_done_cb(ec_bdev->rebuild_ctx->rebuild_done_ctx, -ECANCELED);
+		}
+
+		ec_rebuild_cleanup(ec_bdev->rebuild_ctx);
+		ec_bdev->rebuild_ctx = NULL;
 	}
 
-	ec_rebuild_cleanup(ec_bdev->rebuild_ctx);
-	ec_bdev->rebuild_ctx = NULL;
+	/* Stop process framework rebuild if active */
+	if (ec_bdev->process != NULL) {
+		ec_bdev_stop_process(ec_bdev);
+	}
 }
 
 /*
- * Check if rebuild is in progress
+ * Check if rebuild is in progress (legacy or process framework)
  */
 bool
 ec_bdev_is_rebuilding(struct ec_bdev *ec_bdev)
 {
-	return ec_bdev_get_active_rebuild(ec_bdev) != NULL;
+	/* Check both legacy and new process framework */
+	return ec_bdev_get_active_rebuild(ec_bdev) != NULL ||
+	       ec_bdev_is_process_in_progress(ec_bdev);
 }
 
 /*
- * Get rebuild progress
+ * Get rebuild progress (based on window_offset for process framework)
  */
 int
 ec_bdev_get_rebuild_progress(struct ec_bdev *ec_bdev, uint64_t *current_stripe,
 			     uint64_t *total_stripes)
 {
-	struct ec_rebuild_context *ctx;
+	struct ec_rebuild_context *legacy_ctx;
+	struct ec_bdev_process *process;
 
 	if (ec_bdev == NULL || current_stripe == NULL || total_stripes == NULL) {
 		return -EINVAL;
 	}
 
-	ctx = ec_bdev_get_active_rebuild(ec_bdev);
-	if (ctx == NULL) {
+	/* Check process framework first */
+	process = ec_bdev_get_active_process(ec_bdev);
+	if (process != NULL && process->type == EC_PROCESS_REBUILD) {
+		/* Calculate stripe progress from window_offset */
+		uint64_t total_strips = ec_bdev->bdev.blockcnt / ec_bdev->strip_size;
+		*total_stripes = total_strips / ec_bdev->k;
+		uint64_t completed_strips = process->window_offset / ec_bdev->strip_size;
+		*current_stripe = completed_strips / ec_bdev->k;
+		return 0;
+	}
+
+	/* Fall back to legacy rebuild */
+	legacy_ctx = ec_bdev_get_active_rebuild(ec_bdev);
+	if (legacy_ctx == NULL) {
 		return -ENODEV;
 	}
 
-	*current_stripe = ctx->current_stripe;
-	*total_stripes = ctx->total_stripes;
+	*current_stripe = legacy_ctx->current_stripe;
+	*total_stripes = legacy_ctx->total_stripes;
 
 	return 0;
 }

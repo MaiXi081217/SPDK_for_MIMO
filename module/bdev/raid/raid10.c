@@ -932,7 +932,15 @@ raid10_resize(struct raid_bdev *raid_bdev)
 static struct raid_bdev_module g_raid10_module = {
 	.level = RAID10,
 	.base_bdevs_min = 2,
-	.base_bdevs_constraint = {CONSTRAINT_MIN_BASE_BDEVS_OPERATIONAL, 1},
+	/*
+	 * For RAID10, require at least 2 operational base bdevs to keep the array online.
+	 * 原先是 1（只要还剩一块盘就认为阵列“可用”），这会导致像你现在这种
+	 * 4 块盘只剩 1 块时，RAID 仍然显示 online，实际上已经无法正常使用。
+	 *
+	 * 这里先收紧为 2：当 operational 盘数 < 2 时触发 deconfigure，把阵列下线。
+	 * 更精细的“按 mirror pair 判断可用性”的逻辑在重建和 I/O 路径里单独处理。
+	 */
+	.base_bdevs_constraint = {CONSTRAINT_MIN_BASE_BDEVS_OPERATIONAL, 2},
 	.memory_domains_supported = true,
 	.start = raid10_start,
 	.stop = raid10_stop,

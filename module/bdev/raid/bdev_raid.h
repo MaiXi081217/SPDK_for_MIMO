@@ -278,9 +278,6 @@ const char *raid_bdev_level_to_str(enum raid_level level);
 enum raid_bdev_state raid_bdev_str_to_state(const char *str);
 const char *raid_bdev_state_to_str(enum raid_bdev_state state);
 const char *raid_bdev_process_to_str(enum raid_process_type value);
-/* Forward declaration */
-enum raid_rebuild_state;
-const char *raid_rebuild_state_to_str(enum raid_rebuild_state state);
 void raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w);
 int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_base_bdev_cb cb_fn, void *cb_ctx);
 /* Get rebuild progress API */
@@ -490,14 +487,6 @@ enum raid_bdev_sb_base_bdev_state {
 	RAID_SB_BASE_BDEV_FAILED	= 2,
 	RAID_SB_BASE_BDEV_SPARE		= 3,
 	RAID_SB_BASE_BDEV_REBUILDING	= 4,	/* Rebuild in progress but not completed */
-};
-
-/* Rebuild state for fine-grained tracking */
-enum raid_rebuild_state {
-	RAID_REBUILD_STATE_IDLE,
-	RAID_REBUILD_STATE_READING,
-	RAID_REBUILD_STATE_WRITING,
-	RAID_REBUILD_STATE_CALCULATING,	/* For RAID5F parity calculation */
 };
 
 struct raid_bdev_sb_base_bdev {
