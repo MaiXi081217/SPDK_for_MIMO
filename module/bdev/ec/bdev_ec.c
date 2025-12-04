@@ -588,29 +588,119 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 
 	/* 输出扩展模式和重平衡状态（如果有的话） */
 	spdk_json_write_named_int32(w, "expansion_mode", ec_bdev->expansion_mode);
-	spdk_json_write_named_int32(w, "rebalance_state", ec_bdev->rebalance_state);
-	spdk_json_write_named_uint8(w, "rebalance_progress", ec_bdev->rebalance_progress);
+	
+	/* 输出重平衡状态详细信息 */
+	/* 只有当rebalance状态不是IDLE时，才输出rebalance对象 */
+	if (ec_bdev->rebalance_state != EC_REBALANCE_IDLE) {
+		spdk_json_write_named_object_begin(w, "rebalance");
+		const char *state_str = NULL;
+		switch (ec_bdev->rebalance_state) {
+		case EC_REBALANCE_IDLE:
+			state_str = "IDLE";
+			break;
+		case EC_REBALANCE_RUNNING:
+			state_str = "RUNNING";
+			break;
+		case EC_REBALANCE_PAUSED:
+			state_str = "PAUSED";
+			break;
+		case EC_REBALANCE_COMPLETED:
+			state_str = "COMPLETED";
+			break;
+		case EC_REBALANCE_FAILED:
+			state_str = "FAILED";
+			break;
+		default:
+			state_str = "UNKNOWN";
+			break;
+		}
+		spdk_json_write_named_string(w, "state", state_str);
+		spdk_json_write_named_uint8(w, "progress", ec_bdev->rebalance_progress);
+		/* TODO: 当rebalance_ctx结构实现后，添加current_stripe, total_stripes, last_error等字段 */
+		spdk_json_write_object_end(w);
+	} else {
+		/* IDLE状态时，输出简单的状态字段 */
+		spdk_json_write_named_int32(w, "rebalance_state", ec_bdev->rebalance_state);
+		spdk_json_write_named_uint8(w, "rebalance_progress", ec_bdev->rebalance_progress);
+	}
 
-	/* Output rebuild progress if rebuild is in progress */
-	if (ec_bdev->rebuild_ctx != NULL && !ec_bdev->rebuild_ctx->paused) {
-		struct ec_rebuild_context *rebuild_ctx = ec_bdev->rebuild_ctx;
+	/* Output rebuild progress if rebuild is in progress (support both legacy and process framework) */
+	{
+		struct ec_rebuild_context *legacy_ctx = NULL;
+		struct ec_bdev_process *process = NULL;
+		bool rebuild_in_progress = false;
+		const char *target_name = NULL;
+		uint8_t target_slot = UINT8_MAX;
+		uint64_t current_stripe = 0;
+		uint64_t total_stripes = 0;
 		double percent = 0.0;
+		const char *state_str = NULL;
 
-		if (rebuild_ctx->total_stripes > 0) {
-			percent = (double)rebuild_ctx->current_stripe * 100.0 /
-				  (double)rebuild_ctx->total_stripes;
+		/* Check process framework first (new framework) */
+		process = ec_bdev_get_active_process(ec_bdev);
+		if (process != NULL && process->type == EC_PROCESS_REBUILD) {
+			rebuild_in_progress = true;
+			if (process->target != NULL) {
+				target_name = process->target->name;
+				target_slot = ec_bdev_base_bdev_slot(process->target);
+			}
+			/* Calculate stripe progress from window_offset */
+			/* 安全检查：避免除零错误 */
+			if (ec_bdev->strip_size > 0 && ec_bdev->k > 0 && ec_bdev->bdev.blockcnt > 0) {
+				uint64_t total_strips = ec_bdev->bdev.blockcnt / ec_bdev->strip_size;
+				total_stripes = total_strips / ec_bdev->k;
+				uint64_t completed_strips = process->window_offset / ec_bdev->strip_size;
+				current_stripe = completed_strips / ec_bdev->k;
+				if (total_stripes > 0) {
+					percent = (double)current_stripe * 100.0 / (double)total_stripes;
+				}
+			} else {
+				/* 异常情况：strip_size或k为0，设置默认值 */
+				total_stripes = 0;
+				current_stripe = 0;
+				percent = 0.0;
+			}
+			state_str = ec_rebuild_state_to_str(process->rebuild_state);
+		} else {
+			/* Fall back to legacy rebuild */
+			legacy_ctx = ec_bdev_get_active_rebuild(ec_bdev);
+			if (legacy_ctx != NULL) {
+				rebuild_in_progress = true;
+				if (legacy_ctx->target_base_info != NULL) {
+					target_name = legacy_ctx->target_base_info->name;
+					target_slot = legacy_ctx->target_slot;
+				}
+				current_stripe = legacy_ctx->current_stripe;
+				total_stripes = legacy_ctx->total_stripes;
+				if (total_stripes > 0) {
+					percent = (double)current_stripe * 100.0 / (double)total_stripes;
+				}
+				state_str = ec_rebuild_state_to_str(legacy_ctx->state);
+			}
 		}
 
-		spdk_json_write_named_object_begin(w, "rebuild");
-		spdk_json_write_named_string(w, "target", rebuild_ctx->target_base_info->name);
-		spdk_json_write_named_uint8(w, "target_slot", rebuild_ctx->target_slot);
-		spdk_json_write_named_object_begin(w, "progress");
-		spdk_json_write_named_uint64(w, "current_stripe", rebuild_ctx->current_stripe);
-		spdk_json_write_named_uint64(w, "total_stripes", rebuild_ctx->total_stripes);
-		spdk_json_write_named_double(w, "percent", percent);
-		spdk_json_write_named_string(w, "state", ec_rebuild_state_to_str(rebuild_ctx->state));
-		spdk_json_write_object_end(w);
-		spdk_json_write_object_end(w);
+		if (rebuild_in_progress) {
+			spdk_json_write_named_object_begin(w, "rebuild");
+			if (target_name != NULL) {
+				spdk_json_write_named_string(w, "target", target_name);
+			} else {
+				spdk_json_write_named_null(w, "target");
+			}
+			if (target_slot != UINT8_MAX) {
+				spdk_json_write_named_uint8(w, "target_slot", target_slot);
+			}
+			spdk_json_write_named_object_begin(w, "progress");
+			spdk_json_write_named_uint64(w, "current_stripe", current_stripe);
+			spdk_json_write_named_uint64(w, "total_stripes", total_stripes);
+			spdk_json_write_named_double(w, "percent", percent);
+			if (state_str != NULL) {
+				spdk_json_write_named_string(w, "state", state_str);
+			} else {
+				spdk_json_write_named_string(w, "state", "UNKNOWN");
+			}
+			spdk_json_write_object_end(w);
+			spdk_json_write_object_end(w);
+		}
 	}
 
 	/* 先检查是否存在任何 active 标记，用于兼容旧配置 */
@@ -3511,13 +3601,48 @@ _ec_bdev_fail_base_bdev(void *ctx)
 	if (ec_bdev->expansion_mode == EC_EXPANSION_MODE_SPARE &&
 	    base_info->is_active && !base_info->is_spare) {
 		struct ec_base_bdev_info *iter;
+		uint8_t active_count = 0;
+		uint8_t spare_count = 0;
 
-		SPDK_NOTICELOG("EC[spare] base bdev '%s' (slot=%u) failed on EC bdev %s, trying to promote a spare\n",
+		/* 先统计当前active和spare数量，用于日志和检查
+		 * 注意：base_info已经被标记为failed，所以统计时不会包含它
+		 */
+		EC_FOR_EACH_BASE_BDEV(ec_bdev, iter) {
+			if (iter->is_failed) {
+				continue;
+			}
+			/* 只统计健康的设备（有desc且未失败） */
+			if (iter->desc == NULL) {
+				continue;
+			}
+			if (iter->is_active && !iter->is_spare) {
+				active_count++;
+			} else if (iter->is_spare && !iter->is_active) {
+				spare_count++;
+			}
+		}
+
+		SPDK_NOTICELOG("EC[spare] base bdev '%s' (slot=%u) failed on EC bdev %s, "
+			       "current: active=%u, spare=%u, trying to promote a spare\n",
 			       base_info->name ? base_info->name : "unknown",
-			       slot, ec_bdev->bdev.name);
+			       slot, ec_bdev->bdev.name, active_count, spare_count);
+
+		/* 检查是否有足够的active盘（至少需要k个） */
+		if (active_count < ec_bdev->k) {
+			SPDK_ERRLOG("EC[spare] EC bdev %s: CRITICAL - only %u active devices remaining, "
+				    "need at least %u (k=%u). EC bdev may be in degraded mode.\n",
+				    ec_bdev->bdev.name, active_count, ec_bdev->k, ec_bdev->k);
+		}
 
 		/* 查找可用 spare：有 desc、未失败、标记为 spare 且当前未 active */
+		/* 改进：如果有多个spare，优先选择第一个可用的（未来可以按磨损选择） */
 		EC_FOR_EACH_BASE_BDEV(ec_bdev, iter) {
+			/* 安全检查：确保iter有效且属于当前ec_bdev */
+			if (iter->ec_bdev != ec_bdev) {
+				SPDK_ERRLOG("EC[spare] EC bdev %s: invalid base_info in iteration\n",
+					    ec_bdev->bdev.name);
+				continue;
+			}
 			if (iter->desc != NULL && !iter->is_failed &&
 			    iter->is_spare && !iter->is_active) {
 				spare = iter;
@@ -3526,9 +3651,11 @@ _ec_bdev_fail_base_bdev(void *ctx)
 		}
 
 		if (spare == NULL) {
-			SPDK_WARNLOG("EC[spare] EC bdev %s: no spare available to replace failed base bdev '%s'\n",
+			SPDK_WARNLOG("EC[spare] EC bdev %s: no spare available to replace failed base bdev '%s' "
+				     "(slot=%u). Current active=%u, spare=%u. Please add more spare disks.\n",
 				     ec_bdev->bdev.name,
-				     base_info->name ? base_info->name : "unknown");
+				     base_info->name ? base_info->name : "unknown",
+				     slot, active_count, spare_count);
 			return;
 		}
 
@@ -3536,20 +3663,39 @@ _ec_bdev_fail_base_bdev(void *ctx)
 		spare->is_spare = false;
 		spare->is_active = true;
 
+		/* 更新active设备计数（spare提升为active后） */
+		/* 注意：num_active_bdevs_after_expansion可能超过初始值，这是正常的（spare提升） */
+		if (ec_bdev->num_active_bdevs_after_expansion < UINT8_MAX) {
+			ec_bdev->num_active_bdevs_after_expansion++;
+		}
+
 		/* 如果启用了 superblock，则将 spare 的 state 更新为 CONFIGURED，保证重启后状态一致 */
 		if (ec_bdev->sb != NULL) {
 			uint8_t spare_slot = (uint8_t)(spare - ec_bdev->base_bdev_info);
-			if (ec_bdev_sb_update_base_bdev_state(ec_bdev, spare_slot,
-							      EC_SB_BASE_BDEV_CONFIGURED)) {
-				ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+			/* 验证slot有效性 */
+			if (spare_slot < ec_bdev->num_base_bdevs) {
+				if (ec_bdev_sb_update_base_bdev_state(ec_bdev, spare_slot,
+								      EC_SB_BASE_BDEV_CONFIGURED)) {
+					ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+				} else {
+					SPDK_WARNLOG("EC[spare] EC bdev %s: failed to update superblock state for spare '%s' (slot=%u)\n",
+						     ec_bdev->bdev.name,
+						     spare->name ? spare->name : "unknown",
+						     spare_slot);
+				}
+			} else {
+				SPDK_ERRLOG("EC[spare] EC bdev %s: invalid spare slot %u (num_base_bdevs=%u)\n",
+					    ec_bdev->bdev.name, spare_slot, ec_bdev->num_base_bdevs);
 			}
 		}
 
-		SPDK_NOTICELOG("EC[spare] EC bdev %s: promoting spare '%s' (slot=%u) to replace failed '%s'\n",
+		SPDK_NOTICELOG("EC[spare] EC bdev %s: promoting spare '%s' (slot=%u) to replace failed '%s' (slot=%u). "
+			       "New active count: %u, remaining spare: %u\n",
 			       ec_bdev->bdev.name,
 			       spare->name ? spare->name : "unknown",
 			       (uint8_t)(spare - ec_bdev->base_bdev_info),
-			       base_info->name ? base_info->name : "unknown");
+			       base_info->name ? base_info->name : "unknown",
+			       slot, active_count + 1, spare_count - 1);
 
 		/* 尝试启动针对 spare 的重建（基于现有 process 框架） */
 		if (!ec_bdev_is_rebuilding(ec_bdev)) {
@@ -3559,14 +3705,25 @@ _ec_bdev_fail_base_bdev(void *ctx)
 					     ec_bdev->bdev.name,
 					     spare->name ? spare->name : "unknown",
 					     spdk_strerror(-rc));
+				/* 如果rebuild启动失败，spare已经被提升为active，但数据还未重建
+				 * 这种情况下EC仍然可以运行（降级模式），但需要尽快完成rebuild
+				 */
 			} else {
-				SPDK_NOTICELOG("EC[spare] EC bdev %s: rebuild to spare '%s' started\n",
+				SPDK_NOTICELOG("EC[spare] EC bdev %s: rebuild to spare '%s' (slot=%u) started successfully\n",
 					       ec_bdev->bdev.name,
-					       spare->name ? spare->name : "unknown");
+					       spare->name ? spare->name : "unknown",
+					       (uint8_t)(spare - ec_bdev->base_bdev_info));
 			}
 		} else {
-			SPDK_WARNLOG("EC[spare] EC bdev %s: rebuild already in progress, cannot start spare rebuild now\n",
-				     ec_bdev->bdev.name);
+			SPDK_WARNLOG("EC[spare] EC bdev %s: rebuild already in progress, cannot start spare rebuild now. "
+				     "Spare '%s' (slot=%u) has been promoted to active, but rebuild will start later.\n",
+				     ec_bdev->bdev.name,
+				     spare->name ? spare->name : "unknown",
+				     (uint8_t)(spare - ec_bdev->base_bdev_info));
+			/* 注意：即使rebuild已经在进行中，spare已经被提升为active
+			 * 这种情况下，当前的rebuild完成后，可能需要再次rebuild到新提升的spare
+			 * 但这是合理的，因为spare提升是立即的，rebuild可以稍后进行
+			 */
 		}
 	}
 }

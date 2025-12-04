@@ -399,6 +399,7 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 			struct ec_base_bdev_info *base_info;
 			uint8_t required = ctx->k + ctx->p;
 			uint8_t active = 0;
+			uint8_t spare = 0;
 
 			EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 				if (base_info->desc == NULL || base_info->is_failed) {
@@ -419,6 +420,7 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 				} else {
 					base_info->is_active = false;
 					base_info->is_spare = true;
+					spare++;
 
 					/* Superblock 中标记为 SPARE */
 					if (ec_bdev->sb != NULL) {
@@ -433,11 +435,15 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 			ec_bdev->num_active_bdevs_before_expansion = required;
 			ec_bdev->num_active_bdevs_after_expansion = active;
 
-			SPDK_NOTICELOG("EC[spare] EC bdev %s created in SPARE mode: active=%u, spare=%zu (k=%u, p=%u)\n",
-				       ec_bdev->bdev.name, active,
-				       ctx->req.base_bdevs.num_base_bdevs > active ?
-				       ctx->req.base_bdevs.num_base_bdevs - active : 0,
-				       ctx->k, ctx->p);
+			/* 验证active数量是否符合要求 */
+			if (active < required) {
+				SPDK_WARNLOG("EC[spare] EC bdev %s: WARNING - only %u active devices configured, "
+					     "expected %u (k=%u, p=%u). Some base bdevs may have failed during creation.\n",
+					     ec_bdev->bdev.name, active, required, ctx->k, ctx->p);
+			}
+
+			SPDK_NOTICELOG("EC[spare] EC bdev %s created in SPARE mode: active=%u, spare=%u (k=%u, p=%u)\n",
+				       ec_bdev->bdev.name, active, spare, ctx->k, ctx->p);
 		} else {
 			/* 其他模式暂未实现，先当 NORMAL 处理（所有盘 active） */
 			struct ec_base_bdev_info *base_info;

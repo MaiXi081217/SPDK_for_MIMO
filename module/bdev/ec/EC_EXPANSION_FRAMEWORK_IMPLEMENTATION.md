@@ -730,6 +730,18 @@ rpc_bdev_ec_get_rebalance_status()
      - 当前为占位实现，输出一条 `EC[rebalance] ... skeleton only` 的 `NOTICE`，返回 `-ENOTSUP`
      - 不在任何现有流程中自动调用
 
+5. **JSON输出增强（已完成 ✅）**
+   - `ec_bdev_write_info_json()`（`bdev_ec.c`）：
+     - **Rebuild状态输出**：同时支持legacy rebuild_ctx和process框架的rebuild
+       - 自动检测使用哪种框架（优先process框架）
+       - 输出target、target_slot、current_stripe、total_stripes、percent、state
+     - **Rebalance状态输出**：输出rebalance对象，包含state和progress字段
+       - state: IDLE / RUNNING / PAUSED / COMPLETED / FAILED
+       - progress: 0–100
+       - 待实现：current_stripe、total_stripes、last_error（需要rebalance_ctx结构）
+   - **Spare模式汇总**：输出spare_mode_summary对象
+     - expansion_mode、active/spare/failed设备数量统计
+
 ### 15.2 尚未实现 / 后续计划
 
 1. **Spare 模式后续增强**
@@ -746,7 +758,20 @@ rpc_bdev_ec_get_rebalance_status()
 4. **统一的 EC 状态 RPC（例如 `bdev_ec_get_status`）**
    - 返回 `expansion_mode`、active/spare 列表、rebuild/rebalance 状态、last_failure 等
 
-整体来说：**目前框架已经完成“骨架 + Spare 模式创建时的 active/spare 标记 + 设备选择与 active 的联通”，现有 NORMAL 用法保持不变，新的 SPARE 创建方式在读写/选择路径上已具备基础语义，但尚未接入自动替换与重平衡等高级功能。**
+整体来说：**目前框架已经完成"骨架 + Spare 模式创建时的 active/spare 标记 + 设备选择与 active 的联通 + Spare 模式自动替换逻辑 + JSON输出增强 + 完善的错误处理和验证"，现有 NORMAL 用法保持不变，新的 SPARE 创建方式在读写/选择路径上已具备基础语义，自动替换功能已实现并经过完善，但重平衡框架尚未实现。**
+
+**最新进展（2024-12-04）：**
+- ✅ 完善了rebuild状态的JSON输出，同时支持legacy和process框架
+- ✅ 完善了rebalance状态的JSON输出（基本状态和进度）
+- ✅ Spare模式的自动替换逻辑已实现（设备失败时自动用spare替换并启动rebuild）
+- ✅ **改进和完善（2024-12-04）：**
+  - 添加了active/spare数量统计和验证逻辑
+  - 添加了active设备数量不足的警告（至少需要k个）
+  - 更新了num_active_bdevs_after_expansion计数（spare提升后）
+  - 改进了日志输出：显示详细的active/spare状态和提升后的计数
+  - 添加了slot有效性验证和superblock更新错误处理
+  - 改进了SPARE模式创建时的日志：准确统计spare数量并添加验证警告
+  - 添加了边界检查：desc有效性、slot范围验证、计数溢出保护
 
 ---
 
@@ -795,32 +820,10 @@ rpc_bdev_ec_get_rebalance_status()
 
 ## 附录：关键函数清单
 
-### 重建相关
-- `ec_bdev_start_rebuild()`：启动重建
-- `ec_bdev_stop_rebuild()`：停止重建
-- `ec_bdev_pause_rebuild()`：暂停重建
-- `ec_bdev_resume_rebuild()`：恢复重建
-- `ec_bdev_cancel_rebuild()`：取消重建
-- `ec_bdev_is_rebuilding()`：检查是否在重建
-- `ec_bdev_is_rebuild_target()`：检查是否是重建目标
+**重建相关**：`ec_bdev_start_rebuild()`, `ec_bdev_stop_rebuild()`, `ec_bdev_pause_rebuild()`, `ec_bdev_resume_rebuild()`, `ec_bdev_cancel_rebuild()`, `ec_bdev_is_rebuilding()`, `ec_bdev_is_rebuild_target()`
 
-### 重平衡相关
-- `ec_bdev_start_rebalance()`：启动重平衡
-- `ec_bdev_stop_rebalance()`：停止重平衡
-- `ec_bdev_pause_rebalance()`：暂停重平衡
-- `ec_bdev_resume_rebalance()`：恢复重平衡
-- `ec_bdev_cancel_rebalance()`：取消重平衡
-- `ec_bdev_rebalance_progress()`：获取重平衡进度
+**重平衡相关**：`ec_bdev_start_rebalance()`, `ec_bdev_stop_rebalance()`, `ec_bdev_pause_rebalance()`, `ec_bdev_resume_rebalance()`, `ec_bdev_cancel_rebalance()`, `ec_bdev_rebalance_progress()`
 
-### 设备管理
-- `ec_bdev_add_base_bdev_with_mode()`：加盘（支持模式）
-- `ec_bdev_fail_base_bdev()`：设备失败处理
-- `ec_bdev_find_spare_device()`：查找spare设备
-- `ec_bdev_select_active_devices_by_wear()`：根据磨损选择active设备
-- `ec_bdev_activate_all_devices()`：激活所有设备
+**设备管理**：`ec_bdev_add_base_bdev_with_mode()`, `ec_bdev_fail_base_bdev()`, `ec_bdev_find_spare_device()`, `ec_bdev_select_active_devices_by_wear()`, `ec_bdev_activate_all_devices()`
 
-### 模式处理
-- `ec_bdev_handle_normal_mode()`：普通模式处理
-- `ec_bdev_handle_hybrid_mode()`：混合模式处理
-- `ec_bdev_handle_spare_mode()`：备用盘模式处理
-- `ec_bdev_handle_expand_mode()`：扩容模式处理
+**模式处理**：`ec_bdev_handle_normal_mode()`, `ec_bdev_handle_hybrid_mode()`, `ec_bdev_handle_spare_mode()`, `ec_bdev_handle_expand_mode()`

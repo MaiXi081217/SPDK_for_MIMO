@@ -1887,8 +1887,8 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 	raid_bdev_gen->write_cache = 0;
 	spdk_uuid_copy(&raid_bdev_gen->uuid, uuid);
 	
-	/* Set default blocklen (will be updated during configure) */
-	raid_bdev_gen->blocklen = 512;
+	/* Set default blocklen to 0 (will be updated from first base bdev during configure) */
+	raid_bdev_gen->blocklen = 0;
 	/* Set blockcnt to 0 initially (will be updated during configure) */
 	raid_bdev_gen->blockcnt = 0;
 
@@ -4670,6 +4670,7 @@ raid_bdev_configure_base_bdev(struct raid_base_bdev_info *base_info, bool existi
 	} else {
 		/* Only check for existing superblock if superblock is enabled for this RAID bdev.
 		 * If superblock is disabled, skip the check and proceed directly with configuration.
+		 * This allows reusing Malloc bdevs that may have old superblock data in memory.
 		 */
 		if (raid_bdev->superblock_enabled) {
 			/* check for existing superblock when using a new bdev */
@@ -4715,6 +4716,16 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 			RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
 				if (iter->name == NULL &&
 				    spdk_uuid_compare(&bdev->uuid, &iter->uuid) == 0) {
+					base_info = iter;
+					break;
+				}
+			}
+		}
+		
+		/* If UUID matching failed, fall back to first empty slot */
+		if (base_info == NULL) {
+			RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
+				if (iter->name == NULL && spdk_uuid_is_null(&iter->uuid)) {
 					base_info = iter;
 					break;
 				}
