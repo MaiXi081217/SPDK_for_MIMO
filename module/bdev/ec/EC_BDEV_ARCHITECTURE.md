@@ -357,9 +357,14 @@ ec_bdev_destruct_impl(void *ctx)
 **解决方案**：读取旧数据 → 合并新数据 → 重新编码 → 写入。
 
 **三个阶段**：
-1. **读取阶段**：读取所有k个数据块
-2. **编码阶段**：合并新数据到stripe buffer，重新编码
+1. **读取阶段**：并行读取所有k个数据块
+2. **编码阶段**：合并新数据到stripe buffer，重新编码（支持增量更新优化）
 3. **写入阶段**：写入修改的数据块和所有校验块
+
+**增量更新优化**：
+- **场景**：写入量大于25%strip时，使用增量更新而非全量重新编码
+- **方法**：保存旧数据快照，计算delta = old_data XOR new_data，使用`ec_encode_stripe_update()`增量更新校验块
+- **性能**：计算量从O(k×p×len)降低到O(p×len)，对于k=2, p=2约提升50%
 
 ### 优化：I/O路径性能优化
 
@@ -478,6 +483,47 @@ struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[base_bdev_idx];
 - **O(1)查找**：查找复杂度从O(k+p)降低到O(1)
 - **提升性能**：减少I/O完成路径的计算开销
 - **内存开销**：每个I/O增加256字节（EC_MAX_K + EC_MAX_P = 510，但实际使用k+p个）
+
+#### 操作流程示例
+
+**创建EC设备**：
+```bash
+./scripts/rpc.py bdev_ec_create \
+  -n ec_bdev_name \
+  -k 2 -p 2 \
+  -z 64 \
+  -b "NVMe0n1 NVMe0n2 NVMe0n3 NVMe0n4" \
+  -s -w 2
+```
+
+**完整条带写入流程**：
+```
+应用程序写入请求 → ec_submit_rw_request()
+  ├─ 计算stripe信息（stripe_index, strip_idx_in_stripe）
+  ├─ 选择base bdev（磨损均衡或默认轮询）
+  ├─ 判断写入路径
+  │   ├─ 完整stripe → ec_submit_write_stripe()
+  │   │   ├─ 准备数据指针（处理跨iov）
+  │   │   ├─ 分配校验缓冲区（从池中获取）
+  │   │   ├─ ISA-L编码生成校验块
+  │   │   └─ 并行写入k+p个设备
+  │   └─ 部分stripe → ec_submit_write_partial_stripe() (RMW)
+  │       ├─ 读取k个数据块
+  │       ├─ 合并新数据到stripe buffer
+  │       ├─ 增量更新或全量编码校验块
+  │       └─ 写入修改的数据块和所有校验块
+  └─ 存储快照（磨损均衡FULL模式）
+```
+
+**读取流程**：
+```
+应用程序读取请求 → ec_submit_rw_request()
+  ├─ 计算stripe信息
+  ├─ 加载快照（磨损均衡FULL模式，确保读取一致性）
+  ├─ 确定目标数据块索引
+  ├─ 计算物理LBA
+  └─ 直接读取（无需解码，数据块完整可用）
+```
 
 ---
 
@@ -912,12 +958,13 @@ ec_bdev_register_extension(struct ec_bdev *ec_bdev, struct ec_bdev_extension_if 
 #### 应用场景
 
 1. **磨损均衡（Wear Leveling）**（已实现）：
-   - 通过`select_base_bdevs`选择磨损较低的设备
-   - 使用确定性加权选择算法，保证同一stripe选择一致
-   - 通过`notify_io_complete`跟踪写入次数
-   - 通过`get_wear_level`获取设备磨损等级
+   - **核心思想**：读取所有设备的磨损级别（NVMe percentage_used），计算权重`weight = (100 - wear_level) × 10 + 1`，使用确定性加权选择算法
+   - **设备选择**：通过`select_base_bdevs`选择磨损较低的设备，使用stripe_index作为随机种子保证确定性
+   - **容错保证**：内置容错检查，确保同组条带不共享设备，使用条带分配缓存加速查询
+   - **状态跟踪**：通过`notify_io_complete`跟踪写入次数，通过`get_wear_level`获取设备磨损等级
    - **快照机制**：存储写入时的base bdev选择，确保读取一致性
    - **批量刷新**：每1000次I/O或60秒批量刷新磨损信息，减少查询频率
+   - **磨损配置文件**：支持多个磨损配置文件，每个条带组可绑定不同配置，持久化到superblock
    - **自动降级**：检测到连续失败时自动降级模式
 
 2. **性能优化**：

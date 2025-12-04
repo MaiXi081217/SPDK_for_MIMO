@@ -501,11 +501,24 @@ ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 {
 	struct ec_base_bdev_info *base_info;
 	uint8_t n = ec_bdev->num_base_bdevs;  /* Total number of disks: k + p */
+	bool any_active = false;
 	uint8_t parity_start;  /* Starting position for parity blocks in this stripe */
 	uint8_t i;
 	uint8_t data_idx = 0;
 	uint8_t parity_idx = 0;
 	uint8_t operational_count = 0;
+
+	/* 兼容性说明：
+	 * - 旧版本中没有 is_active 字段，所有盘都默认参与数据存储。
+	 * - 为了保持行为不变，如果没有任何盘被显式标记为 active，则认为“所有非失败盘都是 active”。
+	 * - 只有在扩展框架（如 SPARE/HYBRID 模式）显式设置 is_active 时，下面的过滤才生效。
+	 */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->desc != NULL && !base_info->is_failed && base_info->is_active) {
+			any_active = true;
+			break;
+		}
+	}
 
 	/* Calculate parity start position using round-robin (similar to RAID5)
 	 * For stripe_index i, parity blocks start at position (n - (i % n)) % n
@@ -534,6 +547,13 @@ ec_select_base_bdevs_default(struct ec_bdev *ec_bdev, uint64_t stripe_index,
 	i = 0;
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		if (base_info->desc == NULL || base_info->is_failed) {
+			i++;
+			continue;
+		}
+
+		/* 如果已经有盘被显式标记为 active，则只从 active 盘中选择；
+		 * 否则（any_active == false）保持旧行为：所有非失败盘都参与选择。 */
+		if (any_active && !base_info->is_active) {
 			i++;
 			continue;
 		}

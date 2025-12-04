@@ -150,6 +150,9 @@ struct rpc_bdev_ec_create {
 
 	/* Enable debug logging for device selection */
 	bool                                 debug_enabled;
+
+	/* EC 扩展模式（NORMAL / SPARE / HYBRID / EXPAND），缺省为 NORMAL */
+	enum ec_expansion_mode               expansion_mode;
 };
 
 /*
@@ -229,6 +232,8 @@ static const struct spdk_json_object_decoder rpc_bdev_ec_create_decoders[] = {
 	{"superblock", offsetof(struct rpc_bdev_ec_create, superblock_enabled), spdk_json_decode_bool, true},
 	{"wear_leveling_enabled", offsetof(struct rpc_bdev_ec_create, wear_leveling_enabled), spdk_json_decode_bool, true},
 	{"debug_enabled", offsetof(struct rpc_bdev_ec_create, debug_enabled), spdk_json_decode_bool, true},
+	/* 扩展模式：使用 int32 解码到 enum，保持与 RAID RPC 风格一致；可选参数，默认 NORMAL */
+	{"expansion_mode", offsetof(struct rpc_bdev_ec_create, expansion_mode), spdk_json_decode_int32, true},
 };
 
 struct rpc_bdev_ec_create_ctx {
@@ -350,6 +355,7 @@ static void
 rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 {
 	struct rpc_bdev_ec_create_ctx *ctx = _ctx;
+	struct ec_bdev *ec_bdev;
 
 	if (status != 0) {
 		ctx->status = status;
@@ -363,6 +369,97 @@ rpc_bdev_ec_create_add_base_bdev_cb(void *_ctx, int status)
 	if (ctx->status != 0) {
 		rpc_bdev_ec_create_cleanup_and_send_error(ctx);
 	} else {
+		ec_bdev = ctx->ec_bdev;
+
+		/* 根据扩展模式设置 active / spare 标记（仅在创建完成时生效） */
+		if (ctx->req.expansion_mode == EC_EXPANSION_MODE_NORMAL) {
+			/* NORMAL：所有非失败 base bdev 作为 active，行为与旧版本一致 */
+			struct ec_base_bdev_info *base_info;
+			uint8_t active = 0;
+
+			EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+				if (base_info->desc != NULL && !base_info->is_failed) {
+					base_info->is_active = true;
+					base_info->is_spare = false;
+					active++;
+
+					/* 如果启用了 superblock，同步写入 CONFIGURED 状态 */
+					if (ec_bdev->sb != NULL) {
+						uint8_t slot = (uint8_t)(base_info - ec_bdev->base_bdev_info);
+						ec_bdev_sb_update_base_bdev_state(ec_bdev, slot,
+										  EC_SB_BASE_BDEV_CONFIGURED);
+					}
+				}
+			}
+			ec_bdev->expansion_mode = EC_EXPANSION_MODE_NORMAL;
+			ec_bdev->num_active_bdevs_before_expansion = active;
+			ec_bdev->num_active_bdevs_after_expansion = active;
+		} else if (ctx->req.expansion_mode == EC_EXPANSION_MODE_SPARE) {
+			/* SPARE：前 k+p 个健康盘作为 active，其余盘标记为 spare */
+			struct ec_base_bdev_info *base_info;
+			uint8_t required = ctx->k + ctx->p;
+			uint8_t active = 0;
+
+			EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+				if (base_info->desc == NULL || base_info->is_failed) {
+					continue;
+				}
+
+				if (active < required) {
+					base_info->is_active = true;
+					base_info->is_spare = false;
+					active++;
+
+					/* Superblock 中标记为 CONFIGURED */
+					if (ec_bdev->sb != NULL) {
+						uint8_t slot = (uint8_t)(base_info - ec_bdev->base_bdev_info);
+						ec_bdev_sb_update_base_bdev_state(ec_bdev, slot,
+										  EC_SB_BASE_BDEV_CONFIGURED);
+					}
+				} else {
+					base_info->is_active = false;
+					base_info->is_spare = true;
+
+					/* Superblock 中标记为 SPARE */
+					if (ec_bdev->sb != NULL) {
+						uint8_t slot = (uint8_t)(base_info - ec_bdev->base_bdev_info);
+						ec_bdev_sb_update_base_bdev_state(ec_bdev, slot,
+										  EC_SB_BASE_BDEV_SPARE);
+					}
+				}
+			}
+
+			ec_bdev->expansion_mode = EC_EXPANSION_MODE_SPARE;
+			ec_bdev->num_active_bdevs_before_expansion = required;
+			ec_bdev->num_active_bdevs_after_expansion = active;
+
+			SPDK_NOTICELOG("EC[spare] EC bdev %s created in SPARE mode: active=%u, spare=%zu (k=%u, p=%u)\n",
+				       ec_bdev->bdev.name, active,
+				       ctx->req.base_bdevs.num_base_bdevs > active ?
+				       ctx->req.base_bdevs.num_base_bdevs - active : 0,
+				       ctx->k, ctx->p);
+		} else {
+			/* 其他模式暂未实现，先当 NORMAL 处理（所有盘 active） */
+			struct ec_base_bdev_info *base_info;
+			uint8_t active = 0;
+
+			EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+				if (base_info->desc != NULL && !base_info->is_failed) {
+					base_info->is_active = true;
+					base_info->is_spare = false;
+					active++;
+				}
+			}
+			ec_bdev->expansion_mode = EC_EXPANSION_MODE_NORMAL;
+			ec_bdev->num_active_bdevs_before_expansion = active;
+			ec_bdev->num_active_bdevs_after_expansion = active;
+		}
+
+		/* 如果 superblock 启用，统一写入一次，落盘当前 active/spare 状态 */
+		if (ec_bdev->superblock_enabled && ec_bdev->sb != NULL) {
+			ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+		}
+
 		/* All base bdevs added successfully, configure wear leveling if requested */
 		if (ctx->req.wear_leveling_enabled || ctx->req.debug_enabled) {
 			struct ec_device_selection_config *config = &ctx->ec_bdev->selection_config;
@@ -441,8 +538,11 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-
-
+	/* 规范 expansion_mode：未传或非法时统一视为 NORMAL，保证向后兼容 */
+	if (req->expansion_mode < EC_EXPANSION_MODE_NORMAL ||
+	    req->expansion_mode > EC_EXPANSION_MODE_EXPAND) {
+		req->expansion_mode = EC_EXPANSION_MODE_NORMAL;
+	}
 	/* Validate k and p */
 	if (req->k == 0 || req->p == 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
@@ -454,12 +554,25 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 	 * EC_MAX_K and EC_MAX_P are 255, so no explicit range check is needed here.
 	 * The decoder will reject values outside uint8_t range automatically. */
 
-	/* Validate that number of base bdevs matches k + p */
-	if (req->base_bdevs.num_base_bdevs != req->k + req->p) {
-		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
-					     "Number of base bdevs (%zu) must equal k + p (%u + %u = %u)",
+	/* Validate number of base bdevs
+	 * - NORMAL：必须等于 k + p（保持旧行为完全不变）
+	 * - SPARE：必须 >= k + p（额外盘作为 spare，后续在选择逻辑中通过 is_active 过滤）
+	 * - 其他模式（HYBRID/EXPAND）：暂时按 NORMAL 处理，要求等于 k + p（后续接能力时再放开）
+	 */
+	if (req->expansion_mode == EC_EXPANSION_MODE_SPARE) {
+		if (req->base_bdevs.num_base_bdevs < req->k + req->p) {
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+					     "Spare mode requires at least k + p base bdevs (%u + %u = %u), got %zu",
+					     req->k, req->p, req->k + req->p, req->base_bdevs.num_base_bdevs);
+			goto cleanup;
+		}
+	} else {
+		if (req->base_bdevs.num_base_bdevs != req->k + req->p) {
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+					     "Number of base bdevs (%zu) must equal k + p (%u + %u = %u) in this mode",
 					     req->base_bdevs.num_base_bdevs, req->k, req->p, req->k + req->p);
-		goto cleanup;
+			goto cleanup;
+		}
 	}
 
 	/* Validate base bdev names */

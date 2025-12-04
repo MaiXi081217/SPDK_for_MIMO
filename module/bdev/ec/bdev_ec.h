@@ -129,6 +129,35 @@ enum ec_bdev_state {
 typedef void (*ec_base_bdev_cb)(void *ctx, int status);
 
 /*
+ * EC expansion / rebalance modes
+ * 说明：这些枚举和字段仅用于扩展框架的搭建，当前不会改变已有功能行为。
+ */
+
+/* EC加盘模式（扩展框架骨架） */
+enum ec_expansion_mode {
+	/* 普通模式：保持原有行为，num_base_bdevs 必须等于 k + p */
+	EC_EXPANSION_MODE_NORMAL = 0,
+
+	/* 混合模式：激活所有盘并依赖重平衡（后续实现），当前骨架中不启用 */
+	EC_EXPANSION_MODE_HYBRID = 1,
+
+	/* 备用盘模式：多余盘作为 spare（后续实现自动替换），当前骨架中不启用 */
+	EC_EXPANSION_MODE_SPARE = 2,
+
+	/* 扩容模式：增加 k 或 p（未来功能），当前骨架中不启用 */
+	EC_EXPANSION_MODE_EXPAND = 3,
+};
+
+/* 重平衡状态（扩展框架骨架） */
+enum ec_rebalance_state {
+	EC_REBALANCE_IDLE = 0,
+	EC_REBALANCE_RUNNING = 1,
+	EC_REBALANCE_PAUSED = 2,
+	EC_REBALANCE_COMPLETED = 3,
+	EC_REBALANCE_FAILED = 4,
+};
+
+/*
  * ec_base_bdev_info contains information for the base bdevs which are part of some
  * EC bdev. This structure contains the per base bdev information.
  */
@@ -187,6 +216,17 @@ struct ec_base_bdev_info {
 
 	/* context of the callback */
 	void			*configure_cb_ctx;
+
+	/* 以下字段为扩展框架预留，当前不会改变已有行为 */
+
+	/* 是否为 spare 盘（备用盘模式骨架使用） */
+	bool			is_spare;
+
+	/* 是否参与数据存储（Hybrid / Spare 模式骨架使用） */
+	bool			is_active;
+
+	/* 在扩展前是否为 active（Hybrid 重平衡骨架使用） */
+	bool			was_active_before_expansion;
 };
 
 struct ec_bdev_io;
@@ -329,6 +369,27 @@ struct ec_bdev {
 	
 	/* Device selection strategy configuration */
 	struct ec_device_selection_config selection_config;
+
+	/* 以下字段为扩展框架预留，当前不会改变已有行为 */
+
+	/* 加盘模式（扩展框架骨架） */
+	enum ec_expansion_mode		expansion_mode;
+
+	/* 重平衡状态（扩展框架骨架） */
+	enum ec_rebalance_state		rebalance_state;
+
+	/* 重平衡上下文指针（后续实现时使用，目前为 NULL） */
+	struct ec_rebalance_context	*rebalance_ctx;
+
+	/* 扩展前后 active 设备数量（Hybrid 模式重平衡骨架使用） */
+	uint8_t				num_active_bdevs_before_expansion;
+	uint8_t				num_active_bdevs_after_expansion;
+
+	/* 标记是否需要在合适时机触发重平衡（骨架标志位） */
+	bool				rebalance_required;
+
+	/* 重平衡进度（0–100，骨架阶段保持为 0） */
+	uint8_t				rebalance_progress;
 };
 
 #define EC_FOR_EACH_BASE_BDEV(e, i) \
@@ -435,6 +496,17 @@ int ec_bdev_create(const char *name, uint32_t strip_size, uint8_t k, uint8_t p,
 void ec_bdev_delete(struct ec_bdev *ec_bdev, bool wipe_sb, ec_bdev_destruct_cb cb_fn, void *cb_ctx);
 int ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 			  ec_base_bdev_cb cb_fn, void *cb_ctx);
+
+/*
+ * 扩展加盘入口骨架：当前仅简单调用 ec_bdev_add_base_bdev，不改变原有行为。
+ * 后续在不影响 NORMAL 模式的前提下，再根据 expansion_mode 扩展逻辑。
+ */
+int ec_bdev_add_base_bdev_with_mode(struct ec_bdev *ec_bdev,
+				    const char *name,
+				    enum ec_expansion_mode mode,
+				    ec_base_bdev_cb cb_fn,
+				    void *cb_ctx);
+
 struct ec_bdev *ec_bdev_find_by_name(const char *name);
 enum ec_bdev_state ec_bdev_str_to_state(const char *str);
 const char *ec_bdev_state_to_str(enum ec_bdev_state state);
@@ -453,6 +525,14 @@ void ec_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ct
 int ec_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, ec_base_bdev_cb cb_fn, void *cb_ctx);
 void ec_bdev_fail_base_bdev(struct ec_base_bdev_info *base_info);
 int ec_bdev_gen_decode_matrix(struct ec_bdev *ec_bdev, uint8_t *frag_err_list, int nerrs);
+
+/*
+ * 重平衡入口骨架：当前仅返回 -ENOTSUP，不在任何路径中自动调用，保证现有功能不受影响。
+ * 后续在 Hybrid 模式下再接入 EC process 框架。
+ */
+int ec_bdev_start_rebalance(struct ec_bdev *ec_bdev,
+			    void (*done_cb)(void *ctx, int status),
+			    void *done_ctx);
 
 /*
  * Definitions related to EC bdev superblock

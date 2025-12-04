@@ -4668,12 +4668,20 @@ raid_bdev_configure_base_bdev(struct raid_base_bdev_info *base_info, bool existi
 	if (existing) {
 		raid_bdev_configure_base_bdev_cont(base_info);
 	} else {
-		/* check for existing superblock when using a new bdev */
-		rc = raid_bdev_load_base_bdev_superblock(desc, base_info->app_thread_ch,
-				raid_bdev_configure_base_bdev_check_sb_cb, base_info);
-		if (rc) {
-			SPDK_ERRLOG("Failed to read bdev %s superblock: %s\n",
-				    bdev->name, spdk_strerror(-rc));
+		/* Only check for existing superblock if superblock is enabled for this RAID bdev.
+		 * If superblock is disabled, skip the check and proceed directly with configuration.
+		 */
+		if (raid_bdev->superblock_enabled) {
+			/* check for existing superblock when using a new bdev */
+			rc = raid_bdev_load_base_bdev_superblock(desc, base_info->app_thread_ch,
+					raid_bdev_configure_base_bdev_check_sb_cb, base_info);
+			if (rc) {
+				SPDK_ERRLOG("Failed to read bdev %s superblock: %s\n",
+					    bdev->name, spdk_strerror(-rc));
+			}
+		} else {
+			/* Superblock is disabled - proceed directly with configuration */
+			raid_bdev_configure_base_bdev_cont(base_info);
 		}
 	}
 out:

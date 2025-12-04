@@ -207,10 +207,11 @@ struct ec_decode_private {
 	enum ec_decode_state state;
 };
 
-/* Process type enumeration */
+/* Process type enumeration（扩展框架骨架，保持与 RAID Process 一致的风格） */
 enum ec_process_type {
 	EC_PROCESS_NONE,
 	EC_PROCESS_REBUILD,
+	EC_PROCESS_REBALANCE,	/* 新增：重平衡类型（当前骨架阶段尚未接入逻辑） */
 	EC_PROCESS_MAX
 };
 

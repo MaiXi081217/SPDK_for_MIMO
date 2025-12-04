@@ -358,3 +358,167 @@ raid_bdev_start_rebuild_with_cb(target_base_info,
 
 这些改进使 RAID 模块在故障处理方面达到了与 EC 模块相同的可靠性水平。
 
+---
+
+## 八、RAID创建时的CONFIGURING状态处理改进
+
+### 问题：examine自动创建的RAID设备不可见
+
+**场景**：
+1. 系统启动时，`examine`从superblock自动创建RAID设备
+2. 设备状态为`CONFIGURING`，但可能没有base bdevs配置完成
+3. 设备未注册到bdev层，因此不可见（`bdev_raid_get_bdevs`查询不到）
+4. 用户尝试手动创建同名设备时，会报错"设备已存在"
+
+**挑战**：
+1. 如何判断现有设备是否是同一个设备？
+2. 如何处理UUID不匹配的情况？
+3. 如何避免误删用户数据？
+
+### 解决方案：智能UUID匹配 + 用户提示
+
+**核心原则**：**不自动删除用户设备，只提示冲突，让用户决定**
+
+#### 情况1：UUID匹配（同一个设备）
+
+```c
+// bdev_raid.c:1777-1783
+if (uuid != NULL && !spdk_uuid_is_null(uuid) &&
+    spdk_uuid_compare(&raid_bdev->bdev.uuid, uuid) == 0) {
+    // UUID匹配 → 这是同一个设备，继续配置
+    SPDK_NOTICELOG("RAID bdev %s exists in CONFIGURING state with matching UUID. "
+                  "Continuing configuration.\n", name);
+    *raid_bdev_out = raid_bdev;
+    return 0;
+}
+```
+
+**行为**：返回现有设备，允许继续配置。
+
+#### 情况2：UUID不匹配（不同设备，名称冲突）
+
+```c
+// bdev_raid.c:1786-1797
+if (uuid != NULL && !spdk_uuid_is_null(uuid)) {
+    // UUID不匹配 → 名称冲突
+    char existing_uuid_str[SPDK_UUID_STRING_LEN];
+    char provided_uuid_str[SPDK_UUID_STRING_LEN];
+    spdk_uuid_fmt_lower(existing_uuid_str, sizeof(existing_uuid_str),
+                       &raid_bdev->bdev.uuid);
+    spdk_uuid_fmt_lower(provided_uuid_str, sizeof(provided_uuid_str), uuid);
+    SPDK_ERRLOG("RAID bdev name '%s' already exists in CONFIGURING state "
+                "with different UUID. Existing UUID: %s, Provided UUID: %s. "
+                "Please delete the existing device first or use a different name.\n",
+                name, existing_uuid_str, provided_uuid_str);
+    return -EEXIST;
+}
+```
+
+**行为**：返回错误，明确提示UUID冲突，让用户决定如何处理。
+
+#### 情况3：UUID为NULL，但现有设备有superblock UUID
+
+```c
+// bdev_raid.c:1800-1810
+if (!spdk_uuid_is_null(&raid_bdev->bdev.uuid) && raid_bdev->sb != NULL) {
+    // 现有设备有superblock UUID → 这是从superblock创建的
+    char existing_uuid_str[SPDK_UUID_STRING_LEN];
+    spdk_uuid_fmt_lower(existing_uuid_str, sizeof(existing_uuid_str),
+                       &raid_bdev->bdev.uuid);
+    SPDK_ERRLOG("RAID bdev name '%s' already exists in CONFIGURING state "
+                "(UUID: %s, likely created by examine). "
+                "Please provide UUID to continue configuration, "
+                "or delete the existing device first.\n",
+                name, existing_uuid_str);
+    return -EEXIST;
+}
+```
+
+**行为**：返回错误，提示用户提供UUID或删除现有设备。
+
+#### 情况4：UUID为NULL，现有设备也没有UUID
+
+```c
+// bdev_raid.c:1812-1816
+SPDK_ERRLOG("RAID bdev name '%s' already exists in CONFIGURING state "
+            "but UUID information is missing. "
+            "Please provide UUID or delete the existing device first.\n",
+            name);
+return -EEXIST;
+```
+
+**行为**：返回错误，提示用户提供UUID或删除现有设备。
+
+### 关键改进点
+
+1. **不自动删除**：任何情况下都不会自动删除用户设备
+2. **明确提示**：错误信息包含冲突原因和操作建议
+3. **用户决定**：由用户决定是删除现有设备、提供UUID，还是使用不同名称
+4. **UUID匹配**：使用UUID作为设备身份的唯一标识
+
+### 用户使用场景
+
+**场景1：examine自动创建，用户继续配置**
+```bash
+# 系统启动，examine自动创建了raid1（CONFIGURING状态）
+# 用户手动创建同名设备，UUID匹配
+$ rpc.py bdev_raid_create -n raid1 -s -l raid1 -b nvme0n1
+# 系统：继续使用现有设备，返回成功
+```
+
+**场景2：名称冲突，UUID不匹配**
+```bash
+# examine创建了raid1，UUID=123
+# 用户尝试创建同名设备，UUID=456
+$ rpc.py bdev_raid_create -n raid1 -s -l raid1 -b nvme0n1
+# 错误：RAID bdev name 'raid1' already exists in CONFIGURING state 
+#       with different UUID. Existing UUID: 123, Provided UUID: 456.
+#       Please delete the existing device first or use a different name.
+# 用户：删除现有设备或使用不同名称
+```
+
+**场景3：UUID为NULL**
+```bash
+# examine创建了raid1，UUID=123（从superblock）
+# 用户尝试创建同名设备，但某些RPC路径UUID为NULL
+$ rpc.py bdev_raid_create -n raid1 -s -l raid1 -b nvme0n1
+# 错误：RAID bdev name 'raid1' already exists in CONFIGURING state 
+#       (UUID: 123, likely created by examine).
+#       Please provide UUID to continue configuration, 
+#       or delete the existing device first.
+# 用户：提供UUID或删除现有设备
+```
+
+### 代码位置
+
+- **主要逻辑**：`bdev_raid.c:1767-1816` - `_raid_bdev_create()`函数
+- **UUID比较**：使用`spdk_uuid_compare()`比较UUID
+- **错误处理**：所有情况都返回明确的错误信息
+
+---
+
+## 九、总结（更新）
+
+已成功将 EC 模块的故障处理模式应用到 RAID 模块，实现了：
+
+1. ✅ **REBUILDING 状态持久化**：支持中断后恢复
+2. ✅ **重建进度持久化**：支持断点续传
+3. ✅ **详细进度报告**：JSON 输出，包含完整信息
+4. ✅ **细粒度状态跟踪**：4 个状态（IDLE/READING/WRITING/CALCULATING）
+5. ✅ **进度查询 API**：程序化查询接口
+6. ✅ **重建完成回调**：支持异步通知
+7. ✅ **智能CONFIGURING状态处理**：不自动删除，明确提示冲突，让用户决定
+
+**EC 的详细进度报告机制**：
+- **不是实时推送**，而是**按需查询**
+- 每次调用 RPC 时返回当前进度（从内存读取）
+- 进度查询 API 和 JSON 输出共享同一个数据源（`rebuild_ctx`/`process`）
+- 重建过程中实时更新内存状态，查询时读取最新值
+
+**CONFIGURING状态处理原则**：
+- **不自动删除**：任何情况下都不会自动删除用户设备
+- **明确提示**：错误信息包含冲突原因和操作建议
+- **用户决定**：由用户决定如何处理冲突
+
+这些改进使 RAID 模块在故障处理方面达到了与 EC 模块相同的可靠性水平，同时保护了用户数据不被误删。
+

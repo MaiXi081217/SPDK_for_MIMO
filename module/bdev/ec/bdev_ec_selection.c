@@ -1036,6 +1036,8 @@ ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 	const uint32_t *weight_table;
 	uint8_t i;
 	int rc;
+	bool any_active = false;
+	struct ec_base_bdev_info *base_info;
 
 	if (config->debug_enabled) {
 		SPDK_NOTICELOG("[SELECT] Stripe %lu: Starting device selection (group_size=%u, n=%u, k=%u, p=%u)\n",
@@ -1067,18 +1069,30 @@ ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 			       stripe_index, group_id, offset_in_group, group_start);
 	}
 
-	/* Step 1: Generate candidate device list (exclude failed devices) */
+	/* 兼容性说明：
+	 * - 旧版本中没有 is_active 字段，所有盘都默认参与数据存储。
+	 * - 为了保持行为不变，如果没有任何盘被显式标记为 active，则认为“所有非失败盘都是 active”。
+	 * - 只有在扩展框架（如 SPARE/HYBRID 模式）显式设置 is_active 时，下面的过滤才生效。
+	 */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->desc != NULL && !base_info->is_failed && base_info->is_active) {
+			any_active = true;
+			break;
+		}
+	}
+
+	/* Step 1: Generate candidate device list (exclude failed devices, 并在有 active 标记时只选 active) */
 	uint8_t candidates[EC_MAX_BASE_BDEVS];
 	uint32_t candidate_weights[EC_MAX_BASE_BDEVS];
 	uint8_t num_candidates = 0;
-	struct ec_base_bdev_info *base_info;
 	uint8_t device_idx = 0;
 
 	profile_slot = ec_selection_get_profile_slot_for_stripe(ec_bdev, stripe_index);
 	weight_table = profile_slot ? profile_slot->wear_weights : config->wear_weights;
 
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
-		if (base_info->desc != NULL && !base_info->is_failed) {
+		if (base_info->desc != NULL && !base_info->is_failed &&
+		    (!any_active || base_info->is_active)) {
 			/* CRITICAL: device_idx must be calculated as offset from base_bdev_info array */
 			/* EC_FOR_EACH_BASE_BDEV returns pointer, so calculate index */
 			if (spdk_unlikely(device_idx >= n)) {
@@ -1397,7 +1411,6 @@ ec_bdev_init_selection_config(struct ec_bdev *ec_bdev)
 	bool prev_debug = config->debug_enabled;
 	bool metadata_loaded = false;
 	int rc = 0;
-	uint8_t i;
 
 	SPDK_NOTICELOG("EC bdev %s: Initializing device selection configuration\n",
 		       ec_bdev->bdev.name);

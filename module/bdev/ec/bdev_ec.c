@@ -49,6 +49,59 @@ void ec_bdev_module_stop_done(struct ec_bdev *ec_bdev);
 void ec_bdev_free(struct ec_bdev *ec_bdev);
 void ec_bdev_free_base_bdev_resource(struct ec_base_bdev_info *base_info);
 
+/*
+ * 扩展框架骨架实现说明：
+ *
+ * - ec_bdev_add_base_bdev_with_mode()
+ *   当前仅简单调用现有的 ec_bdev_add_base_bdev，不改变原有行为。
+ *   只是增加一条 debug 日志，方便后续在不影响 NORMAL 模式的前提下逐步接入 SPARE / HYBRID 等模式。
+ *
+ * - ec_bdev_start_rebalance()
+ *   当前作为占位符实现，直接返回 -ENOTSUP，并在调用时输出一条 NOTICE 日志。
+ *   该函数不会被任何现有路径自动调用，只有未来显式接入 Hybrid 模式时才会使用。
+ */
+
+int
+ec_bdev_add_base_bdev_with_mode(struct ec_bdev *ec_bdev,
+				const char *name,
+				enum ec_expansion_mode mode,
+				ec_base_bdev_cb cb_fn,
+				void *cb_ctx)
+{
+	if (ec_bdev == NULL || name == NULL) {
+		return -EINVAL;
+	}
+
+	/* 骨架阶段：仅记录一次调试日志，行为等价于原 ec_bdev_add_base_bdev */
+	SPDK_DEBUGLOG(bdev_ec, "EC[expansion] add base bdev '%s' to %s (mode=%d, skeleton no-op)\n",
+		      name, ec_bdev->bdev.name, (int)mode);
+
+	return ec_bdev_add_base_bdev(ec_bdev, name, cb_fn, cb_ctx);
+}
+
+int
+ec_bdev_start_rebalance(struct ec_bdev *ec_bdev,
+			void (*done_cb)(void *ctx, int status),
+			void *done_ctx)
+{
+	if (ec_bdev == NULL) {
+		if (done_cb) {
+			done_cb(done_ctx, -EINVAL);
+		}
+		return -EINVAL;
+	}
+
+	/* 骨架阶段：仅输出提示，返回不支持。不会被现有流程自动调用。 */
+	SPDK_NOTICELOG("EC[rebalance] start requested on EC bdev %s, but rebalance framework is not wired yet (skeleton only)\n",
+		       ec_bdev->bdev.name);
+
+	if (done_cb) {
+		done_cb(done_ctx, -ENOTSUP);
+	}
+
+	return -ENOTSUP;
+}
+
 /* Type definition for examine load superblock callback */
 typedef void (*ec_bdev_examine_load_sb_cb)(struct spdk_bdev *bdev,
 		const struct ec_bdev_superblock *sb, int status, void *ctx);
@@ -516,6 +569,8 @@ void
 ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 {
 	struct ec_base_bdev_info *base_info;
+	bool any_active = false;
+	uint32_t role_active = 0, role_spare = 0, role_failed = 0;
 
 	assert(ec_bdev != NULL);
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
@@ -530,6 +585,11 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "num_base_bdevs_discovered", ec_bdev->num_base_bdevs_discovered);
 	spdk_json_write_named_uint32(w, "num_base_bdevs_operational",
 				     ec_bdev->num_base_bdevs_operational);
+
+	/* 输出扩展模式和重平衡状态（如果有的话） */
+	spdk_json_write_named_int32(w, "expansion_mode", ec_bdev->expansion_mode);
+	spdk_json_write_named_int32(w, "rebalance_state", ec_bdev->rebalance_state);
+	spdk_json_write_named_uint8(w, "rebalance_progress", ec_bdev->rebalance_progress);
 
 	/* Output rebuild progress if rebuild is in progress */
 	if (ec_bdev->rebuild_ctx != NULL && !ec_bdev->rebuild_ctx->paused) {
@@ -553,9 +613,32 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 		spdk_json_write_object_end(w);
 	}
 
+	/* 先检查是否存在任何 active 标记，用于兼容旧配置 */
+	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		if (base_info->desc != NULL && !base_info->is_failed && base_info->is_active) {
+			any_active = true;
+			break;
+		}
+	}
+
 	spdk_json_write_name(w, "base_bdevs_list");
 	spdk_json_write_array_begin(w);
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
+		const char *role = "unknown";
+
+		if (any_active) {
+			if (base_info->is_failed) {
+				role = "failed";
+				role_failed++;
+			} else if (base_info->is_spare) {
+				role = "spare";
+				role_spare++;
+			} else if (base_info->is_active) {
+				role = "active";
+				role_active++;
+			}
+		}
+
 		spdk_json_write_object_begin(w);
 		spdk_json_write_name(w, "name");
 		if (base_info->name) {
@@ -566,11 +649,22 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 		spdk_json_write_named_uuid(w, "uuid", &base_info->uuid);
 		spdk_json_write_named_bool(w, "is_configured", base_info->is_configured);
 		spdk_json_write_named_bool(w, "is_failed", base_info->is_failed);
+		spdk_json_write_named_string(w, "role", role);
 		spdk_json_write_named_uint64(w, "data_offset", base_info->data_offset);
 		spdk_json_write_named_uint64(w, "data_size", base_info->data_size);
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
+
+	/* 为 SPARE / 扩展模式增加简单汇总，便于脚本快速查看备用盘情况 */
+	if (any_active) {
+		spdk_json_write_named_object_begin(w, "spare_mode_summary");
+		spdk_json_write_named_int32(w, "expansion_mode", ec_bdev->expansion_mode);
+		spdk_json_write_named_uint32(w, "active", role_active);
+		spdk_json_write_named_uint32(w, "spare", role_spare);
+		spdk_json_write_named_uint32(w, "failed", role_failed);
+		spdk_json_write_object_end(w);
+	}
 }
 
 /*
@@ -3326,6 +3420,7 @@ _ec_bdev_fail_base_bdev(void *ctx)
 {
 	struct ec_base_bdev_info *base_info = ctx;
 	struct ec_bdev *ec_bdev;
+	struct ec_base_bdev_info *spare = NULL;
 	uint8_t slot;
 	char pcie_bdf[32] = "N/A";
 
@@ -3345,7 +3440,10 @@ _ec_bdev_fail_base_bdev(void *ctx)
 		return;
 	}
 
+	/* 失败盘本身不再视为 active/spare，避免语义混乱 */
 	base_info->is_failed = true;
+	base_info->is_active = false;
+	base_info->is_spare = false;
 	slot = (uint8_t)(base_info - ec_bdev->base_bdev_info);
 
 	/* Try to get PCIe BDF address for the failed disk */
@@ -3390,13 +3488,87 @@ _ec_bdev_fail_base_bdev(void *ctx)
 					/* Write superblock asynchronously - but don't remove the base bdev yet */
 					ec_bdev_write_superblock(ec_bdev, ec_bdev_fail_base_bdev_write_sb_cb, base_info);
 				}
-				return;
 			}
+		} else {
+			/* Slot not found in superblock - mark as failed but don't remove */
+			SPDK_WARNLOG("Superblock slot not found for failed base bdev (slot=%u), marking as failed but keeping in EC bdev\n",
+				     slot);
 		}
+	} else {
+		/* No superblock - mark as failed but don't remove */
+		SPDK_WARNLOG("No superblock found for failed base bdev, marking as failed but keeping in EC bdev\n");
 	}
 
-	/* No superblock or slot not found - mark as failed but don't remove */
-	SPDK_WARNLOG("No superblock found for failed base bdev, marking as failed but keeping in EC bdev\n");
+	/*
+	 * 备用盘模式下的自动替换逻辑：
+	 * 仅当：
+	 *   - 当前 EC bdev 处于 SPARE 模式，且
+	 *   - 失败的是 active 盘（is_active == true, is_spare == false）
+	 * 时，尝试从 spare 列表中提升一块盘为新的 active，并启动 rebuild。
+	 *
+	 * 其他模式下保持原有行为：只标记 failed，不做自动替换。
+	 */
+	if (ec_bdev->expansion_mode == EC_EXPANSION_MODE_SPARE &&
+	    base_info->is_active && !base_info->is_spare) {
+		struct ec_base_bdev_info *iter;
+
+		SPDK_NOTICELOG("EC[spare] base bdev '%s' (slot=%u) failed on EC bdev %s, trying to promote a spare\n",
+			       base_info->name ? base_info->name : "unknown",
+			       slot, ec_bdev->bdev.name);
+
+		/* 查找可用 spare：有 desc、未失败、标记为 spare 且当前未 active */
+		EC_FOR_EACH_BASE_BDEV(ec_bdev, iter) {
+			if (iter->desc != NULL && !iter->is_failed &&
+			    iter->is_spare && !iter->is_active) {
+				spare = iter;
+				break;
+			}
+		}
+
+		if (spare == NULL) {
+			SPDK_WARNLOG("EC[spare] EC bdev %s: no spare available to replace failed base bdev '%s'\n",
+				     ec_bdev->bdev.name,
+				     base_info->name ? base_info->name : "unknown");
+			return;
+		}
+
+		/* 激活 spare，并清除 spare 标记 */
+		spare->is_spare = false;
+		spare->is_active = true;
+
+		/* 如果启用了 superblock，则将 spare 的 state 更新为 CONFIGURED，保证重启后状态一致 */
+		if (ec_bdev->sb != NULL) {
+			uint8_t spare_slot = (uint8_t)(spare - ec_bdev->base_bdev_info);
+			if (ec_bdev_sb_update_base_bdev_state(ec_bdev, spare_slot,
+							      EC_SB_BASE_BDEV_CONFIGURED)) {
+				ec_bdev_write_superblock(ec_bdev, NULL, NULL);
+			}
+		}
+
+		SPDK_NOTICELOG("EC[spare] EC bdev %s: promoting spare '%s' (slot=%u) to replace failed '%s'\n",
+			       ec_bdev->bdev.name,
+			       spare->name ? spare->name : "unknown",
+			       (uint8_t)(spare - ec_bdev->base_bdev_info),
+			       base_info->name ? base_info->name : "unknown");
+
+		/* 尝试启动针对 spare 的重建（基于现有 process 框架） */
+		if (!ec_bdev_is_rebuilding(ec_bdev)) {
+			int rc = ec_bdev_start_rebuild(ec_bdev, spare, NULL, NULL);
+			if (rc != 0) {
+				SPDK_WARNLOG("EC[spare] EC bdev %s: failed to start rebuild to spare '%s': %s\n",
+					     ec_bdev->bdev.name,
+					     spare->name ? spare->name : "unknown",
+					     spdk_strerror(-rc));
+			} else {
+				SPDK_NOTICELOG("EC[spare] EC bdev %s: rebuild to spare '%s' started\n",
+					       ec_bdev->bdev.name,
+					       spare->name ? spare->name : "unknown");
+			}
+		} else {
+			SPDK_WARNLOG("EC[spare] EC bdev %s: rebuild already in progress, cannot start spare rebuild now\n",
+				     ec_bdev->bdev.name);
+		}
+	}
 }
 
 /*
