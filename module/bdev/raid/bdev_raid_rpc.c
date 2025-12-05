@@ -332,7 +332,7 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
 			SPDK_ERRLOG("Failed to add base bdev %s to RAID bdev %s: %s\n",
 				    base_bdev_name, req->name, spdk_strerror(-rc));
 			/* If base bdev doesn't exist, treat it as an error */
-			if (rc == -ENODEV) {
+		if (rc == -ENODEV) {
 				SPDK_ERRLOG("Base bdev %s does not exist. All base bdevs must be available before creating RAID bdev.\n",
 					    base_bdev_name);
 			}

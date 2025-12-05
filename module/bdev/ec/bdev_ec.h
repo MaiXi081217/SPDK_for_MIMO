@@ -70,6 +70,9 @@ struct ec_device_selection_config {
 	/* Fault tolerance for wear leveling (内置在磨损均衡算法中) */
 	uint8_t stripe_group_size;  /* Stripe group size for fault tolerance (usually = num_base_bdevs) */
 	
+	/* 【问题5修复】容错降级策略配置 */
+	bool allow_degraded_placement;  /* 是否允许降级放置（破坏容错性），默认false */
+	
 	/* Deterministic algorithm parameters */
 	uint32_t selection_seed;  /* Seed for deterministic selection */
 	

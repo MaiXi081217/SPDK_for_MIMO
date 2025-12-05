@@ -25,6 +25,9 @@ struct ec_bdev_write_sb_ctx {
 	ec_bdev_write_sb_cb cb;
 	void *cb_ctx;
 	struct spdk_bdev_io_wait_entry wait_entry;
+	/* 【问题4修复】双缓冲区支持：使用序列号确定写入槽位 */
+	uint64_t sb_offset;  /* 超级块写入偏移（0或sb_size，基于序列号奇偶性） */
+	bool ping_pong_enabled;  /* 是否启用双缓冲区机制 */
 };
 
 struct ec_bdev_read_sb_ctx {
@@ -34,6 +37,17 @@ struct ec_bdev_read_sb_ctx {
 	void *cb_ctx;
 	void *buf;
 	uint32_t buf_size;
+	/* 【问题4修复】双缓冲区读取支持 */
+	void *buf_slot_a;  /* 主槽位（偏移0）的缓冲区 */
+	void *buf_slot_b;  /* 备用槽位（偏移sb_size）的缓冲区 */
+	uint32_t buf_size_slot_a;
+	uint32_t buf_size_slot_b;
+	bool slot_a_valid;  /* 主槽位是否有效（CRC正确） */
+	bool slot_b_valid;  /* 备用槽位是否有效（CRC正确） */
+	uint64_t slot_a_seq;  /* 主槽位的序列号 */
+	uint64_t slot_b_seq;  /* 备用槽位的序列号 */
+	uint8_t reads_completed;  /* 已完成的读取数量（0-2） */
+	uint64_t sb_size;  /* 超级块大小（用于计算备用槽位偏移） */
 };
 
 struct ec_sb_profile_slot_disk {
@@ -534,6 +548,44 @@ ec_bdev_sb_check_crc(struct ec_bdev_superblock *sb)
 	return crc == prev;
 }
 
+/*
+ * 【问题4修复】验证单个槽位的超级块
+ * 返回0表示有效，非0表示无效
+ * 如果有效，通过输出参数返回序列号
+ */
+static int
+ec_bdev_validate_sb_slot(void *buf, uint32_t buf_size, uint64_t *seq_number_out)
+{
+	struct ec_bdev_superblock *sb = (struct ec_bdev_superblock *)buf;
+
+	/* 检查签名 */
+	if (memcmp(sb->signature, EC_BDEV_SB_SIG, sizeof(sb->signature)) != 0) {
+		return -EINVAL;
+	}
+
+	/* 检查长度 */
+	if (sb->length > EC_BDEV_SB_MAX_SUPPORTED_LENGTH || sb->length == 0) {
+		return -EINVAL;
+	}
+
+	/* 检查CRC */
+	if (!ec_bdev_sb_check_crc(sb)) {
+		return -EINVAL;
+	}
+
+	/* 检查版本 */
+	if (sb->version.major != EC_BDEV_SB_VERSION_MAJOR) {
+		return -EINVAL;
+	}
+
+	/* 如果所有检查都通过，返回序列号 */
+	if (seq_number_out != NULL) {
+		*seq_number_out = sb->seq_number;
+	}
+
+	return 0;
+}
+
 static int
 ec_bdev_parse_superblock(struct ec_bdev_read_sb_ctx *ctx)
 {
@@ -604,12 +656,119 @@ ec_bdev_parse_superblock(struct ec_bdev_read_sb_ctx *ctx)
 static void
 ec_bdev_read_sb_ctx_free(struct ec_bdev_read_sb_ctx *ctx)
 {
-	spdk_dma_free(ctx->buf);
+	if (ctx->buf != NULL) {
+		spdk_dma_free(ctx->buf);
+	}
+	if (ctx->buf_slot_a != NULL && ctx->buf_slot_a != ctx->buf) {
+		spdk_dma_free(ctx->buf_slot_a);
+	}
+	if (ctx->buf_slot_b != NULL && ctx->buf_slot_b != ctx->buf) {
+		spdk_dma_free(ctx->buf_slot_b);
+	}
 
 	free(ctx);
 }
 
 static void ec_bdev_read_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
+
+/*
+ * 【问题4修复】选择最佳槽位并完成读取
+ * 比较两个槽位的序列号和有效性，选择最佳的一个
+ */
+static void
+ec_bdev_select_best_sb_slot(struct ec_bdev_read_sb_ctx *ctx)
+{
+	struct ec_bdev_superblock *sb = NULL;
+	int status = 0;
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(ctx->desc);
+
+	/* 验证两个槽位并获取序列号 */
+	if (ctx->buf_slot_a != NULL) {
+		ctx->slot_a_valid = (ec_bdev_validate_sb_slot(ctx->buf_slot_a, ctx->buf_size_slot_a,
+							      &ctx->slot_a_seq) == 0);
+		if (!ctx->slot_a_valid) {
+			SPDK_DEBUGLOG(bdev_ec_sb, "Slot A (offset 0) invalid on bdev %s\n",
+				      spdk_bdev_get_name(bdev));
+		} else {
+			SPDK_DEBUGLOG(bdev_ec_sb, "Slot A (offset 0) valid, seq=%lu on bdev %s\n",
+				      ctx->slot_a_seq, spdk_bdev_get_name(bdev));
+		}
+	}
+
+	if (ctx->buf_slot_b != NULL) {
+		ctx->slot_b_valid = (ec_bdev_validate_sb_slot(ctx->buf_slot_b, ctx->buf_size_slot_b,
+							      &ctx->slot_b_seq) == 0);
+		if (!ctx->slot_b_valid) {
+			SPDK_DEBUGLOG(bdev_ec_sb, "Slot B (offset %lu) invalid on bdev %s\n",
+				      ctx->sb_size, spdk_bdev_get_name(bdev));
+		} else {
+			SPDK_DEBUGLOG(bdev_ec_sb, "Slot B (offset %lu) valid, seq=%lu on bdev %s\n",
+				      ctx->sb_size, ctx->slot_b_seq, spdk_bdev_get_name(bdev));
+		}
+	}
+
+	/* 选择最佳槽位 */
+	uint32_t selected_size = 0;
+	if (ctx->slot_a_valid && ctx->slot_b_valid) {
+		/* 两个槽位都有效，选择序列号较高的 */
+		if (ctx->slot_a_seq >= ctx->slot_b_seq) {
+			sb = (struct ec_bdev_superblock *)ctx->buf_slot_a;
+			selected_size = ctx->buf_size_slot_a;
+			SPDK_DEBUGLOG(bdev_ec_sb, "Selected slot A (seq=%lu >= seq=%lu) on bdev %s\n",
+				      ctx->slot_a_seq, ctx->slot_b_seq, spdk_bdev_get_name(bdev));
+		} else {
+			sb = (struct ec_bdev_superblock *)ctx->buf_slot_b;
+			selected_size = ctx->buf_size_slot_b;
+			SPDK_DEBUGLOG(bdev_ec_sb, "Selected slot B (seq=%lu > seq=%lu) on bdev %s\n",
+				      ctx->slot_b_seq, ctx->slot_a_seq, spdk_bdev_get_name(bdev));
+		}
+	} else if (ctx->slot_a_valid) {
+		/* 只有主槽位有效 */
+		sb = (struct ec_bdev_superblock *)ctx->buf_slot_a;
+		selected_size = ctx->buf_size_slot_a;
+		SPDK_DEBUGLOG(bdev_ec_sb, "Selected slot A (only valid slot) on bdev %s\n",
+			      spdk_bdev_get_name(bdev));
+	} else if (ctx->slot_b_valid) {
+		/* 只有备用槽位有效 */
+		sb = (struct ec_bdev_superblock *)ctx->buf_slot_b;
+		selected_size = ctx->buf_size_slot_b;
+		SPDK_DEBUGLOG(bdev_ec_sb, "Selected slot B (only valid slot) on bdev %s\n",
+			      spdk_bdev_get_name(bdev));
+	} else {
+		/* 两个槽位都无效 */
+		SPDK_ERRLOG("Both superblock slots invalid on bdev %s\n",
+			    spdk_bdev_get_name(bdev));
+		status = -EINVAL;
+	}
+
+	/* 如果找到了有效的槽位，将选中的槽位复制到主缓冲区 */
+	if (sb != NULL && status == 0) {
+		/* 确保主缓冲区足够大 */
+		if (ctx->buf_size < selected_size) {
+			void *new_buf = spdk_dma_realloc(ctx->buf, selected_size,
+							spdk_bdev_get_buf_align(bdev), NULL);
+			if (!new_buf) {
+				SPDK_ERRLOG("Failed to reallocate buffer for selected slot on bdev %s\n",
+					    spdk_bdev_get_name(bdev));
+				status = -ENOMEM;
+				sb = NULL;
+			} else {
+				ctx->buf = new_buf;
+				ctx->buf_size = selected_size;
+			}
+		}
+		if (sb != NULL) {
+			memcpy(ctx->buf, sb, selected_size);
+			sb = (struct ec_bdev_superblock *)ctx->buf;
+		}
+	}
+
+	/* 调用回调函数 */
+	ctx->cb(sb, status, ctx->cb_ctx);
+
+	/* 释放上下文 */
+	ec_bdev_read_sb_ctx_free(ctx);
+}
 
 static int
 ec_bdev_read_sb_remainder(struct ec_bdev_read_sb_ctx *ctx)
@@ -646,19 +805,39 @@ ec_bdev_read_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct spdk_bdev *bdev = bdev_io->bdev;
 	struct ec_bdev_read_sb_ctx *ctx = cb_arg;
-	struct ec_bdev_superblock *sb = NULL;
-	int status;
+	void *current_buf = NULL;
+	uint32_t *current_buf_size = NULL;
+	bool is_slot_a = false;
+	int status = 0;
 
-	if (spdk_bdev_is_md_interleaved(bdev_io->bdev) && ctx->buf_size > bdev->blocklen) {
+	/* 确定当前读取的是哪个槽位 */
+	uint64_t read_offset = bdev_io->u.bdev.offset_blocks * bdev->blocklen;
+	if (ctx->buf_slot_a != NULL && read_offset < ctx->sb_size) {
+		/* 主槽位：偏移在 [0, sb_size) 范围内 */
+		current_buf = ctx->buf_slot_a;
+		current_buf_size = &ctx->buf_size_slot_a;
+		is_slot_a = true;
+	} else if (ctx->buf_slot_b != NULL && read_offset >= ctx->sb_size) {
+		/* 备用槽位：偏移 >= sb_size */
+		current_buf = ctx->buf_slot_b;
+		current_buf_size = &ctx->buf_size_slot_b;
+		is_slot_a = false;
+	} else {
+		/* 单槽位模式（向后兼容） */
+		current_buf = ctx->buf;
+		current_buf_size = &ctx->buf_size;
+	}
+
+	if (spdk_bdev_is_md_interleaved(bdev_io->bdev) && *current_buf_size > bdev->blocklen) {
 		const uint32_t data_block_size = spdk_bdev_get_data_block_size(bdev);
-		uint32_t num_blocks = ctx->buf_size / bdev->blocklen;
+		uint32_t num_blocks = *current_buf_size / bdev->blocklen;
 		uint32_t i;
 
 		/* Use reverse iteration with memcpy to avoid overlapping issues
 		 * when bdev->blocklen > data_block_size (i.e., metadata padding exists) */
 		for (i = num_blocks; i > 0; i--) {
-			memcpy(ctx->buf + (i - 1) * data_block_size,
-			       ctx->buf + (i - 1) * bdev->blocklen,
+			memcpy(current_buf + (i - 1) * data_block_size,
+			       current_buf + (i - 1) * bdev->blocklen,
 			       data_block_size);
 		}
 	}
@@ -666,10 +845,81 @@ ec_bdev_read_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	spdk_bdev_free_io(bdev_io);
 
 	if (!success) {
-		status = -EIO;
-		goto out;
+		/* 读取失败，标记该槽位无效 */
+		if (is_slot_a) {
+			ctx->slot_a_valid = false;
+		} else if (current_buf == ctx->buf_slot_b) {
+			ctx->slot_b_valid = false;
+		} else {
+			/* 单槽位模式，直接返回错误 */
+			status = -EIO;
+			ctx->cb(NULL, status, ctx->cb_ctx);
+			ec_bdev_read_sb_ctx_free(ctx);
+			return;
+		}
+	} else {
+		/* 读取成功，检查是否需要读取剩余部分 */
+		struct ec_bdev_superblock *sb = (struct ec_bdev_superblock *)current_buf;
+		if (sb->length > *current_buf_size) {
+			/* 需要读取剩余部分 */
+			uint32_t buf_size_prev = *current_buf_size;
+			void *buf;
+			uint64_t read_offset = is_slot_a ? 0 : ctx->sb_size;
+
+			*current_buf_size = spdk_divide_round_up(
+				spdk_min((uint32_t)sb->length, (uint32_t)EC_BDEV_SB_MAX_SUPPORTED_LENGTH),
+				spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
+			buf = spdk_dma_realloc(current_buf, *current_buf_size,
+					      spdk_bdev_get_buf_align(bdev), NULL);
+			if (buf == NULL) {
+				SPDK_ERRLOG("Failed to reallocate buffer\n");
+				status = -ENOMEM;
+				if (is_slot_a) {
+					ctx->slot_a_valid = false;
+				} else {
+					ctx->slot_b_valid = false;
+				}
+			} else {
+				current_buf = buf;
+				if (is_slot_a) {
+					ctx->buf_slot_a = buf;
+				} else {
+					ctx->buf_slot_b = buf;
+				}
+
+				status = spdk_bdev_read(ctx->desc, ctx->ch,
+							current_buf + buf_size_prev,
+							read_offset + buf_size_prev,
+							*current_buf_size - buf_size_prev,
+							ec_bdev_read_sb_cb, ctx);
+				if (status == 0) {
+					return;  /* 继续读取剩余部分 */
+				}
+				/* 读取失败，标记该槽位无效 */
+				if (is_slot_a) {
+					ctx->slot_a_valid = false;
+				} else {
+					ctx->slot_b_valid = false;
+				}
+			}
+		}
 	}
 
+	/* 双缓冲区模式：检查是否两个槽位都已读取完成 */
+	if (ctx->buf_slot_a != NULL || ctx->buf_slot_b != NULL) {
+		ctx->reads_completed++;
+		if (ctx->reads_completed >= 2 || 
+		    (ctx->buf_slot_a == NULL && ctx->buf_slot_b != NULL) ||
+		    (ctx->buf_slot_a != NULL && ctx->buf_slot_b == NULL)) {
+			/* 所有槽位都已读取完成，选择最佳槽位 */
+			ec_bdev_select_best_sb_slot(ctx);
+			return;
+		}
+		/* 还有槽位未读取完成，等待 */
+		return;
+	}
+
+	/* 单槽位模式（向后兼容） */
 	status = ec_bdev_parse_superblock(ctx);
 	if (status == -EAGAIN) {
 		status = ec_bdev_read_sb_remainder(ctx);
@@ -679,13 +929,154 @@ ec_bdev_read_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	} else if (status != 0) {
 		SPDK_DEBUGLOG(bdev_ec_sb, "failed to parse bdev %s superblock\n",
 			      spdk_bdev_get_name(spdk_bdev_desc_get_bdev(ctx->desc)));
-	} else {
-		sb = ctx->buf;
 	}
-out:
-	ctx->cb(sb, status, ctx->cb_ctx);
 
+	ctx->cb(status == 0 ? ctx->buf : NULL, status, ctx->cb_ctx);
 	ec_bdev_read_sb_ctx_free(ctx);
+}
+
+/*
+ * 【问题4修复】双缓冲区读取第一阶段：读取主槽位头部以确定sb_size
+ * 这个回调函数在读取主槽位头部后调用，用于确定sb_size，然后启动双槽位完整读取
+ */
+static void
+ec_bdev_read_sb_header_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct ec_bdev_read_sb_ctx *ctx = cb_arg;
+	struct ec_bdev_superblock *sb;
+	uint32_t sb_size;
+	int rc;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		/* 主槽位读取失败，尝试从备用槽位读取（使用默认大小） */
+		SPDK_DEBUGLOG(bdev_ec_sb, "Failed to read slot A header, trying slot B with default size on bdev %s\n",
+			      spdk_bdev_get_name(bdev));
+		/* 使用默认大小作为sb_size，尝试从备用槽位读取 */
+		sb_size = spdk_divide_round_up(sizeof(struct ec_bdev_superblock),
+					       spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
+		ctx->sb_size = sb_size;
+		/* 只从备用槽位读取 */
+		ctx->buf_slot_b = spdk_dma_malloc(ctx->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
+		if (!ctx->buf_slot_b) {
+			ctx->cb(NULL, -ENOMEM, ctx->cb_ctx);
+			ec_bdev_read_sb_ctx_free(ctx);
+			return;
+		}
+		ctx->buf_size_slot_b = ctx->buf_size;
+		rc = spdk_bdev_read(ctx->desc, ctx->ch, ctx->buf_slot_b, sb_size, ctx->buf_size_slot_b,
+				    ec_bdev_read_sb_cb, ctx);
+		if (rc != 0) {
+			ctx->cb(NULL, rc, ctx->cb_ctx);
+			ec_bdev_read_sb_ctx_free(ctx);
+		}
+		return;
+	}
+
+	/* 处理元数据交错的情况 */
+	if (spdk_bdev_is_md_interleaved(bdev) && ctx->buf_size > bdev->blocklen) {
+		const uint32_t data_block_size = spdk_bdev_get_data_block_size(bdev);
+		uint32_t num_blocks = ctx->buf_size / bdev->blocklen;
+		uint32_t i;
+
+		for (i = num_blocks; i > 0; i--) {
+			memcpy(ctx->buf + (i - 1) * data_block_size,
+			       ctx->buf + (i - 1) * bdev->blocklen,
+			       data_block_size);
+		}
+	}
+
+	/* 解析超级块头部，获取sb_size */
+	sb = (struct ec_bdev_superblock *)ctx->buf;
+	if (memcmp(sb->signature, EC_BDEV_SB_SIG, sizeof(sb->signature)) != 0) {
+		/* 签名不匹配，尝试从备用槽位读取（使用默认大小） */
+		SPDK_DEBUGLOG(bdev_ec_sb, "Invalid signature in slot A, trying slot B with default size on bdev %s\n",
+			      spdk_bdev_get_name(bdev));
+		sb_size = spdk_divide_round_up(sizeof(struct ec_bdev_superblock),
+					       spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
+		ctx->sb_size = sb_size;
+		ctx->buf_slot_b = spdk_dma_malloc(ctx->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
+		if (!ctx->buf_slot_b) {
+			ctx->cb(NULL, -ENOMEM, ctx->cb_ctx);
+			ec_bdev_read_sb_ctx_free(ctx);
+			return;
+		}
+		ctx->buf_size_slot_b = ctx->buf_size;
+		rc = spdk_bdev_read(ctx->desc, ctx->ch, ctx->buf_slot_b, sb_size, ctx->buf_size_slot_b,
+				    ec_bdev_read_sb_cb, ctx);
+		if (rc != 0) {
+			ctx->cb(NULL, rc, ctx->cb_ctx);
+			ec_bdev_read_sb_ctx_free(ctx);
+		}
+		return;
+	}
+
+	/* 确定sb_size：使用超级块中记录的length字段，但需要对齐到块大小 */
+	if (sb->length > 0 && sb->length <= EC_BDEV_SB_MAX_SUPPORTED_LENGTH) {
+		sb_size = spdk_divide_round_up(sb->length,
+					       spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
+	} else {
+		/* 如果length字段无效，使用默认大小 */
+		sb_size = spdk_divide_round_up(sizeof(struct ec_bdev_superblock),
+					       spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
+	}
+	ctx->sb_size = sb_size;
+
+	/* 确定完整读取所需的缓冲区大小 */
+	uint32_t full_buf_size = spdk_divide_round_up(
+		spdk_min((uint32_t)sb->length, (uint32_t)EC_BDEV_SB_MAX_SUPPORTED_LENGTH),
+		spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
+
+	/* 分配两个槽位的缓冲区 */
+	ctx->buf_slot_a = spdk_dma_malloc(full_buf_size, spdk_bdev_get_buf_align(bdev), NULL);
+	ctx->buf_slot_b = spdk_dma_malloc(full_buf_size, spdk_bdev_get_buf_align(bdev), NULL);
+	if (!ctx->buf_slot_a || !ctx->buf_slot_b) {
+		ctx->cb(NULL, -ENOMEM, ctx->cb_ctx);
+		ec_bdev_read_sb_ctx_free(ctx);
+		return;
+	}
+	ctx->buf_size_slot_a = full_buf_size;
+	ctx->buf_size_slot_b = full_buf_size;
+
+	/* 将已读取的主槽位头部数据复制到buf_slot_a */
+	memcpy(ctx->buf_slot_a, ctx->buf, ctx->buf_size);
+
+	/* 如果头部数据不够，需要读取主槽位的剩余部分 */
+	if (sb->length > ctx->buf_size) {
+		rc = spdk_bdev_read(ctx->desc, ctx->ch, ctx->buf_slot_a + ctx->buf_size, 0 + ctx->buf_size,
+				    full_buf_size - ctx->buf_size, ec_bdev_read_sb_cb, ctx);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to read slot A remainder on bdev %s: %s\n",
+				    spdk_bdev_get_name(bdev), spdk_strerror(-rc));
+			ctx->slot_a_valid = false;
+			/* 标记主槽位读取完成（虽然失败了） */
+			ctx->reads_completed++;
+		}
+		/* 如果读取成功，ec_bdev_read_sb_cb 会在读取完成后增加 reads_completed */
+	} else {
+		/* 头部数据已经足够，标记主槽位读取完成 */
+		ctx->reads_completed++;
+	}
+
+	/* 同时从备用槽位读取完整内容 */
+	rc = spdk_bdev_read(ctx->desc, ctx->ch, ctx->buf_slot_b, sb_size, full_buf_size,
+			    ec_bdev_read_sb_cb, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to read slot B on bdev %s: %s\n",
+			    spdk_bdev_get_name(bdev), spdk_strerror(-rc));
+		ctx->slot_b_valid = false;
+		/* 标记备用槽位读取完成（虽然失败了） */
+		ctx->reads_completed++;
+	}
+	/* 如果读取成功，ec_bdev_read_sb_cb 会在读取完成后增加 reads_completed */
+
+	/* 检查是否所有读取都已完成（包括失败的情况） */
+	if (ctx->reads_completed >= 2) {
+		ec_bdev_select_best_sb_slot(ctx);
+	}
+	/* 否则，等待 ec_bdev_read_sb_cb 处理剩余的读取完成 */
 }
 
 int
@@ -707,6 +1098,7 @@ ec_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_ch
 	ctx->ch = ch;
 	ctx->cb = cb;
 	ctx->cb_ctx = cb_ctx;
+	/* 初始缓冲区大小：足够读取超级块头部 */
 	ctx->buf_size = spdk_divide_round_up(sizeof(struct ec_bdev_superblock),
 					     spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
 	ctx->buf = spdk_dma_malloc(ctx->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
@@ -715,7 +1107,16 @@ ec_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_ch
 		goto err;
 	}
 
-	rc = spdk_bdev_read(desc, ch, ctx->buf, 0, ctx->buf_size, ec_bdev_read_sb_cb, ctx);
+	/* 【问题4修复】双缓冲区读取：实现完整的双槽位读取逻辑
+	 * 1. 首先读取主槽位（偏移0）的头部，确定sb_size
+	 * 2. 然后同时从两个槽位（0和sb_size）读取完整内容
+	 * 3. 比较两个槽位的序列号和CRC
+	 * 4. 选择序列号较高且CRC正确的槽位
+	 * 5. 如果两个槽位都有效，选择序列号较高的
+	 * 6. 如果只有一个槽位有效，使用该槽位
+	 * 7. 如果两个槽位都无效，返回错误
+	 */
+	rc = spdk_bdev_read(desc, ch, ctx->buf, 0, ctx->buf_size, ec_bdev_read_sb_header_cb, ctx);
 	if (rc) {
 		goto err;
 	}
@@ -776,8 +1177,10 @@ _ec_bdev_write_superblock(void *_ctx)
 			continue;
 		}
 
+		/* 【问题4修复】双缓冲区机制：使用序列号确定写入槽位（0或sb_size） */
+		uint64_t write_offset = ctx->ping_pong_enabled ? ctx->sb_offset : 0;
 		rc = spdk_bdev_write(base_info->desc, base_info->app_thread_ch,
-				     ec_bdev->sb_io_buf, 0, ec_bdev->sb_io_buf_size,
+				     ec_bdev->sb_io_buf, write_offset, ec_bdev->sb_io_buf_size,
 				     ec_bdev_write_superblock_cb, ctx);
 		if (rc != 0) {
 			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
@@ -846,6 +1249,13 @@ ec_bdev_write_superblock(struct ec_bdev *ec_bdev, ec_bdev_write_sb_cb cb, void *
 
 	sb->seq_number++;
 	ec_bdev_sb_update_crc(sb);
+	
+	/* 【问题4修复】双缓冲区机制：使用序列号奇偶性确定写入槽位
+	 * 偶数序列号写入主槽位（0），奇数序列号写入备用槽位（sb_size）
+	 * 这样即使写入过程中崩溃，也能从另一个槽位恢复
+	 */
+	ctx->ping_pong_enabled = true;  /* 默认启用双缓冲区 */
+	ctx->sb_offset = (sb->seq_number % 2) == 0 ? 0 : ec_bdev->sb_io_buf_size;
 
 	if (spdk_bdev_is_md_interleaved(&ec_bdev->bdev)) {
 		void *sb_buf = sb;

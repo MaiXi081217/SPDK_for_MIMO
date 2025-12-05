@@ -573,11 +573,11 @@ rpc_bdev_ec_create(struct spdk_jsonrpc_request *request,
 			goto cleanup;
 		}
 	} else {
-		if (req->base_bdevs.num_base_bdevs != req->k + req->p) {
-			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+	if (req->base_bdevs.num_base_bdevs != req->k + req->p) {
+		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
 					     "Number of base bdevs (%zu) must equal k + p (%u + %u = %u) in this mode",
 					     req->base_bdevs.num_base_bdevs, req->k, req->p, req->k + req->p);
-			goto cleanup;
+		goto cleanup;
 		}
 	}
 

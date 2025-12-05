@@ -37,9 +37,9 @@ static void ec_remove_from_array(uint8_t *candidates, uint32_t *weights,
 static bool ec_device_combination_same(uint8_t *old_data, uint8_t *old_parity,
 				      uint8_t *new_data, uint8_t *new_parity,
 				      uint8_t k, uint8_t p);
-static void ec_selection_compute_weights_from_levels(uint8_t n, const uint32_t *levels,
+void ec_selection_compute_weights_from_levels(uint8_t n, const uint32_t *levels,
 		uint32_t *weights);
-static int ec_selection_collect_device_wear(struct ec_bdev *ec_bdev, uint32_t *levels);
+int ec_selection_collect_device_wear(struct ec_bdev *ec_bdev, uint32_t *levels);
 static uint16_t ec_selection_allocate_profile_id(struct ec_device_selection_config *config);
 static void ec_selection_copy_profile_to_active(struct ec_device_selection_config *config,
 		struct ec_wear_profile_slot *slot, uint8_t num_devices);
@@ -47,7 +47,7 @@ static struct ec_wear_profile_slot *ec_selection_find_matching_profile(
 		struct ec_device_selection_config *config, const uint32_t *levels);
 static struct ec_wear_profile_slot *ec_selection_find_profile_slot(
 		struct ec_device_selection_config *config, uint16_t profile_id);
-static struct ec_wear_profile_slot *ec_selection_ensure_profile_slot(
+struct ec_wear_profile_slot *ec_selection_ensure_profile_slot(
 		struct ec_device_selection_config *config, uint16_t profile_id);
 static void ec_selection_schedule_group_flush(struct ec_bdev *ec_bdev);
 /* Internal helper: wear leveling selection without fault tolerance check (to avoid recursion) */
@@ -56,7 +56,7 @@ static int ec_select_base_bdevs_wear_leveling_no_fault_check(struct ec_bdev *ec_
 		uint8_t *data_indices,
 		uint8_t *parity_indices);
 
-static void
+void
 ec_assignment_cache_reset(struct ec_assignment_cache *cache)
 {
 	if (cache == NULL) {
@@ -78,7 +78,7 @@ ec_assignment_cache_reset(struct ec_assignment_cache *cache)
 	memset(&cache->lock, 0, sizeof(cache->lock));
 }
 
-static int
+int
 ec_assignment_cache_init(struct ec_assignment_cache *cache, uint32_t requested_capacity)
 {
 	uint32_t capacity;
@@ -220,6 +220,27 @@ ec_assignment_cache_store(struct ec_device_selection_config *config,
 		if (p > 0) {
 			memcpy(entry->parity_indices, parity_indices, p);
 		}
+	}
+	spdk_spin_unlock(&config->assignment_cache.lock);
+}
+
+/* Invalidate a specific stripe from assignment cache */
+void
+ec_assignment_cache_invalidate_stripe(struct ec_device_selection_config *config,
+				      uint64_t stripe_index)
+{
+	struct ec_assignment_cache_entry *entry;
+
+	if (config == NULL || !config->assignment_cache.initialized) {
+		return;
+	}
+
+	spdk_spin_lock(&config->assignment_cache.lock);
+	entry = ec_assignment_cache_find_entry(&config->assignment_cache, stripe_index);
+	if (entry != NULL) {
+		/* Mark entry as empty to invalidate it */
+		entry->state = EC_ASSIGNMENT_CACHE_ENTRY_EMPTY;
+		entry->stripe_index = 0;
 	}
 	spdk_spin_unlock(&config->assignment_cache.lock);
 }
@@ -505,7 +526,12 @@ ec_device_combination_same(uint8_t *old_data, uint8_t *old_parity,
 	return true;
 }
 
-static void
+/* 【问题3修复】权重计算常量定义 */
+#define EC_WEAR_WEIGHT_MIN_THRESHOLD	10	/* 最小权重阈值：确保高磨损设备仍有写入机会 */
+#define EC_WEAR_WEIGHT_MAX_RATIO	3	/* 最大权重比例：限制新设备和旧设备的权重差 */
+#define EC_WEAR_WEIGHT_SMOOTH_FACTOR	0.7	/* 平滑因子：0.0-1.0，值越大越平滑（使用线性插值） */
+
+void
 ec_selection_compute_weights_from_levels(uint8_t n, const uint32_t *levels,
 					 uint32_t *weights)
 {
@@ -522,11 +548,7 @@ ec_selection_compute_weights_from_levels(uint8_t n, const uint32_t *levels,
 			continue;
 		}
 
-		if (wear == 0) {
-			weights[i] = 100;
-			continue;
-		}
-
+		/* 【问题3修复】不再对磨损度为0的设备特殊处理，统一使用平滑算法 */
 		if (wear > max_wear) {
 			max_wear = wear;
 		}
@@ -537,6 +559,7 @@ ec_selection_compute_weights_from_levels(uint8_t n, const uint32_t *levels,
 	}
 
 	if (!have_valid || max_wear == min_wear) {
+		/* 所有设备磨损度相同，使用均匀权重 */
 		for (i = 0; i < n; i++) {
 			if (levels[i] == UINT32_MAX) {
 				weights[i] = 0;
@@ -547,27 +570,79 @@ ec_selection_compute_weights_from_levels(uint8_t n, const uint32_t *levels,
 		return;
 	}
 
+	/* 【问题3修复】使用平滑曲线计算权重，避免权重剧烈跳变 */
 	uint32_t range = max_wear - min_wear;
+	uint32_t max_weight = 0;
+	uint32_t min_weight = UINT32_MAX;
+
+	/* 第一遍：计算基础权重（使用平滑因子） */
 	for (i = 0; i < n; i++) {
 		if (levels[i] == UINT32_MAX) {
 			weights[i] = 0;
 			continue;
 		}
 
-		if (levels[i] == 0) {
-			weights[i] = 100;
-			continue;
-		}
-
+		/* 使用平滑因子：将线性归一化结果与均匀权重（50）进行插值 */
 		uint32_t normalized = ((levels[i] - min_wear) * 100) / range;
-		weights[i] = 100 - normalized;
-		if (weights[i] == 0) {
-			weights[i] = 1;
+		uint32_t linear_weight = 100 - normalized;
+		
+		/* 平滑插值：linear_weight * (1 - smooth_factor) + 50 * smooth_factor */
+		/* 简化计算：linear_weight * (1 - smooth_factor) + 50 * smooth_factor */
+		uint32_t smooth_weight = (linear_weight * (100 - (uint32_t)(EC_WEAR_WEIGHT_SMOOTH_FACTOR * 100)) +
+					   50 * (uint32_t)(EC_WEAR_WEIGHT_SMOOTH_FACTOR * 100)) / 100;
+		
+		weights[i] = smooth_weight;
+		
+		if (weights[i] > max_weight) {
+			max_weight = weights[i];
+		}
+		if (weights[i] < min_weight && weights[i] > 0) {
+			min_weight = weights[i];
+		}
+	}
+
+	/* 第二遍：应用最小权重阈值和最大权重比例限制 */
+	if (max_weight > 0 && min_weight < UINT32_MAX) {
+		/* 检查是否需要应用限制 */
+		bool need_adjustment = false;
+		
+		/* 检查最小权重阈值 */
+		if (min_weight < EC_WEAR_WEIGHT_MIN_THRESHOLD) {
+			need_adjustment = true;
+		}
+		
+		/* 检查最大权重比例 */
+		if (max_weight > min_weight * EC_WEAR_WEIGHT_MAX_RATIO) {
+			need_adjustment = true;
+		}
+		
+		if (need_adjustment) {
+			/* 计算调整后的权重范围 */
+			uint32_t target_min = EC_WEAR_WEIGHT_MIN_THRESHOLD;
+			uint32_t target_max = target_min * EC_WEAR_WEIGHT_MAX_RATIO;
+			
+			/* 如果当前最大权重小于目标最大值，使用当前最大值 */
+			if (max_weight < target_max) {
+				target_max = max_weight;
+			}
+			
+			/* 重新归一化权重到目标范围 */
+			uint32_t weight_range = max_weight - min_weight;
+			if (weight_range > 0) {
+				uint32_t target_range = target_max - target_min;
+				for (i = 0; i < n; i++) {
+					if (weights[i] > 0) {
+						/* 归一化到[0, 1]，然后映射到[target_min, target_max] */
+						uint32_t normalized_pos = ((weights[i] - min_weight) * 100) / weight_range;
+						weights[i] = target_min + (normalized_pos * target_range) / 100;
+					}
+				}
+			}
 		}
 	}
 }
 
-static inline uint32_t
+uint32_t
 ec_selection_calculate_group_id(const struct ec_device_selection_config *config,
 				uint64_t stripe_index)
 {
@@ -669,7 +744,7 @@ ec_selection_find_profile_slot(struct ec_device_selection_config *config, uint16
 	return NULL;
 }
 
-static struct ec_wear_profile_slot *
+struct ec_wear_profile_slot *
 ec_selection_ensure_profile_slot(struct ec_device_selection_config *config, uint16_t profile_id)
 {
 	struct ec_wear_profile_slot *slot = ec_selection_find_profile_slot(config, profile_id);
@@ -694,14 +769,24 @@ ec_selection_ensure_profile_slot(struct ec_device_selection_config *config, uint
 	return NULL;
 }
 
+/* 【问题2修复】添加force_profile_id参数版本，避免全局状态切换竞态条件 */
 static struct ec_wear_profile_slot *
-ec_selection_get_profile_slot_for_stripe(struct ec_bdev *ec_bdev, uint64_t stripe_index)
+ec_selection_get_profile_slot_for_stripe_with_profile(struct ec_bdev *ec_bdev, uint64_t stripe_index, uint16_t force_profile_id)
 {
 	struct ec_device_selection_config *config = &ec_bdev->selection_config;
 	struct ec_wear_profile_slot *slot;
-	uint16_t profile_id = config->active_profile_id;
+	uint16_t profile_id;
 	uint32_t group_id;
 	int rc;
+
+	/* 如果指定了force_profile_id，直接使用它（0表示使用默认行为） */
+	if (force_profile_id != 0) {
+		profile_id = force_profile_id;
+		return ec_selection_find_profile_slot(config, profile_id);
+	}
+
+	/* 默认行为：使用active_profile_id */
+	profile_id = config->active_profile_id;
 
 	if (!config->wear_leveling_enabled || config->group_profile_map == NULL) {
 		return ec_selection_find_profile_slot(config, profile_id);
@@ -731,7 +816,13 @@ ec_selection_get_profile_slot_for_stripe(struct ec_bdev *ec_bdev, uint64_t strip
 	return slot;
 }
 
-static int
+static struct ec_wear_profile_slot *
+ec_selection_get_profile_slot_for_stripe(struct ec_bdev *ec_bdev, uint64_t stripe_index)
+{
+	return ec_selection_get_profile_slot_for_stripe_with_profile(ec_bdev, stripe_index, 0);
+}
+
+int
 ec_selection_collect_device_wear(struct ec_bdev *ec_bdev, uint32_t *levels)
 {
 	uint8_t n = ec_bdev->num_base_bdevs;
@@ -876,7 +967,7 @@ ec_selection_create_profile_from_devices(struct ec_bdev *ec_bdev, bool make_acti
 	return 0;
 }
 
-static void
+void
 ec_selection_mark_group_dirty(struct ec_bdev *ec_bdev)
 {
 	struct ec_device_selection_config *config = &ec_bdev->selection_config;
@@ -1021,11 +1112,13 @@ ec_selection_bind_group_profile(struct ec_bdev *ec_bdev, uint64_t stripe_index)
  * 磨损均衡算法，内置容错保证：确保同组条带不共享设备
  * 这是磨损均衡的核心功能，不是独立选项
  */
-int
-ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
+/* 【问题2修复】内部实现函数，接受force_profile_id参数 */
+static int
+ec_select_base_bdevs_wear_leveling_internal(struct ec_bdev *ec_bdev,
 				   uint64_t stripe_index,
 				   uint8_t *data_indices,
-				   uint8_t *parity_indices)
+				   uint8_t *parity_indices,
+				   uint16_t force_profile_id)
 {
 	struct ec_device_selection_config *config = &ec_bdev->selection_config;
 	uint8_t n = ec_bdev->num_base_bdevs;
@@ -1040,8 +1133,8 @@ ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 	struct ec_base_bdev_info *base_info;
 
 	if (config->debug_enabled) {
-		SPDK_NOTICELOG("[SELECT] Stripe %lu: Starting device selection (group_size=%u, n=%u, k=%u, p=%u)\n",
-			       stripe_index, group_size, n, k, p);
+		SPDK_NOTICELOG("[SELECT] Stripe %lu: Starting device selection (group_size=%u, n=%u, k=%u, p=%u, force_profile_id=%u)\n",
+			       stripe_index, group_size, n, k, p, force_profile_id);
 	}
 
 	if (ec_assignment_cache_get(config, stripe_index, data_indices, parity_indices, k, p)) {
@@ -1071,7 +1164,7 @@ ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 
 	/* 兼容性说明：
 	 * - 旧版本中没有 is_active 字段，所有盘都默认参与数据存储。
-	 * - 为了保持行为不变，如果没有任何盘被显式标记为 active，则认为“所有非失败盘都是 active”。
+	 * - 为了保持行为不变，如果没有任何盘被显式标记为 active，则认为"所有非失败盘都是 active"。
 	 * - 只有在扩展框架（如 SPARE/HYBRID 模式）显式设置 is_active 时，下面的过滤才生效。
 	 */
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
@@ -1087,7 +1180,7 @@ ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 	uint8_t num_candidates = 0;
 	uint8_t device_idx = 0;
 
-	profile_slot = ec_selection_get_profile_slot_for_stripe(ec_bdev, stripe_index);
+	profile_slot = ec_selection_get_profile_slot_for_stripe_with_profile(ec_bdev, stripe_index, force_profile_id);
 	weight_table = profile_slot ? profile_slot->wear_weights : config->wear_weights;
 
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
@@ -1201,17 +1294,35 @@ ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 		}
 	}
 
-	/* If not enough available devices, use all candidates (with warning) */
+	/* 【问题5修复】如果可用设备不足，根据allow_degraded_placement配置决定行为 */
 	if (num_available < k + p) {
-		/* Provide detailed error information */
-		SPDK_WARNLOG("EC bdev %s: Not enough devices for fault tolerance at stripe %lu "
-			     "(group_id=%lu, offset_in_group=%lu). "
-			     "Available: %u, needed: %u, candidates: %u, used by other stripes: %u. "
-			     "Using all candidates with potential overlap (fault tolerance may be compromised).\n",
-			     ec_bdev->bdev.name, stripe_index, group_id, offset_in_group,
-			     num_available, k + p, num_candidates, used_count);
-		SPDK_WARNLOG("EC bdev %s: Suggestion: Increase stripe_group_size or add more base devices "
-			     "to improve fault tolerance.\n", ec_bdev->bdev.name);
+		/* 严格模式（默认）：拒绝IO，返回错误 */
+		if (!config->allow_degraded_placement) {
+			SPDK_ERRLOG("EC bdev %s: CRITICAL - Not enough devices for fault tolerance at stripe %lu "
+				    "(group_id=%lu, offset_in_group=%lu). "
+				    "Available: %u, needed: %u, candidates: %u, used by other stripes: %u. "
+				    "Fault tolerance constraint cannot be satisfied. "
+				    "Refusing I/O to prevent data corruption.\n",
+				    ec_bdev->bdev.name, stripe_index, group_id, offset_in_group,
+				    num_available, k + p, num_candidates, used_count);
+			SPDK_ERRLOG("EC bdev %s: Suggestion: Increase stripe_group_size or add more base devices "
+				    "to improve fault tolerance. If you must proceed despite the risk, "
+				    "explicitly enable allow_degraded_placement (NOT RECOMMENDED).\n",
+				    ec_bdev->bdev.name);
+			return -ENOSPC;  /* 返回ENOSPC表示资源不足，无法满足容错要求 */
+		}
+		
+		/* 降级模式（显式启用）：允许回退，但发出严重警告 */
+		SPDK_ERRLOG("EC bdev %s: WARNING - Degraded placement enabled. Not enough devices for fault tolerance at stripe %lu "
+			    "(group_id=%lu, offset_in_group=%lu). "
+			    "Available: %u, needed: %u, candidates: %u, used by other stripes: %u. "
+			    "Using all candidates with potential overlap - FAULT TOLERANCE IS COMPROMISED!\n",
+			    ec_bdev->bdev.name, stripe_index, group_id, offset_in_group,
+			    num_available, k + p, num_candidates, used_count);
+		SPDK_ERRLOG("EC bdev %s: CRITICAL - Data may be written to overlapping devices, reducing fault tolerance. "
+			    "This configuration should only be used in emergency situations.\n",
+			    ec_bdev->bdev.name);
+		
 		/* Safety: ensure we don't exceed array bounds */
 		/* Note: num_candidates is uint8_t, so it's always <= EC_MAX_BASE_BDEVS (255) */
 		if (num_candidates > 0 && num_candidates <= n) {
@@ -1310,6 +1421,27 @@ ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 	}
 
 	return 0;
+}
+
+/* 【问题2修复】公共API：使用默认active_profile_id */
+int
+ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
+				   uint64_t stripe_index,
+				   uint8_t *data_indices,
+				   uint8_t *parity_indices)
+{
+	return ec_select_base_bdevs_wear_leveling_internal(ec_bdev, stripe_index, data_indices, parity_indices, 0);
+}
+
+/* 【问题2修复】公共API：使用指定的force_profile_id（0表示使用默认） */
+int
+ec_select_base_bdevs_wear_leveling_with_profile(struct ec_bdev *ec_bdev,
+				   uint64_t stripe_index,
+				   uint8_t *data_indices,
+				   uint8_t *parity_indices,
+				   uint16_t force_profile_id)
+{
+	return ec_select_base_bdevs_wear_leveling_internal(ec_bdev, stripe_index, data_indices, parity_indices, force_profile_id);
 }
 
 /*
@@ -1428,6 +1560,8 @@ ec_bdev_init_selection_config(struct ec_bdev *ec_bdev)
 	config->active_profile_id = prev_active_profile;
 	config->next_profile_id = prev_next_profile ? prev_next_profile : 1;
 	config->debug_enabled = prev_debug;
+	/* 【问题5修复】默认禁用降级放置，确保容错性 */
+	config->allow_degraded_placement = false;
 	config->group_map_dirty = false;
 	config->group_map_dirty_count = 0;
 	config->group_map_flush_in_progress = false;

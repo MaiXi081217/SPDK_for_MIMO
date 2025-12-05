@@ -1602,11 +1602,18 @@ def add_parser(subparsers):
             print("ERROR: p (number of parity blocks) must be at least 1", file=sys.stderr)
             sys.exit(1)
 
-        # Validate that number of base bdevs matches k + p
-        if len(base_bdevs) != args.k + args.p:
-            print("ERROR: Number of base bdevs (%d) must equal k + p (%d + %d = %d)" % 
-                  (len(base_bdevs), args.k, args.p, args.k + args.p), file=sys.stderr)
-            sys.exit(1)
+        # Validate number of base bdevs based on expansion_mode
+        expansion_mode = getattr(args, 'expansion_mode', 0)  # Default to NORMAL (0)
+        if expansion_mode == 2:  # SPARE mode
+            if len(base_bdevs) < args.k + args.p:
+                print("ERROR: Number of base bdevs (%d) must be at least k + p (%d + %d = %d) for SPARE mode" % 
+                      (len(base_bdevs), args.k, args.p, args.k + args.p), file=sys.stderr)
+                sys.exit(1)
+        else:  # NORMAL mode (default)
+            if len(base_bdevs) != args.k + args.p:
+                print("ERROR: Number of base bdevs (%d) must equal k + p (%d + %d = %d)" % 
+                      (len(base_bdevs), args.k, args.p, args.k + args.p), file=sys.stderr)
+                sys.exit(1)
 
         # Print the created EC name (RPC returns a string)
         # Build request params
@@ -1626,6 +1633,8 @@ def add_parser(subparsers):
             params['wear_leveling_enabled'] = args.wear_leveling_enabled
         if args.debug_enabled:
             params['debug_enabled'] = args.debug_enabled
+        if hasattr(args, 'expansion_mode') and args.expansion_mode is not None:
+            params['expansion_mode'] = args.expansion_mode
         
         print_json(args.client.bdev_ec_create(**params))
     
@@ -1645,6 +1654,7 @@ def add_parser(subparsers):
                                               'disabled by default', action='store_true')
     p.add_argument('-w', '--wear-leveling-enabled', help='Enable wear leveling for device selection', action='store_true')
     p.add_argument('--debug-enabled', help='Enable debug logging for device selection', action='store_true')
+    p.add_argument('-e', '--expansion-mode', help='Expansion mode: 0=NORMAL (default), 2=SPARE', type=int, default=0, choices=[0, 2])
     p.set_defaults(func=bdev_ec_create)
 
     def bdev_ec_delete(args):

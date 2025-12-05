@@ -13,11 +13,7 @@
 #include "spdk/thread.h"
 #include "spdk/json.h"
 
-#define EC_OFFSET_BLOCKS_INVALID	UINT64_MAX
-#define EC_BDEV_PROCESS_MAX_QD	16
-
-#define EC_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT	1024
-#define EC_BDEV_PROCESS_MAX_BANDWIDTH_MB_SEC_DEFAULT	0
+/* Constants are now defined in bdev_ec_internal.h */
 
 /* External reference to EC bdev module interface */
 extern struct spdk_bdev_module g_ec_if;
@@ -52,7 +48,9 @@ struct ec_process_stripe_ctx {
 	uint8_t parity_indices[EC_MAX_P];
 	uint8_t available_indices[EC_MAX_K];
 	uint8_t num_available;
-	uint8_t failed_frag_idx;
+	uint8_t failed_frag_idx;  /* For rebuild: single failed fragment index */
+	uint8_t failed_data_indices[EC_MAX_K];  /* For rebalance: list of failed data fragment indices */
+	uint8_t num_failed_data;  /* Number of failed data fragments (for rebalance) */
 	uint8_t frag_map[EC_MAX_K + EC_MAX_P];
 	uint8_t reads_completed;
 	uint8_t reads_expected;
@@ -61,7 +59,20 @@ struct ec_process_stripe_ctx {
 	unsigned char *stripe_buf;
 	unsigned char *recover_buf;
 	unsigned char *data_ptrs[EC_MAX_K];
+	/* For rebalance verification */
+	unsigned char *verify_buf;  /* Buffer for reading back data for verification */
+	unsigned char *verify_parity_buf;  /* Buffer for reading back parity for verification */
+	unsigned char *original_data_buf;  /* Buffer to save original written data for verification comparison */
+	uint8_t verify_reads_completed;  /* Track verification reads */
+	uint8_t verify_reads_expected;  /* Expected verification reads (k+p) */
+	bool verification_in_progress;  /* Flag to indicate verification is in progress */
 };
+
+/* Forward declarations for verification helper functions (after struct definition) */
+static void ec_bdev_process_free_verification_buffers(struct ec_process_stripe_ctx *stripe_ctx);
+static void ec_bdev_process_verification_error(struct ec_bdev_process_request *process_req,
+					       struct ec_process_stripe_ctx *stripe_ctx,
+					       int error_code, const char *error_msg);
 
 /* ====================================================================
  * Helper functions
@@ -118,7 +129,9 @@ ec_bdev_ch_process_setup(struct ec_bdev_io_channel *ec_ch, struct ec_bdev_proces
 
 	ec_ch->process.offset = process->window_offset;
 
-	/* Process must have a target */
+	/* Rebuild requires a target, but rebalance does not */
+	if (process->type == EC_PROCESS_REBUILD) {
+		/* Process must have a target for rebuild */
 	assert(process->target != NULL);
 
 	/* Check if target disk is still available */
@@ -133,6 +146,10 @@ ec_bdev_ch_process_setup(struct ec_bdev_io_channel *ec_ch, struct ec_bdev_proces
 		SPDK_ERRLOG("Failed to get I/O channel for target disk '%s'\n",
 			    process->target->name ? process->target->name : "unknown");
 		goto err;
+		}
+	} else {
+		/* For rebalance, target_ch is not needed */
+		ec_ch->process.target_ch = NULL;
 	}
 
 	/* Allocate processed channel */
@@ -148,7 +165,7 @@ ec_bdev_ch_process_setup(struct ec_bdev_io_channel *ec_ch, struct ec_bdev_proces
 		goto err;
 	}
 
-	/* Setup base channels - for EC rebuild, we need at least k available base bdevs */
+		/* Setup base channels */
 	EC_FOR_EACH_BASE_BDEV(ec_bdev, base_info) {
 		uint8_t slot = ec_bdev_base_bdev_slot(base_info);
 
@@ -158,6 +175,8 @@ ec_bdev_ch_process_setup(struct ec_bdev_io_channel *ec_ch, struct ec_bdev_proces
 			goto err;
 		}
 
+		if (process->type == EC_PROCESS_REBUILD) {
+			/* For rebuild: use target_ch for target, base_channel for others */
 		if (base_info != process->target) {
 			if (ec_ch->base_channel != NULL) {
 				ec_ch_processed->base_channel[slot] = ec_ch->base_channel[slot];
@@ -168,6 +187,17 @@ ec_bdev_ch_process_setup(struct ec_bdev_io_channel *ec_ch, struct ec_bdev_proces
 		} else {
 			ec_ch_processed->base_channel[slot] = ec_ch->process.target_ch;
 			available_base_bdevs++;
+			}
+		} else if (process->type == EC_PROCESS_REBALANCE) {
+			/* For rebalance: use all active base bdevs */
+			if (base_info->desc != NULL && !base_info->is_failed && base_info->is_active) {
+				if (ec_ch->base_channel != NULL) {
+					ec_ch_processed->base_channel[slot] = ec_ch->base_channel[slot];
+					if (ec_ch_processed->base_channel[slot] != NULL) {
+						available_base_bdevs++;
+					}
+				}
+			}
 		}
 	}
 
@@ -177,6 +207,14 @@ ec_bdev_ch_process_setup(struct ec_bdev_io_channel *ec_ch, struct ec_bdev_proces
 			SPDK_ERRLOG("Insufficient base bdevs available for rebuild on EC bdev '%s': "
 				    "%u available, need at least %u\n",
 				    ec_bdev->bdev.name, available_base_bdevs, ec_bdev->k);
+			goto err;
+		}
+	} else if (process->type == EC_PROCESS_REBALANCE) {
+		/* For rebalance: need at least k+p active base bdevs */
+		if (available_base_bdevs < ec_bdev->k + ec_bdev->p) {
+			SPDK_ERRLOG("Insufficient active base bdevs available for rebalance on EC bdev '%s': "
+				    "%u available, need at least %u\n",
+				    ec_bdev->bdev.name, available_base_bdevs, ec_bdev->k + ec_bdev->p);
 			goto err;
 		}
 	}
@@ -250,7 +288,7 @@ ec_bdev_process_thread_init(void *ctx)
 	
 	process->state = EC_PROCESS_STATE_RUNNING;
 	
-	/* Show rebuild notification when rebuild starts (aligned with RAID framework) */
+	/* Show process notification when process starts */
 	if (process->type == EC_PROCESS_REBUILD && process->target != NULL) {
 		uint8_t target_slot = ec_bdev_base_bdev_slot(process->target);
 		uint64_t total_size = process->ec_bdev->bdev.blockcnt;
@@ -274,6 +312,20 @@ ec_bdev_process_thread_init(void *ctx)
 		SPDK_NOTICELOG("Check progress: bdev_ec_get_bdevs\n");
 		SPDK_NOTICELOG("===========================================================\n");
 		SPDK_NOTICELOG("\n");
+	} else if (process->type == EC_PROCESS_REBALANCE) {
+		struct ec_rebalance_context *rebalance_ctx = process->ec_bdev->rebalance_ctx;
+		if (rebalance_ctx != NULL) {
+			SPDK_NOTICELOG("\n");
+			SPDK_NOTICELOG("===========================================================\n");
+			SPDK_NOTICELOG("REBALANCE IN PROGRESS: EC bdev '%s'\n", process->ec_bdev->bdev.name);
+			SPDK_NOTICELOG("Old active profile: %u\n", rebalance_ctx->old_active_profile_id);
+			SPDK_NOTICELOG("New active profile: %u\n", rebalance_ctx->new_active_profile_id);
+			SPDK_NOTICELOG("Total stripes: %lu\n", rebalance_ctx->total_stripes);
+			SPDK_NOTICELOG("Rebalance is running in background. This may take a while...\n");
+		SPDK_NOTICELOG("Check progress: bdev_ec_get_bdevs\n");
+		SPDK_NOTICELOG("===========================================================\n");
+		SPDK_NOTICELOG("\n");
+		}
 	}
 	
 	ec_bdev_process_thread_run(process);
@@ -371,9 +423,23 @@ ec_bdev_process_window_range_unlocked(void *ctx, int status)
 		uint32_t percent = (uint32_t)((completed_blocks * 100) / total_blocks);
 		SPDK_NOTICELOG("EC rebuild progress for bdev %s: %lu/%lu blocks (%u%%)\n",
 			       process->ec_bdev->bdev.name, completed_blocks, total_blocks, percent);
+	} else if (process->type == EC_PROCESS_REBALANCE) {
+		/* 【问题5修复】统一进度计算：使用 rebalance_ctx->current_stripe */
+		/* Progress is updated in stripe_write_complete based on current_stripe */
+		/* This ensures consistency and avoids duplicate progress updates */
+		struct ec_rebalance_context *rebalance_ctx = process->ec_bdev->rebalance_ctx;
+		if (rebalance_ctx != NULL && rebalance_ctx->total_stripes > 0) {
+			uint32_t percent = (uint32_t)((rebalance_ctx->current_stripe * 100) / 
+								      rebalance_ctx->total_stripes);
+			SPDK_NOTICELOG("EC[rebalance] Rebalance progress for bdev %s: %lu/%lu stripes (%u%%)\n",
+				       process->ec_bdev->bdev.name, 
+				       rebalance_ctx->current_stripe, 
+				       rebalance_ctx->total_stripes, 
+				       percent);
+		}
 	}
 
-	/* Check if rebuild is complete */
+	/* Check if process is complete */
 	if (process->window_offset >= process->ec_bdev->bdev.blockcnt) {
 		/* Rebuild complete - update superblock to CONFIGURED */
 		if (process->type == EC_PROCESS_REBUILD &&
@@ -385,6 +451,15 @@ ec_bdev_process_window_range_unlocked(void *ctx, int status)
 							      EC_SB_BASE_BDEV_CONFIGURED)) {
 				ec_bdev_write_superblock(process->ec_bdev, NULL, NULL);
 			}
+		} else if (process->type == EC_PROCESS_REBALANCE) {
+			/* Rebalance complete - update rebalance state */
+			struct ec_rebalance_context *rebalance_ctx = process->ec_bdev->rebalance_ctx;
+			if (rebalance_ctx != NULL) {
+				rebalance_ctx->current_stripe = rebalance_ctx->total_stripes;
+				process->ec_bdev->rebalance_progress = 100;
+			}
+			SPDK_NOTICELOG("EC[rebalance] Rebalance completed on EC bdev %s\n",
+				       process->ec_bdev->bdev.name);
 		}
 		/* Process complete */
 		process->status = 0;
@@ -457,6 +532,79 @@ ec_bdev_process_update_superblock_on_error(struct ec_bdev_process *process)
 	}
 }
 
+/* Free verification buffers - centralized cleanup function */
+static void
+ec_bdev_process_free_verification_buffers(struct ec_process_stripe_ctx *stripe_ctx)
+{
+	if (stripe_ctx == NULL) {
+		return;
+	}
+	
+	if (stripe_ctx->verify_buf != NULL) {
+		spdk_dma_free(stripe_ctx->verify_buf);
+		stripe_ctx->verify_buf = NULL;
+	}
+	if (stripe_ctx->verify_parity_buf != NULL) {
+		spdk_dma_free(stripe_ctx->verify_parity_buf);
+		stripe_ctx->verify_parity_buf = NULL;
+	}
+	if (stripe_ctx->original_data_buf != NULL) {
+		spdk_dma_free(stripe_ctx->original_data_buf);
+		stripe_ctx->original_data_buf = NULL;
+	}
+	stripe_ctx->verification_in_progress = false;
+}
+
+/* Handle verification error - centralized error handling */
+static void
+ec_bdev_process_verification_error(struct ec_bdev_process_request *process_req,
+				    struct ec_process_stripe_ctx *stripe_ctx,
+				    int error_code, const char *error_msg)
+{
+	struct ec_bdev_process *process = process_req->process;
+	struct ec_bdev *ec_bdev = process->ec_bdev;
+	
+	SPDK_ERRLOG("%s", error_msg);
+	
+	/* 【问题4修复】验证失败时，如果 group_profile_map 已经更新，需要回滚 */
+	if (process->type == EC_PROCESS_REBALANCE && ec_bdev->rebalance_ctx != NULL) {
+		struct ec_rebalance_context *rebalance_ctx = ec_bdev->rebalance_ctx;
+		struct ec_device_selection_config *config = &ec_bdev->selection_config;
+		uint32_t group_id = ec_selection_calculate_group_id(config, stripe_ctx->stripe_index);
+		
+		/* 检查当前 stripe 的 group 是否已更新到新 profile */
+		if (config->group_profile_map != NULL && 
+		    group_id < config->group_profile_capacity &&
+		    config->group_profile_map[group_id] == rebalance_ctx->new_active_profile_id) {
+			/* 回滚当前 stripe 的 group_profile_map */
+			SPDK_WARNLOG("EC[rebalance] Rolling back group %u for failed verification of stripe %lu\n",
+				     group_id, stripe_ctx->stripe_index);
+			config->group_profile_map[group_id] = rebalance_ctx->old_active_profile_id;
+			ec_selection_mark_group_dirty(ec_bdev);
+			
+			/* 从跟踪列表中移除（如果存在） */
+			if (rebalance_ctx->updated_groups != NULL) {
+				for (uint32_t i = 0; i < rebalance_ctx->num_updated_groups; i++) {
+					if (rebalance_ctx->updated_groups[i] == group_id) {
+						/* 移除：将最后一个元素移到当前位置 */
+						rebalance_ctx->updated_groups[i] = 
+							rebalance_ctx->updated_groups[--rebalance_ctx->num_updated_groups];
+						break;
+					}
+				}
+			}
+		}
+	}
+	
+	ec_bdev_process_free_verification_buffers(stripe_ctx);
+	process->status = error_code;
+	process->error_status = error_code;
+	if (ec_bdev->rebalance_ctx) {
+		ec_bdev->rebalance_ctx->error_status = error_code;
+	}
+	ec_bdev_process_request_complete(process_req, error_code);
+}
+
 /* ====================================================================
  * Request processing
  * ==================================================================== */
@@ -466,7 +614,6 @@ void
 ec_bdev_process_request_complete(struct ec_bdev_process_request *process_req, int status)
 {
 	struct ec_bdev_process *process;
-	struct ec_process_stripe_ctx *stripe_ctx;
 
 	if (process_req == NULL) {
 		return;
@@ -480,91 +627,38 @@ ec_bdev_process_request_complete(struct ec_bdev_process_request *process_req, in
 
 	assert(spdk_get_thread() == process->thread);
 
-	/* Unified error handling: set error status atomically (aligned with RAID) */
+	/* Set error status if any (aligned with RAID framework) */
 	if (status != 0) {
 		process->window_status = status;
-		process->error_status = status;
 	}
 
-	/* Get stripe context from process request */
-	stripe_ctx = (struct ec_process_stripe_ctx *)(process_req + 1);
+	/* Insert request back to queue for reuse (aligned with RAID framework) */
+	TAILQ_INSERT_TAIL(&process->requests, process_req, link);
 
-	/* Free buffers */
-	if (stripe_ctx->stripe_buf != NULL) {
-		struct ec_bdev *ec_bdev = process->ec_bdev;
-		uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
-		ec_put_rmw_stripe_buf(process->ec_ch, stripe_ctx->stripe_buf,
-				     strip_size_bytes * ec_bdev->k);
-	}
-
-	if (stripe_ctx->recover_buf != NULL) {
-		spdk_dma_free(stripe_ctx->recover_buf);
-	}
-
-	/* Remove from queue - verify it's in queue first to avoid crashes */
-	bool was_in_queue = false;
-	struct ec_bdev_process_request *req_check;
-	TAILQ_FOREACH(req_check, &process->requests, link) {
-		if (req_check == process_req) {
-			was_in_queue = true;
-			break;
-		}
-	}
-	if (was_in_queue) {
-		TAILQ_REMOVE(&process->requests, process_req, link);
-	} else {
-		/* Request not in queue - this should not happen in normal flow
-		 * but can occur in edge cases (e.g., retry logic). Log and continue.
-		 */
-		SPDK_WARNLOG("Request not in queue during completion (stripe %lu) - may be retry case\n",
-			     stripe_ctx->stripe_index);
-	}
-
-	/* Update window progress - decrement window_remaining for completed stripe
-	 * Only decrement if request was in queue (was counted in window_remaining)
-	 */
-	if (was_in_queue) {
-		assert(process->window_remaining > 0);
-		process->window_remaining--;
-	}
-
-	/* Free request */
-	free(process_req);
+	/* Always decrement window_remaining (aligned with RAID framework) */
+	assert(process->window_remaining > 0);
+	process->window_remaining--;
 
 	/* Check if window is complete (aligned with RAID framework) */
 	if (process->window_remaining == 0) {
-		/* Unified error handling: error_status and window_status should be in sync
-		 * For rebuild, prefer error_status; for other processes, use window_status
-		 */
-		int error_to_report = 0;
-		if (process->type == EC_PROCESS_REBUILD && process->error_status != 0) {
-			error_to_report = process->error_status;
-		} else if (process->window_status != 0) {
-			error_to_report = process->window_status;
-		}
-
-		if (error_to_report != 0) {
-			/* Error occurred - will be handled in thread_run */
-			process->status = error_to_report;
+		if (process->window_status != 0) {
+			/* Error occurred - finish process with error */
+			process->status = process->window_status;
 			ec_bdev_process_thread_run(process);
 			return;
 		}
 
-		/* Window complete - update channel offsets and unlock window
-		 * Note: EC uses single-threaded process, so we only need to update
-		 * the process channel's offset, not all channels like RAID does
-		 */
+		/* Window complete - update channel offsets and unlock window */
 		if (process->ec_ch != NULL) {
 			process->ec_ch->process.offset = process->window_offset + process->window_size;
 		}
 		
-		/* Unlock and move to next window */
+		/* Unlock window range */
 		ec_bdev_process_unlock_window_range(process);
-		return;
+		
+		/* Continue processing next window */
+		ec_bdev_process_thread_run(process);
 	}
-
-	/* Continue processing next stripe */
-	ec_bdev_process_thread_run(process);
 }
 
 /* Stripe write complete callback */
@@ -576,7 +670,10 @@ ec_bdev_process_stripe_write_complete(struct spdk_bdev_io *bdev_io, bool success
 	struct ec_process_stripe_ctx *stripe_ctx;
 	struct ec_bdev *ec_bdev;
 
-	spdk_bdev_free_io(bdev_io);
+	/* bdev_io may be NULL when called from read_complete for verification processing */
+	if (bdev_io != NULL) {
+		spdk_bdev_free_io(bdev_io);
+	}
 
 	if (process_req == NULL) {
 		return;
@@ -592,20 +689,673 @@ ec_bdev_process_stripe_write_complete(struct spdk_bdev_io *bdev_io, bool success
 	stripe_ctx = (struct ec_process_stripe_ctx *)(process_req + 1);
 
 	if (!success) {
-		SPDK_ERRLOG("Rebuild write failed for stripe %lu on EC bdev %s\n",
-			    stripe_ctx->stripe_index, ec_bdev->bdev.name);
+		if (process->type == EC_PROCESS_REBUILD) {
+			SPDK_ERRLOG("Rebuild write failed for stripe %lu on EC bdev %s\n",
+				    stripe_ctx->stripe_index, ec_bdev->bdev.name);
+		} else if (process->type == EC_PROCESS_REBALANCE) {
+			/* Check if this is a verification read failure */
+			if (stripe_ctx->verification_in_progress) {
+				SPDK_ERRLOG("Rebalance verification read failed for stripe %lu on EC bdev %s\n",
+					    stripe_ctx->stripe_index, ec_bdev->bdev.name);
+				/* Free verification buffers */
+				ec_bdev_process_free_verification_buffers(stripe_ctx);
+			} else {
+				SPDK_ERRLOG("Rebalance write failed for stripe %lu on EC bdev %s\n",
+					    stripe_ctx->stripe_index, ec_bdev->bdev.name);
+			}
+		}
 		
 		/* Update superblock and error status */
 		ec_bdev_process_update_superblock_on_error(process);
 		process->status = -EIO;
 		process->error_status = -EIO;
+		if (process->type == EC_PROCESS_REBALANCE && ec_bdev->rebalance_ctx) {
+			ec_bdev->rebalance_ctx->error_status = -EIO;
+		}
 		ec_bdev_process_request_complete(process_req, -EIO);
 		return;
 	}
 
-	/* Write completed successfully - complete this request */
-	process->rebuild_state = EC_REBUILD_STATE_IDLE;
-	ec_bdev_process_request_complete(process_req, 0);
+	if (process->type == EC_PROCESS_REBUILD) {
+		/* Rebuild: single write to target, complete immediately */
+		process->rebuild_state = EC_REBUILD_STATE_IDLE;
+		ec_bdev_process_request_complete(process_req, 0);
+	} else if (process->type == EC_PROCESS_REBALANCE) {
+		/* Rebalance: track multiple writes (k data + p parity) */
+		stripe_ctx->reads_completed++;  /* Reuse for write tracking */
+		
+		/* Check if all writes completed */
+		if (stripe_ctx->reads_completed >= stripe_ctx->reads_expected) {
+			/* All writes completed - start verification if not already in progress */
+			if (!stripe_ctx->verification_in_progress) {
+				/* 【步骤8】写入后强制验证：从新设备读取并验证数据完整性 */
+				uint8_t k = ec_bdev->k;
+				uint8_t p = ec_bdev->p;
+				uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+				uint8_t i, idx;
+				int rc;
+				
+				/* Allocate verification buffers */
+				stripe_ctx->verify_buf = spdk_dma_malloc(strip_size_bytes * k, ec_bdev->buf_alignment, NULL);
+				if (stripe_ctx->verify_buf == NULL) {
+					SPDK_ERRLOG("Failed to allocate verification buffer for rebalance stripe %lu\n",
+						    stripe_ctx->stripe_index);
+					process->status = -ENOMEM;
+					process->error_status = -ENOMEM;
+					ec_bdev_process_request_complete(process_req, -ENOMEM);
+					return;
+				}
+				
+				stripe_ctx->verify_parity_buf = spdk_dma_malloc(strip_size_bytes * p, ec_bdev->buf_alignment, NULL);
+				if (stripe_ctx->verify_parity_buf == NULL) {
+					SPDK_ERRLOG("Failed to allocate verification parity buffer for rebalance stripe %lu\n",
+						    stripe_ctx->stripe_index);
+					spdk_dma_free(stripe_ctx->verify_buf);
+					stripe_ctx->verify_buf = NULL;
+					process->status = -ENOMEM;
+					process->error_status = -ENOMEM;
+					ec_bdev_process_request_complete(process_req, -ENOMEM);
+					return;
+				}
+				
+				/* Start verification reads */
+				stripe_ctx->verification_in_progress = true;
+				stripe_ctx->verify_reads_completed = 0;
+				stripe_ctx->verify_reads_expected = k + p;
+				
+				/* Prepare data pointers for verification */
+				unsigned char *verify_data_ptrs[EC_MAX_K];
+				for (i = 0; i < k; i++) {
+					verify_data_ptrs[i] = stripe_ctx->verify_buf + i * strip_size_bytes;
+				}
+				
+				/* Read k data blocks for verification */
+				for (i = 0; i < k; i++) {
+					idx = stripe_ctx->data_indices[i];
+					struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[idx];
+					
+					if (base_info->desc == NULL || base_info->is_failed) {
+						SPDK_ERRLOG("Verification: data device %u is not available for rebalance stripe %lu\n",
+							    idx, stripe_ctx->stripe_index);
+						spdk_dma_free(stripe_ctx->verify_buf);
+						spdk_dma_free(stripe_ctx->verify_parity_buf);
+						stripe_ctx->verify_buf = NULL;
+						stripe_ctx->verify_parity_buf = NULL;
+						process->status = -ENODEV;
+						process->error_status = -ENODEV;
+						ec_bdev_process_request_complete(process_req, -ENODEV);
+						return;
+					}
+					
+					uint64_t pd_lba = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+							  base_info->data_offset;
+					
+					/* Use read_complete callback for verification reads */
+					rc = spdk_bdev_read_blocks(base_info->desc,
+								process->ec_ch->process.ch_processed->base_channel[idx],
+								verify_data_ptrs[i], pd_lba, ec_bdev->strip_size,
+								ec_bdev_process_stripe_read_complete, process_req);
+					if (rc != 0) {
+						if (rc == -ENOMEM) {
+							/* Queue wait and retry - track how many reads we've submitted */
+							/* Keep verification_in_progress = true, but update expected count */
+							stripe_ctx->verify_reads_expected = i;  /* Only count reads we've submitted so far */
+							process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+							process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+							process_req->ec_io.waitq_entry.cb_arg = process;
+							process_req->ec_io.waitq_entry.dep_unblock = true;
+							spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+										process->ec_ch->process.ch_processed->base_channel[idx],
+										&process_req->ec_io.waitq_entry);
+							return;  /* Will retry - verification reads will complete via callback */
+						} else {
+							char error_msg[256];
+							snprintf(error_msg, sizeof(error_msg),
+								 "Failed to read data for verification from device %u for rebalance stripe %lu: %s\n",
+								 idx, stripe_ctx->stripe_index, spdk_strerror(-rc));
+							ec_bdev_process_verification_error(process_req, stripe_ctx, rc, error_msg);
+							return;
+						}
+					}
+				}
+				
+				/* Read p parity blocks for verification */
+				unsigned char *verify_parity_ptrs[EC_MAX_P];
+				for (i = 0; i < p; i++) {
+					verify_parity_ptrs[i] = stripe_ctx->verify_parity_buf + i * strip_size_bytes;
+				}
+				
+				for (i = 0; i < p; i++) {
+					idx = stripe_ctx->parity_indices[i];
+					struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[idx];
+					
+					if (base_info->desc == NULL || base_info->is_failed) {
+						SPDK_ERRLOG("Verification: parity device %u is not available for rebalance stripe %lu\n",
+							    idx, stripe_ctx->stripe_index);
+						spdk_dma_free(stripe_ctx->verify_buf);
+						spdk_dma_free(stripe_ctx->verify_parity_buf);
+						stripe_ctx->verify_buf = NULL;
+						stripe_ctx->verify_parity_buf = NULL;
+						stripe_ctx->verification_in_progress = false;  /* Reset verification state */
+						process->status = -ENODEV;
+						process->error_status = -ENODEV;
+						ec_bdev_process_request_complete(process_req, -ENODEV);
+						return;
+					}
+					
+					uint64_t pd_lba = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+							  base_info->data_offset;
+					
+					/* Use read_complete callback for verification reads */
+					rc = spdk_bdev_read_blocks(base_info->desc,
+								process->ec_ch->process.ch_processed->base_channel[idx],
+								verify_parity_ptrs[i], pd_lba, ec_bdev->strip_size,
+								ec_bdev_process_stripe_read_complete, process_req);
+					if (rc != 0) {
+						if (rc == -ENOMEM) {
+							/* Queue wait and retry - track how many reads we've submitted */
+							/* Keep verification_in_progress = true, but update expected count */
+							stripe_ctx->verify_reads_expected = k + i;  /* k data reads + i parity reads submitted so far */
+							process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+							process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+							process_req->ec_io.waitq_entry.cb_arg = process;
+							process_req->ec_io.waitq_entry.dep_unblock = true;
+							spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+										process->ec_ch->process.ch_processed->base_channel[idx],
+										&process_req->ec_io.waitq_entry);
+							return;  /* Will retry - verification reads will complete via callback */
+						} else {
+							char error_msg[256];
+							snprintf(error_msg, sizeof(error_msg),
+								 "Failed to read parity for verification from device %u for rebalance stripe %lu: %s\n",
+								 idx, stripe_ctx->stripe_index, spdk_strerror(-rc));
+							ec_bdev_process_verification_error(process_req, stripe_ctx, rc, error_msg);
+							return;
+						}
+					}
+				}
+				
+				return;  /* Verification reads submitted, will continue in callback */
+			} else {
+				/* Verification reads completed - verify data integrity */
+				uint8_t k = ec_bdev->k;
+				uint8_t p = ec_bdev->p;
+				uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+				unsigned char *verify_data_ptrs[EC_MAX_K];
+				unsigned char *verify_parity_ptrs[EC_MAX_P];
+				unsigned char *computed_parity_ptrs[EC_MAX_P];
+				uint8_t i;
+				int rc;
+				
+				/* Prepare pointers */
+				for (i = 0; i < k; i++) {
+					verify_data_ptrs[i] = stripe_ctx->verify_buf + i * strip_size_bytes;
+				}
+				for (i = 0; i < p; i++) {
+					verify_parity_ptrs[i] = stripe_ctx->verify_parity_buf + i * strip_size_bytes;
+					/* Use recover_buf for computed parity (already allocated) */
+					computed_parity_ptrs[i] = stripe_ctx->recover_buf + i * strip_size_bytes;
+				}
+				
+				/* Re-encode to compute expected parity */
+				rc = ec_encode_stripe(ec_bdev, verify_data_ptrs, computed_parity_ptrs, strip_size_bytes);
+				if (rc != 0) {
+					char error_msg[256];
+					snprintf(error_msg, sizeof(error_msg),
+						 "Failed to re-encode for verification on stripe %lu: %s\n",
+						 stripe_ctx->stripe_index, spdk_strerror(-rc));
+					ec_bdev_process_verification_error(process_req, stripe_ctx, rc, error_msg);
+					return;
+				}
+				
+				/* Compare original written data with read data */
+				/* Use original_data_buf if available (saved before writing), otherwise use data_ptrs */
+				unsigned char *original_data_ptrs[EC_MAX_K];
+				if (stripe_ctx->original_data_buf != NULL) {
+					for (i = 0; i < k; i++) {
+						original_data_ptrs[i] = stripe_ctx->original_data_buf + i * strip_size_bytes;
+					}
+				} else {
+					/* Fallback: use data_ptrs (may contain decoded data if recovery occurred) */
+					for (i = 0; i < k; i++) {
+						original_data_ptrs[i] = stripe_ctx->data_ptrs[i];
+					}
+				}
+				
+				for (i = 0; i < k; i++) {
+					if (memcmp(original_data_ptrs[i], verify_data_ptrs[i], strip_size_bytes) != 0) {
+						char error_msg[256];
+						snprintf(error_msg, sizeof(error_msg),
+							 "Verification failed for stripe %lu: data block %u mismatch\n",
+							 stripe_ctx->stripe_index, i);
+						ec_bdev_process_verification_error(process_req, stripe_ctx, -EIO, error_msg);
+						return;
+					}
+				}
+				
+				/* Compare computed parity with read parity */
+				for (i = 0; i < p; i++) {
+					if (memcmp(computed_parity_ptrs[i], verify_parity_ptrs[i], strip_size_bytes) != 0) {
+						char error_msg[256];
+						snprintf(error_msg, sizeof(error_msg),
+							 "Verification failed for stripe %lu: parity block %u mismatch\n",
+							 stripe_ctx->stripe_index, i);
+						ec_bdev_process_verification_error(process_req, stripe_ctx, -EIO, error_msg);
+						return;
+					}
+				}
+				
+				/* Verification passed - free verification buffers and reset flag */
+				ec_bdev_process_free_verification_buffers(stripe_ctx);
+				
+				/* All writes and verification completed - update metadata and complete */
+				struct ec_rebalance_context *rebalance_ctx = ec_bdev->rebalance_ctx;
+				struct ec_device_selection_config *config = &ec_bdev->selection_config;
+				uint32_t group_id;
+				
+				if (rebalance_ctx != NULL) {
+					/* 【步骤6】更新group_profile_map（绑定到新profile） */
+					group_id = ec_selection_calculate_group_id(config, stripe_ctx->stripe_index);
+					if (config->group_profile_map != NULL && 
+					    group_id < config->group_profile_capacity) {
+						/* 【问题5修复】跟踪本次更新的 group */
+						uint32_t old_profile = config->group_profile_map[group_id];
+						config->group_profile_map[group_id] = rebalance_ctx->new_active_profile_id;
+						
+						/* 如果这个 group 之前不是新 profile，则添加到跟踪列表 */
+						if (old_profile != rebalance_ctx->new_active_profile_id) {
+							/* 检查是否需要扩展数组 */
+							if (rebalance_ctx->num_updated_groups >= rebalance_ctx->updated_groups_capacity) {
+								uint32_t new_capacity = rebalance_ctx->updated_groups_capacity == 0 ? 
+								    16 : rebalance_ctx->updated_groups_capacity * 2;
+								uint32_t *new_array = realloc(rebalance_ctx->updated_groups,
+												new_capacity * sizeof(uint32_t));
+								if (new_array != NULL) {
+									rebalance_ctx->updated_groups = new_array;
+									rebalance_ctx->updated_groups_capacity = new_capacity;
+								}
+							}
+							if (rebalance_ctx->updated_groups != NULL &&
+							    rebalance_ctx->num_updated_groups < rebalance_ctx->updated_groups_capacity) {
+								rebalance_ctx->updated_groups[rebalance_ctx->num_updated_groups++] = group_id;
+							}
+						}
+						
+						ec_selection_mark_group_dirty(ec_bdev);
+					}
+					
+					/* 【步骤7】清除该stripe的assignment_cache */
+					ec_assignment_cache_invalidate_stripe(config, stripe_ctx->stripe_index);
+					
+					/* Update progress only after successful verification */
+					rebalance_ctx->current_stripe++;
+					if (rebalance_ctx->total_stripes > 0) {
+						uint32_t percent = (uint32_t)((rebalance_ctx->current_stripe * 100) / 
+								      rebalance_ctx->total_stripes);
+						ec_bdev->rebalance_progress = percent;
+					}
+				}
+				
+				/* Complete this request */
+				ec_bdev_process_request_complete(process_req, 0);
+			}
+		} else if (stripe_ctx->verification_in_progress) {
+			/* Verification read completed */
+			stripe_ctx->verify_reads_completed++;
+			
+			/* Check if all verification reads completed */
+			/* Note: verify_reads_expected may be less than k+p if ENOMEM occurred during submission */
+			if (stripe_ctx->verify_reads_completed >= stripe_ctx->verify_reads_expected) {
+				/* If verify_reads_expected < k+p, we need to submit remaining verification reads */
+				uint8_t total_k = ec_bdev->k;
+				uint8_t total_p = ec_bdev->p;
+				uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+				uint8_t total_expected = total_k + total_p;
+				
+				if (stripe_ctx->verify_reads_expected < total_expected) {
+					/* Partial verification reads completed - need to submit remaining reads */
+					uint8_t remaining_verify_reads = total_expected - stripe_ctx->verify_reads_expected;
+					uint8_t start_idx;
+					uint8_t i, idx;
+					int rc_retry;
+					
+					/* Determine where to continue: if verify_reads_expected < total_k, continue data reads */
+					if (stripe_ctx->verify_reads_expected < total_k) {
+						/* Continue data reads */
+						start_idx = stripe_ctx->verify_reads_expected;
+						unsigned char *verify_data_ptrs[EC_MAX_K];
+						for (i = 0; i < total_k; i++) {
+							verify_data_ptrs[i] = stripe_ctx->verify_buf + i * strip_size_bytes;
+						}
+						
+						for (uint8_t j = 0; j < remaining_verify_reads && (start_idx + j) < total_k; j++) {
+							idx = stripe_ctx->data_indices[start_idx + j];
+							struct ec_base_bdev_info *base_info_retry = &ec_bdev->base_bdev_info[idx];
+							
+							if (base_info_retry->desc == NULL || base_info_retry->is_failed) {
+								SPDK_ERRLOG("Verification retry: data device %u is not available for rebalance stripe %lu\n",
+									    idx, stripe_ctx->stripe_index);
+								spdk_dma_free(stripe_ctx->verify_buf);
+								spdk_dma_free(stripe_ctx->verify_parity_buf);
+								stripe_ctx->verify_buf = NULL;
+								stripe_ctx->verify_parity_buf = NULL;
+								stripe_ctx->verification_in_progress = false;
+								process->status = -ENODEV;
+								process->error_status = -ENODEV;
+								ec_bdev_process_request_complete(process_req, -ENODEV);
+								return;
+							}
+							
+							uint64_t pd_lba_retry = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+										base_info_retry->data_offset;
+							
+							/* Use read_complete callback for verification reads */
+							rc_retry = spdk_bdev_read_blocks(base_info_retry->desc,
+										process->ec_ch->process.ch_processed->base_channel[idx],
+										verify_data_ptrs[start_idx + j], pd_lba_retry, ec_bdev->strip_size,
+										ec_bdev_process_stripe_read_complete, process_req);
+							if (rc_retry != 0) {
+								if (rc_retry == -ENOMEM) {
+									/* Queue wait and retry again */
+									process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info_retry->desc);
+									process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+									process_req->ec_io.waitq_entry.cb_arg = process;
+									process_req->ec_io.waitq_entry.dep_unblock = true;
+									spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+												process->ec_ch->process.ch_processed->base_channel[idx],
+												&process_req->ec_io.waitq_entry);
+									/* Update expected reads to include what we just tried to submit */
+									stripe_ctx->verify_reads_expected = start_idx + j;
+									return; /* Will retry later */
+								} else {
+									SPDK_ERRLOG("Failed to read data for verification (retry) from device %u for rebalance stripe %lu: %s\n",
+										    idx, stripe_ctx->stripe_index, spdk_strerror(-rc_retry));
+									spdk_dma_free(stripe_ctx->verify_buf);
+									spdk_dma_free(stripe_ctx->verify_parity_buf);
+									stripe_ctx->verify_buf = NULL;
+									stripe_ctx->verify_parity_buf = NULL;
+									stripe_ctx->verification_in_progress = false;
+									process->status = rc_retry;
+									process->error_status = rc_retry;
+									ec_bdev_process_request_complete(process_req, rc_retry);
+									return;
+								}
+							}
+						}
+						
+						/* If we've completed all data reads, continue with parity reads */
+						if (stripe_ctx->verify_reads_expected >= total_k) {
+							/* Continue with parity reads */
+							unsigned char *verify_parity_ptrs[EC_MAX_P];
+							for (i = 0; i < total_p; i++) {
+								verify_parity_ptrs[i] = stripe_ctx->verify_parity_buf + i * strip_size_bytes;
+							}
+							
+							uint8_t parity_start_idx = stripe_ctx->verify_reads_expected - total_k;
+							uint8_t remaining_parity_reads = total_expected - stripe_ctx->verify_reads_expected;
+							
+							for (uint8_t j = 0; j < remaining_parity_reads && (parity_start_idx + j) < total_p; j++) {
+								idx = stripe_ctx->parity_indices[parity_start_idx + j];
+								struct ec_base_bdev_info *base_info_retry = &ec_bdev->base_bdev_info[idx];
+								
+								if (base_info_retry->desc == NULL || base_info_retry->is_failed) {
+									SPDK_ERRLOG("Verification retry: parity device %u is not available for rebalance stripe %lu\n",
+										    idx, stripe_ctx->stripe_index);
+									spdk_dma_free(stripe_ctx->verify_buf);
+									spdk_dma_free(stripe_ctx->verify_parity_buf);
+									stripe_ctx->verify_buf = NULL;
+									stripe_ctx->verify_parity_buf = NULL;
+									stripe_ctx->verification_in_progress = false;
+									process->status = -ENODEV;
+									process->error_status = -ENODEV;
+									ec_bdev_process_request_complete(process_req, -ENODEV);
+									return;
+								}
+								
+								uint64_t pd_lba_retry = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+											base_info_retry->data_offset;
+								
+								/* Use read_complete callback for verification reads */
+								rc_retry = spdk_bdev_read_blocks(base_info_retry->desc,
+											process->ec_ch->process.ch_processed->base_channel[idx],
+											verify_parity_ptrs[parity_start_idx + j], pd_lba_retry, ec_bdev->strip_size,
+											ec_bdev_process_stripe_read_complete, process_req);
+								if (rc_retry != 0) {
+									if (rc_retry == -ENOMEM) {
+										/* Queue wait and retry again */
+										process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info_retry->desc);
+										process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+										process_req->ec_io.waitq_entry.cb_arg = process;
+										process_req->ec_io.waitq_entry.dep_unblock = true;
+										spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+													process->ec_ch->process.ch_processed->base_channel[idx],
+													&process_req->ec_io.waitq_entry);
+										/* Update expected reads to include what we just tried to submit */
+										stripe_ctx->verify_reads_expected = total_k + parity_start_idx + j;
+										return; /* Will retry later */
+									} else {
+										SPDK_ERRLOG("Failed to read parity for verification (retry) from device %u for rebalance stripe %lu: %s\n",
+											    idx, stripe_ctx->stripe_index, spdk_strerror(-rc_retry));
+										spdk_dma_free(stripe_ctx->verify_buf);
+										spdk_dma_free(stripe_ctx->verify_parity_buf);
+										stripe_ctx->verify_buf = NULL;
+										stripe_ctx->verify_parity_buf = NULL;
+										stripe_ctx->verification_in_progress = false;
+										process->status = rc_retry;
+										process->error_status = rc_retry;
+										ec_bdev_process_request_complete(process_req, rc_retry);
+										return;
+									}
+								}
+							}
+						}
+						
+						/* Update expected reads to total */
+						stripe_ctx->verify_reads_expected = total_expected;
+						return; /* Wait for all verification reads to complete */
+					} else {
+						/* Continue parity reads */
+						start_idx = stripe_ctx->verify_reads_expected - total_k;
+						unsigned char *verify_parity_ptrs[EC_MAX_P];
+						for (i = 0; i < total_p; i++) {
+							verify_parity_ptrs[i] = stripe_ctx->verify_parity_buf + i * strip_size_bytes;
+						}
+						
+						for (uint8_t j = 0; j < remaining_verify_reads && (start_idx + j) < total_p; j++) {
+							idx = stripe_ctx->parity_indices[start_idx + j];
+							struct ec_base_bdev_info *base_info_retry = &ec_bdev->base_bdev_info[idx];
+							
+							if (base_info_retry->desc == NULL || base_info_retry->is_failed) {
+								SPDK_ERRLOG("Verification retry: parity device %u is not available for rebalance stripe %lu\n",
+									    idx, stripe_ctx->stripe_index);
+								spdk_dma_free(stripe_ctx->verify_buf);
+								spdk_dma_free(stripe_ctx->verify_parity_buf);
+								stripe_ctx->verify_buf = NULL;
+								stripe_ctx->verify_parity_buf = NULL;
+								stripe_ctx->verification_in_progress = false;
+								process->status = -ENODEV;
+								process->error_status = -ENODEV;
+								ec_bdev_process_request_complete(process_req, -ENODEV);
+								return;
+							}
+							
+							uint64_t pd_lba_retry = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+										base_info_retry->data_offset;
+							
+							rc_retry = spdk_bdev_read_blocks(base_info_retry->desc,
+										process->ec_ch->process.ch_processed->base_channel[idx],
+										verify_parity_ptrs[start_idx + j], pd_lba_retry, ec_bdev->strip_size,
+										ec_bdev_process_stripe_write_complete, process_req);
+							if (rc_retry != 0) {
+								if (rc_retry == -ENOMEM) {
+									/* Queue wait and retry again */
+									process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info_retry->desc);
+									process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+									process_req->ec_io.waitq_entry.cb_arg = process;
+									process_req->ec_io.waitq_entry.dep_unblock = true;
+									spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+												process->ec_ch->process.ch_processed->base_channel[idx],
+												&process_req->ec_io.waitq_entry);
+									/* Update expected reads to include what we just tried to submit */
+									stripe_ctx->verify_reads_expected = total_k + start_idx + j;
+									return; /* Will retry later */
+								} else {
+									SPDK_ERRLOG("Failed to read parity for verification (retry) from device %u for rebalance stripe %lu: %s\n",
+										    idx, stripe_ctx->stripe_index, spdk_strerror(-rc_retry));
+									spdk_dma_free(stripe_ctx->verify_buf);
+									spdk_dma_free(stripe_ctx->verify_parity_buf);
+									stripe_ctx->verify_buf = NULL;
+									stripe_ctx->verify_parity_buf = NULL;
+									stripe_ctx->verification_in_progress = false;
+									process->status = rc_retry;
+									process->error_status = rc_retry;
+									ec_bdev_process_request_complete(process_req, rc_retry);
+									return;
+								}
+							}
+						}
+						
+						/* Update expected reads to total */
+						stripe_ctx->verify_reads_expected = total_expected;
+						return; /* Wait for all verification reads to complete */
+					}
+				}
+				
+				/* All verification reads completed - verify data integrity */
+				/* Use variables from outer scope if available, otherwise define new ones */
+				uint8_t verify_k = ec_bdev->k;
+				uint8_t verify_p = ec_bdev->p;
+				uint32_t verify_strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+				unsigned char *verify_data_ptrs[EC_MAX_K];
+				unsigned char *verify_parity_ptrs[EC_MAX_P];
+				unsigned char *computed_parity_ptrs[EC_MAX_P];
+				uint8_t verify_i;
+				int verify_rc;
+				
+				/* Prepare pointers */
+				for (verify_i = 0; verify_i < verify_k; verify_i++) {
+					verify_data_ptrs[verify_i] = stripe_ctx->verify_buf + verify_i * verify_strip_size_bytes;
+				}
+				for (verify_i = 0; verify_i < verify_p; verify_i++) {
+					verify_parity_ptrs[verify_i] = stripe_ctx->verify_parity_buf + verify_i * verify_strip_size_bytes;
+					/* Use recover_buf for computed parity (already allocated) */
+					computed_parity_ptrs[verify_i] = stripe_ctx->recover_buf + verify_i * verify_strip_size_bytes;
+				}
+				
+				/* Re-encode to compute expected parity */
+				verify_rc = ec_encode_stripe(ec_bdev, verify_data_ptrs, computed_parity_ptrs, verify_strip_size_bytes);
+				if (verify_rc != 0) {
+					char error_msg[256];
+					snprintf(error_msg, sizeof(error_msg),
+						 "Failed to re-encode for verification on stripe %lu: %s\n",
+						 stripe_ctx->stripe_index, spdk_strerror(-verify_rc));
+					ec_bdev_process_verification_error(process_req, stripe_ctx, verify_rc, error_msg);
+					return;
+				}
+				
+				/* Compare original written data with read data */
+				/* Use original_data_buf if available (saved before writing), otherwise use data_ptrs */
+				unsigned char *original_data_ptrs_verify[EC_MAX_K];
+				if (stripe_ctx->original_data_buf != NULL) {
+					for (verify_i = 0; verify_i < verify_k; verify_i++) {
+						original_data_ptrs_verify[verify_i] = stripe_ctx->original_data_buf + verify_i * verify_strip_size_bytes;
+					}
+				} else {
+					/* Fallback: use data_ptrs (may contain decoded data if recovery occurred) */
+					for (verify_i = 0; verify_i < verify_k; verify_i++) {
+						original_data_ptrs_verify[verify_i] = stripe_ctx->data_ptrs[verify_i];
+					}
+				}
+				
+				for (verify_i = 0; verify_i < verify_k; verify_i++) {
+					if (memcmp(original_data_ptrs_verify[verify_i], verify_data_ptrs[verify_i], verify_strip_size_bytes) != 0) {
+						SPDK_ERRLOG("Verification failed for stripe %lu: data block %u mismatch\n",
+							    stripe_ctx->stripe_index, verify_i);
+						spdk_dma_free(stripe_ctx->verify_buf);
+						spdk_dma_free(stripe_ctx->verify_parity_buf);
+						stripe_ctx->verify_buf = NULL;
+						stripe_ctx->verify_parity_buf = NULL;
+						stripe_ctx->verification_in_progress = false;
+						process->status = -EIO;
+						process->error_status = -EIO;
+						if (ec_bdev->rebalance_ctx) {
+							ec_bdev->rebalance_ctx->error_status = -EIO;
+						}
+						ec_bdev_process_request_complete(process_req, -EIO);
+						return;
+					}
+				}
+				
+				/* Compare computed parity with read parity */
+				for (verify_i = 0; verify_i < verify_p; verify_i++) {
+					if (memcmp(computed_parity_ptrs[verify_i], verify_parity_ptrs[verify_i], verify_strip_size_bytes) != 0) {
+						char error_msg[256];
+						snprintf(error_msg, sizeof(error_msg),
+							 "Verification failed for stripe %lu: parity block %u mismatch\n",
+							 stripe_ctx->stripe_index, verify_i);
+						ec_bdev_process_verification_error(process_req, stripe_ctx, -EIO, error_msg);
+						return;
+					}
+				}
+				
+				/* Verification passed - free verification buffers and reset flag */
+				ec_bdev_process_free_verification_buffers(stripe_ctx);
+				
+				/* All writes and verification completed - update metadata and complete */
+				struct ec_rebalance_context *rebalance_ctx = ec_bdev->rebalance_ctx;
+				struct ec_device_selection_config *config = &ec_bdev->selection_config;
+				uint32_t group_id;
+				
+				if (rebalance_ctx != NULL) {
+					/* 【步骤6】更新group_profile_map（绑定到新profile） */
+					group_id = ec_selection_calculate_group_id(config, stripe_ctx->stripe_index);
+					if (config->group_profile_map != NULL && 
+					    group_id < config->group_profile_capacity) {
+						/* 【问题5修复】跟踪本次更新的 group */
+						uint32_t old_profile = config->group_profile_map[group_id];
+						config->group_profile_map[group_id] = rebalance_ctx->new_active_profile_id;
+						
+						/* 如果这个 group 之前不是新 profile，则添加到跟踪列表 */
+						if (old_profile != rebalance_ctx->new_active_profile_id) {
+							/* 检查是否需要扩展数组 */
+							if (rebalance_ctx->num_updated_groups >= rebalance_ctx->updated_groups_capacity) {
+								uint32_t new_capacity = rebalance_ctx->updated_groups_capacity == 0 ? 
+								    16 : rebalance_ctx->updated_groups_capacity * 2;
+								uint32_t *new_array = realloc(rebalance_ctx->updated_groups,
+												new_capacity * sizeof(uint32_t));
+								if (new_array != NULL) {
+									rebalance_ctx->updated_groups = new_array;
+									rebalance_ctx->updated_groups_capacity = new_capacity;
+								}
+							}
+							if (rebalance_ctx->updated_groups != NULL &&
+							    rebalance_ctx->num_updated_groups < rebalance_ctx->updated_groups_capacity) {
+								rebalance_ctx->updated_groups[rebalance_ctx->num_updated_groups++] = group_id;
+							}
+						}
+						
+						ec_selection_mark_group_dirty(ec_bdev);
+					}
+					
+					/* 【步骤7】清除该stripe的assignment_cache */
+					ec_assignment_cache_invalidate_stripe(config, stripe_ctx->stripe_index);
+					
+					/* Update progress only after successful verification */
+					rebalance_ctx->current_stripe++;
+					if (rebalance_ctx->total_stripes > 0) {
+						uint32_t percent = (uint32_t)((rebalance_ctx->current_stripe * 100) / 
+								      rebalance_ctx->total_stripes);
+						ec_bdev->rebalance_progress = percent;
+					}
+				}
+				
+				/* Complete this request */
+				ec_bdev_process_request_complete(process_req, 0);
+			}
+			/* Otherwise, wait for more verification reads to complete */
+		}
+		/* Otherwise, wait for more writes to complete */
+	}
 }
 
 /* Stripe read complete callback */
@@ -636,8 +1386,13 @@ ec_bdev_process_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success,
 	stripe_ctx = (struct ec_process_stripe_ctx *)(process_req + 1);
 
 	if (!success) {
+		if (process->type == EC_PROCESS_REBUILD) {
 		SPDK_ERRLOG("Rebuild read failed for stripe %lu on EC bdev %s\n",
 			    stripe_ctx->stripe_index, ec_bdev->bdev.name);
+		} else if (process->type == EC_PROCESS_REBALANCE) {
+			SPDK_ERRLOG("Rebalance read failed for stripe %lu on EC bdev %s\n",
+				    stripe_ctx->stripe_index, ec_bdev->bdev.name);
+		}
 		
 		/* Update superblock and error status */
 		ec_bdev_process_update_superblock_on_error(process);
@@ -647,6 +1402,24 @@ ec_bdev_process_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success,
 		return;
 	}
 
+	/* Check if this is a verification read */
+	if (stripe_ctx->verification_in_progress) {
+		/* Handle verification read completion */
+		stripe_ctx->verify_reads_completed++;
+		
+		/* Check if all verification reads completed */
+		if (stripe_ctx->verify_reads_completed >= stripe_ctx->verify_reads_expected) {
+			/* All verification reads completed - trigger verification processing */
+			/* Process verification in write_complete callback (it checks verification_in_progress) */
+			/* Note: bdev_io is already freed by spdk_bdev_free_io above, so we pass NULL */
+			ec_bdev_process_stripe_write_complete(NULL, true, cb_arg);
+			return;
+		}
+		/* More verification reads pending */
+		return;
+	}
+	
+	/* Normal read completion */
 	stripe_ctx->reads_completed++;
 
 	/* Check if all reads completed */
@@ -727,7 +1500,9 @@ ec_bdev_process_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success,
 			return; /* Wait for all reads to complete */
 		}
 		
-		/* All reads completed - proceed with decoding */
+		/* All reads completed - proceed with processing */
+		if (process->type == EC_PROCESS_REBUILD) {
+			/* Rebuild: decode and write to target */
 		process->rebuild_state = EC_REBUILD_STATE_DECODING;
 
 		uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
@@ -758,6 +1533,368 @@ ec_bdev_process_stripe_read_complete(struct spdk_bdev_io *bdev_io, bool success,
 					    process->ec_ch->process.target_ch,
 					    stripe_ctx->recover_buf, pd_lba, ec_bdev->strip_size,
 					    ec_bdev_process_stripe_write_complete, process_req);
+		} else if (process->type == EC_PROCESS_REBALANCE) {
+			/* Rebalance: re-encode and write to new devices */
+			struct ec_rebalance_context *rebalance_ctx = ec_bdev->rebalance_ctx;
+			uint32_t strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+			unsigned char *parity_ptrs[EC_MAX_P];
+			uint8_t k = ec_bdev->k;
+			uint8_t p = ec_bdev->p;
+			uint8_t i, idx;
+			/* 【修复】如果从parity设备读取了数据，需要先解码恢复失败的数据块 */
+			/* Use saved failed data indices list instead of calculating */
+			if (stripe_ctx->num_failed_data > 0 && stripe_ctx->reads_expected < k) {
+				/* We read from parity devices - need to decode failed data fragments */
+				/* Use the saved list of failed data fragment indices */
+				uint8_t num_failed = stripe_ctx->num_failed_data;
+				
+				/* Prepare recovery pointers for failed data fragments */
+				unsigned char *recover_ptrs[EC_MAX_K];
+				for (i = 0; i < num_failed; i++) {
+					uint8_t failed_idx = stripe_ctx->failed_data_indices[i];
+					recover_ptrs[i] = stripe_ctx->data_ptrs[failed_idx];
+				}
+				
+				/* Decode failed data fragments using saved indices */
+				rc = ec_decode_stripe(ec_bdev, stripe_ctx->data_ptrs, recover_ptrs,
+						      stripe_ctx->failed_data_indices, num_failed, strip_size_bytes);
+				if (rc != 0) {
+					SPDK_ERRLOG("Failed to decode %u failed data fragments for rebalance stripe %lu: %s\n",
+						    num_failed, stripe_ctx->stripe_index, spdk_strerror(-rc));
+					process->status = rc;
+					process->error_status = rc;
+					if (rebalance_ctx) {
+						rebalance_ctx->error_status = rc;
+					}
+					ec_bdev_process_request_complete(process_req, rc);
+					return;
+				}
+			}
+			
+			/* Prepare parity pointers */
+			for (i = 0; i < p; i++) {
+				parity_ptrs[i] = stripe_ctx->recover_buf + i * strip_size_bytes;
+			}
+			
+			/* 【步骤4】重新编码生成新校验块 */
+			rc = ec_encode_stripe(ec_bdev, stripe_ctx->data_ptrs, parity_ptrs, strip_size_bytes);
+			if (rc != 0) {
+				SPDK_ERRLOG("Failed to re-encode stripe %lu during rebalance: %s\n",
+					    stripe_ctx->stripe_index, spdk_strerror(-rc));
+				process->status = rc;
+				process->error_status = rc;
+				if (rebalance_ctx) {
+					rebalance_ctx->error_status = rc;
+				}
+				ec_bdev_process_request_complete(process_req, rc);
+				return;
+			}
+			
+			/* Save original data for verification comparison (before writing) */
+			if (stripe_ctx->original_data_buf == NULL) {
+				stripe_ctx->original_data_buf = spdk_dma_malloc(strip_size_bytes * k, ec_bdev->buf_alignment, NULL);
+				if (stripe_ctx->original_data_buf == NULL) {
+					SPDK_ERRLOG("Failed to allocate original data buffer for verification on stripe %lu\n",
+						    stripe_ctx->stripe_index);
+					process->status = -ENOMEM;
+					process->error_status = -ENOMEM;
+					if (rebalance_ctx) {
+						rebalance_ctx->error_status = -ENOMEM;
+					}
+					ec_bdev_process_request_complete(process_req, -ENOMEM);
+					return;
+				}
+				/* Copy original data before writing */
+				for (i = 0; i < k; i++) {
+					memcpy(stripe_ctx->original_data_buf + i * strip_size_bytes,
+					       stripe_ctx->data_ptrs[i], strip_size_bytes);
+				}
+			}
+			
+			/* 【步骤5】写入新设备（k个数据块 + p个校验块） */
+			/* Track writes */
+			stripe_ctx->reads_completed = 0;  /* Reuse for write tracking */
+			stripe_ctx->reads_expected = k + p;
+			
+			/* Write k data blocks */
+			for (i = 0; i < k; i++) {
+				idx = stripe_ctx->data_indices[i];
+				struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[idx];
+				
+				if (base_info->desc == NULL || base_info->is_failed) {
+					/* 【问题1修复】设备失败时，尝试重新选择设备而不是直接中止重平衡
+					 * 局部重试机制：将该设备标记为不可用，重新触发设备选择
+					 */
+					SPDK_WARNLOG("New data device %u is not available for rebalance stripe %lu - attempting device reselection\n",
+						    idx, stripe_ctx->stripe_index);
+					
+					/* 标记该设备在当前重平衡上下文中暂时不可用 */
+					rebalance_ctx->device_failure_retry_count++;
+					
+					/* 如果重试次数过多，跳过该条带 */
+					if (rebalance_ctx->device_failure_retry_count > 3) {
+						SPDK_ERRLOG("Device reselection failed after %u retries for stripe %lu - skipping stripe\n",
+							    rebalance_ctx->device_failure_retry_count, stripe_ctx->stripe_index);
+						
+						/* 记录失败的条带 */
+						if (rebalance_ctx->num_failed_stripes >= rebalance_ctx->failed_stripes_capacity) {
+							uint32_t new_capacity = rebalance_ctx->failed_stripes_capacity == 0 ? 
+							    64 : rebalance_ctx->failed_stripes_capacity * 2;
+							uint64_t *new_array = realloc(rebalance_ctx->failed_stripes,
+												new_capacity * sizeof(uint64_t));
+							if (new_array == NULL) {
+								SPDK_ERRLOG("Failed to allocate memory for failed stripes list\n");
+								/* 继续处理，但无法记录失败条带 */
+							} else {
+								rebalance_ctx->failed_stripes = new_array;
+								rebalance_ctx->failed_stripes_capacity = new_capacity;
+							}
+						}
+						if (rebalance_ctx->failed_stripes != NULL) {
+							rebalance_ctx->failed_stripes[rebalance_ctx->num_failed_stripes++] = stripe_ctx->stripe_index;
+						}
+						
+						/* 完成当前请求（标记为跳过） */
+						ec_bdev_process_request_complete(process_req, 0);
+						return;
+					}
+					
+					/* 【问题2修复】重新选择设备：使用force_profile_id参数，避免全局状态切换竞态条件 */
+					base_info->is_failed = true;
+					
+					/* 重新触发设备选择，使用force_profile_id参数而不是修改全局状态 */
+					rc = ec_select_base_bdevs_wear_leveling_with_profile(ec_bdev, stripe_ctx->stripe_index,
+										stripe_ctx->data_indices, stripe_ctx->parity_indices,
+										rebalance_ctx->new_active_profile_id);
+					
+					/* 恢复设备状态 */
+					base_info->is_failed = false;
+					
+					if (rc != 0) {
+						SPDK_ERRLOG("Failed to reselect devices after failure for stripe %lu: %s\n",
+							    stripe_ctx->stripe_index, spdk_strerror(-rc));
+						/* 跳过该条带 */
+						if (rebalance_ctx->num_failed_stripes >= rebalance_ctx->failed_stripes_capacity) {
+							uint32_t new_capacity = rebalance_ctx->failed_stripes_capacity == 0 ? 
+							    64 : rebalance_ctx->failed_stripes_capacity * 2;
+							uint64_t *new_array = realloc(rebalance_ctx->failed_stripes,
+												new_capacity * sizeof(uint64_t));
+							if (new_array != NULL) {
+								rebalance_ctx->failed_stripes = new_array;
+								rebalance_ctx->failed_stripes_capacity = new_capacity;
+							}
+						}
+						if (rebalance_ctx->failed_stripes != NULL) {
+							rebalance_ctx->failed_stripes[rebalance_ctx->num_failed_stripes++] = stripe_ctx->stripe_index;
+						}
+						ec_bdev_process_request_complete(process_req, 0);
+						return;
+					}
+					
+					/* 更新条带上下文中的设备索引（函数会直接修改传入的数组） */
+					/* 注意：ec_select_base_bdevs_wear_leveling_with_profile 会直接修改传入的数组，
+					 * 所以 stripe_ctx->data_indices 和 stripe_ctx->parity_indices 已经被更新了 */
+					
+					/* 重置重试计数（成功重新选择） */
+					rebalance_ctx->device_failure_retry_count = 0;
+					
+					/* 继续使用新选择的设备 */
+					idx = stripe_ctx->data_indices[i];
+					base_info = &ec_bdev->base_bdev_info[idx];
+					
+					/* 再次检查新选择的设备是否可用 */
+					if (base_info->desc == NULL || base_info->is_failed) {
+						SPDK_ERRLOG("Reselected data device %u is also not available for stripe %lu - skipping stripe\n",
+							    idx, stripe_ctx->stripe_index);
+						if (rebalance_ctx->num_failed_stripes >= rebalance_ctx->failed_stripes_capacity) {
+							uint32_t new_capacity = rebalance_ctx->failed_stripes_capacity == 0 ? 
+							    64 : rebalance_ctx->failed_stripes_capacity * 2;
+							uint64_t *new_array = realloc(rebalance_ctx->failed_stripes,
+												new_capacity * sizeof(uint64_t));
+							if (new_array != NULL) {
+								rebalance_ctx->failed_stripes = new_array;
+								rebalance_ctx->failed_stripes_capacity = new_capacity;
+							}
+						}
+						if (rebalance_ctx->failed_stripes != NULL) {
+							rebalance_ctx->failed_stripes[rebalance_ctx->num_failed_stripes++] = stripe_ctx->stripe_index;
+						}
+						ec_bdev_process_request_complete(process_req, 0);
+						return;
+					}
+				}
+				
+				uint64_t pd_lba = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+						  base_info->data_offset;
+				
+				rc = spdk_bdev_write_blocks(base_info->desc,
+							    process->ec_ch->process.ch_processed->base_channel[idx],
+							    stripe_ctx->data_ptrs[i], pd_lba, ec_bdev->strip_size,
+							    ec_bdev_process_stripe_write_complete, process_req);
+				if (rc != 0) {
+					if (rc == -ENOMEM) {
+						/* Queue wait and retry */
+						process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+						process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+						process_req->ec_io.waitq_entry.cb_arg = process;
+						process_req->ec_io.waitq_entry.dep_unblock = true;
+						spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+									process->ec_ch->process.ch_processed->base_channel[idx],
+									&process_req->ec_io.waitq_entry);
+						return;  /* Will retry */
+					} else {
+						SPDK_ERRLOG("Failed to write data to new device %u for rebalance stripe %lu: %s\n",
+							    idx, stripe_ctx->stripe_index, spdk_strerror(-rc));
+						process->status = rc;
+						process->error_status = rc;
+						if (rebalance_ctx) {
+							rebalance_ctx->error_status = rc;
+						}
+						ec_bdev_process_request_complete(process_req, rc);
+						return;
+					}
+				}
+			}
+			
+			/* Write p parity blocks */
+			for (i = 0; i < p; i++) {
+				idx = stripe_ctx->parity_indices[i];
+				struct ec_base_bdev_info *base_info = &ec_bdev->base_bdev_info[idx];
+				
+				if (base_info->desc == NULL || base_info->is_failed) {
+					/* 【问题1修复】设备失败时，尝试重新选择设备而不是直接中止重平衡 */
+					SPDK_WARNLOG("New parity device %u is not available for rebalance stripe %lu - attempting device reselection\n",
+						    idx, stripe_ctx->stripe_index);
+					
+					/* 标记该设备在当前重平衡上下文中暂时不可用 */
+					rebalance_ctx->device_failure_retry_count++;
+					
+					/* 如果重试次数过多，跳过该条带 */
+					if (rebalance_ctx->device_failure_retry_count > 3) {
+						SPDK_ERRLOG("Device reselection failed after %u retries for stripe %lu - skipping stripe\n",
+							    rebalance_ctx->device_failure_retry_count, stripe_ctx->stripe_index);
+						
+						/* 记录失败的条带 */
+						if (rebalance_ctx->num_failed_stripes >= rebalance_ctx->failed_stripes_capacity) {
+							uint32_t new_capacity = rebalance_ctx->failed_stripes_capacity == 0 ? 
+							    64 : rebalance_ctx->failed_stripes_capacity * 2;
+							uint64_t *new_array = realloc(rebalance_ctx->failed_stripes,
+												new_capacity * sizeof(uint64_t));
+							if (new_array == NULL) {
+								SPDK_ERRLOG("Failed to allocate memory for failed stripes list\n");
+							} else {
+								rebalance_ctx->failed_stripes = new_array;
+								rebalance_ctx->failed_stripes_capacity = new_capacity;
+							}
+						}
+						if (rebalance_ctx->failed_stripes != NULL) {
+							rebalance_ctx->failed_stripes[rebalance_ctx->num_failed_stripes++] = stripe_ctx->stripe_index;
+						}
+						
+						/* 完成当前请求（标记为跳过） */
+						ec_bdev_process_request_complete(process_req, 0);
+						return;
+					}
+					
+					/* 【问题2修复】重新选择设备：使用force_profile_id参数，避免全局状态切换竞态条件 */
+					base_info->is_failed = true;
+					
+					/* 重新触发设备选择，使用force_profile_id参数而不是修改全局状态 */
+					rc = ec_select_base_bdevs_wear_leveling_with_profile(ec_bdev, stripe_ctx->stripe_index,
+										stripe_ctx->data_indices, stripe_ctx->parity_indices,
+										rebalance_ctx->new_active_profile_id);
+					
+					/* 恢复设备状态 */
+					base_info->is_failed = false;
+					
+					if (rc != 0) {
+						SPDK_ERRLOG("Failed to reselect devices after failure for stripe %lu: %s\n",
+							    stripe_ctx->stripe_index, spdk_strerror(-rc));
+						/* 跳过该条带 */
+						if (rebalance_ctx->num_failed_stripes >= rebalance_ctx->failed_stripes_capacity) {
+							uint32_t new_capacity = rebalance_ctx->failed_stripes_capacity == 0 ? 
+							    64 : rebalance_ctx->failed_stripes_capacity * 2;
+							uint64_t *new_array = realloc(rebalance_ctx->failed_stripes,
+												new_capacity * sizeof(uint64_t));
+							if (new_array != NULL) {
+								rebalance_ctx->failed_stripes = new_array;
+								rebalance_ctx->failed_stripes_capacity = new_capacity;
+							}
+						}
+						if (rebalance_ctx->failed_stripes != NULL) {
+							rebalance_ctx->failed_stripes[rebalance_ctx->num_failed_stripes++] = stripe_ctx->stripe_index;
+						}
+						ec_bdev_process_request_complete(process_req, 0);
+						return;
+					}
+					
+					/* 更新条带上下文中的设备索引（函数会直接修改传入的数组） */
+					/* 注意：ec_select_base_bdevs_wear_leveling_with_profile 会直接修改传入的数组，
+					 * 所以 stripe_ctx->data_indices 和 stripe_ctx->parity_indices 已经被更新了 */
+					
+					/* 重置重试计数（成功重新选择） */
+					rebalance_ctx->device_failure_retry_count = 0;
+					
+					/* 继续使用新选择的设备 */
+					idx = stripe_ctx->parity_indices[i];
+					base_info = &ec_bdev->base_bdev_info[idx];
+					
+					/* 再次检查新选择的设备是否可用 */
+					if (base_info->desc == NULL || base_info->is_failed) {
+						SPDK_ERRLOG("Reselected parity device %u is also not available for stripe %lu - skipping stripe\n",
+							    idx, stripe_ctx->stripe_index);
+						if (rebalance_ctx->num_failed_stripes >= rebalance_ctx->failed_stripes_capacity) {
+							uint32_t new_capacity = rebalance_ctx->failed_stripes_capacity == 0 ? 
+							    64 : rebalance_ctx->failed_stripes_capacity * 2;
+							uint64_t *new_array = realloc(rebalance_ctx->failed_stripes,
+												new_capacity * sizeof(uint64_t));
+							if (new_array != NULL) {
+								rebalance_ctx->failed_stripes = new_array;
+								rebalance_ctx->failed_stripes_capacity = new_capacity;
+							}
+						}
+						if (rebalance_ctx->failed_stripes != NULL) {
+							rebalance_ctx->failed_stripes[rebalance_ctx->num_failed_stripes++] = stripe_ctx->stripe_index;
+						}
+						ec_bdev_process_request_complete(process_req, 0);
+						return;
+					}
+				}
+				
+				uint64_t pd_lba = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+						  base_info->data_offset;
+				
+				rc = spdk_bdev_write_blocks(base_info->desc,
+							    process->ec_ch->process.ch_processed->base_channel[idx],
+							    parity_ptrs[i], pd_lba, ec_bdev->strip_size,
+							    ec_bdev_process_stripe_write_complete, process_req);
+				if (rc != 0) {
+					if (rc == -ENOMEM) {
+						/* Queue wait and retry */
+						process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+						process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+						process_req->ec_io.waitq_entry.cb_arg = process;
+						process_req->ec_io.waitq_entry.dep_unblock = true;
+						spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+									process->ec_ch->process.ch_processed->base_channel[idx],
+									&process_req->ec_io.waitq_entry);
+						return;  /* Will retry */
+					} else {
+						SPDK_ERRLOG("Failed to write parity to new device %u for rebalance stripe %lu: %s\n",
+							    idx, stripe_ctx->stripe_index, spdk_strerror(-rc));
+						process->status = rc;
+						process->error_status = rc;
+						if (rebalance_ctx) {
+							rebalance_ctx->error_status = rc;
+						}
+						ec_bdev_process_request_complete(process_req, rc);
+						return;
+					}
+				}
+			}
+			
+			return;  /* Writes submitted, will continue in write_complete callback */
+		}
 		if (rc != 0) {
 			if (rc == -ENOMEM) {
 				/* Queue wait and retry - use waitq_entry from ec_io (each request has its own) */
@@ -794,10 +1931,522 @@ ec_bdev_submit_process_request(struct ec_bdev_process *process, uint64_t stripe_
 	struct ec_base_bdev_info *base_info;
 	uint8_t data_indices[EC_MAX_K];
 	uint8_t parity_indices[EC_MAX_P];
+	uint8_t old_data_indices[EC_MAX_K];
+	uint8_t old_parity_indices[EC_MAX_P];
 	uint8_t i, idx;
 	uint8_t num_available = 0;
 	uint32_t strip_size_bytes;
 	int rc;
+
+	/* Try to reuse request from queue first (aligned with RAID framework) */
+	process_req = TAILQ_FIRST(&process->requests);
+	if (process_req != NULL) {
+		/* Remove from queue - will be re-inserted on completion */
+		TAILQ_REMOVE(&process->requests, process_req, link);
+		/* Get stripe context from reused request */
+		stripe_ctx = (struct ec_process_stripe_ctx *)(process_req + 1);
+		/* Clear stripe context for reuse */
+		memset(stripe_ctx, 0, sizeof(*stripe_ctx));
+	} else {
+		/* No request available in queue - allocate new one */
+		process_req = NULL;
+		stripe_ctx = NULL;
+	}
+	
+	/* Handle rebalance differently from rebuild */
+	if (process->type == EC_PROCESS_REBALANCE) {
+		struct ec_rebalance_context *rebalance_ctx = ec_bdev->rebalance_ctx;
+		struct ec_device_selection_config *config = &ec_bdev->selection_config;
+		uint32_t group_id;
+		uint16_t old_profile_id;
+		uint8_t k = ec_bdev->k;
+		uint8_t p = ec_bdev->p;
+		
+		if (rebalance_ctx == NULL) {
+			SPDK_ERRLOG("Rebalance context is NULL for stripe %lu\n", stripe_index);
+			if (process_req == NULL) {
+				/* Only free if we allocated it */
+			} else {
+				/* Put back to queue on error */
+				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			}
+			return -EINVAL;
+		}
+		
+		/* Allocate process request with embedded stripe context if not reused */
+		if (process_req == NULL) {
+			process_req = calloc(1, sizeof(*process_req) + sizeof(*stripe_ctx));
+			if (process_req == NULL) {
+				return -ENOMEM;
+			}
+			stripe_ctx = (struct ec_process_stripe_ctx *)(process_req + 1);
+		}
+		
+		process_req->process = process;
+		process_req->target = NULL;  /* Rebalance doesn't have a target */
+		process_req->target_ch = NULL;
+		stripe_ctx->process_req = process_req;
+		stripe_ctx->stripe_index = stripe_index;
+		
+		/* Calculate group_id */
+		group_id = ec_selection_calculate_group_id(config, stripe_index);
+		
+		/* 【步骤1】获取旧profile（通过group_profile_map，如果未绑定则使用old_active_profile_id） */
+		if (config->group_profile_map != NULL && 
+		    group_id < config->group_profile_capacity &&
+		    config->group_profile_map[group_id] != 0) {
+			/* Group已绑定，使用绑定的profile */
+			old_profile_id = config->group_profile_map[group_id];
+		} else {
+			/* Group未绑定，使用重平衡前的active profile */
+			old_profile_id = rebalance_ctx->old_active_profile_id;
+		}
+		
+		/* 【问题2修复】使用force_profile_id参数选择旧设备，避免全局状态切换竞态条件 */
+		rc = ec_select_base_bdevs_wear_leveling_with_profile(ec_bdev, stripe_index,
+							old_data_indices, old_parity_indices,
+							old_profile_id);
+		
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to select old devices for rebalance stripe %lu: %s\n",
+				    stripe_index, spdk_strerror(-rc));
+			/* Put request back to queue on error (will be reused later) */
+			TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			return rc;
+		}
+		
+		/* 【步骤2】使用新profile选择新设备
+		 * 【问题2修复】使用force_profile_id参数，避免全局状态切换竞态条件
+		 * 因为此时group_profile_map尚未更新（在验证通过后才更新），会回退到active_profile_id
+		 */
+		rc = ec_select_base_bdevs_wear_leveling_with_profile(ec_bdev, stripe_index,
+							data_indices, parity_indices,
+							rebalance_ctx->new_active_profile_id);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to select new devices for rebalance stripe %lu: %s\n",
+				    stripe_index, spdk_strerror(-rc));
+			/* Put request back to queue on error (will be reused later) */
+			TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			return rc;
+		}
+		
+		/* Copy new indices to stripe context (for writing) */
+		memcpy(stripe_ctx->data_indices, data_indices, sizeof(data_indices));
+		memcpy(stripe_ctx->parity_indices, parity_indices, sizeof(parity_indices));
+		
+		/* Store old indices (data + parity) in available_indices for reading */
+		/* 【问题7修复】包含parity设备，以便在数据设备失败时可以从parity恢复 */
+		memcpy(stripe_ctx->available_indices, old_data_indices, k * sizeof(uint8_t));
+		memcpy(stripe_ctx->available_indices + k, old_parity_indices, p * sizeof(uint8_t));
+		stripe_ctx->num_available = k + p;  /* Include parity devices for recovery */
+		
+		/* Allocate buffers */
+		strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+		stripe_ctx->stripe_buf = ec_get_rmw_stripe_buf(process->ec_ch, ec_bdev,
+							      strip_size_bytes * k);
+		if (stripe_ctx->stripe_buf == NULL) {
+			SPDK_ERRLOG("Failed to allocate stripe buffer for rebalance\n");
+			/* Put request back to queue on error (will be reused later) */
+			TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			return -ENOMEM;
+		}
+		
+		/* Allocate parity buffer for re-encoding */
+		stripe_ctx->recover_buf = spdk_dma_malloc(strip_size_bytes * p, ec_bdev->buf_alignment, NULL);
+		if (stripe_ctx->recover_buf == NULL) {
+			SPDK_ERRLOG("Failed to allocate parity buffer for rebalance\n");
+			ec_put_rmw_stripe_buf(process->ec_ch, stripe_ctx->stripe_buf,
+					     strip_size_bytes * k);
+			/* Put request back to queue on error (will be reused later) */
+			TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			return -ENOMEM;
+		}
+		
+		/* Prepare data pointers */
+		for (i = 0; i < k; i++) {
+			stripe_ctx->data_ptrs[i] = stripe_ctx->stripe_buf + i * strip_size_bytes;
+		}
+		
+		/* 【步骤3】从旧设备读取k个数据块（并行） */
+		stripe_ctx->reads_completed = 0;
+		stripe_ctx->reads_expected = k;
+		stripe_ctx->reads_submitted = 0;
+		stripe_ctx->reads_retry_needed = false;
+		
+		/* Update counters - request will be inserted to queue on completion
+		 * Aligned with RAID framework: window_remaining increases when request is submitted
+		 */
+		process->window_remaining++;
+		process->window_stripes_submitted++;
+		
+		/* Submit reads from old devices */
+		/* 【问题7修复】尝试从旧设备读取，如果失败则尝试从其他可用设备恢复 */
+		uint8_t failed_data_indices[EC_MAX_K];
+		uint8_t num_failed_data = 0;
+		uint8_t num_available_read = 0;
+		
+		for (i = 0; i < k; i++) {
+			idx = old_data_indices[i];
+			base_info = &ec_bdev->base_bdev_info[idx];
+			
+			if (base_info->desc == NULL || base_info->is_failed) {
+				/* Mark this data device as failed */
+				failed_data_indices[num_failed_data++] = i;
+				SPDK_WARNLOG("Old data device %u is not available for rebalance stripe %lu, will try recovery\n",
+					     idx, stripe_ctx->stripe_index);
+			} else {
+				/* Device is available - submit read */
+				uint64_t pd_lba = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+						  base_info->data_offset;
+				
+				rc = spdk_bdev_read_blocks(base_info->desc,
+							   process->ec_ch->process.ch_processed->base_channel[idx],
+							   stripe_ctx->data_ptrs[i], pd_lba, ec_bdev->strip_size,
+							   ec_bdev_process_stripe_read_complete, process_req);
+				if (rc != 0) {
+					if (rc == -ENOMEM) {
+						/* Queue wait and retry */
+						process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+						process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+						process_req->ec_io.waitq_entry.cb_arg = process;
+						process_req->ec_io.waitq_entry.dep_unblock = true;
+						spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+									process->ec_ch->process.ch_processed->base_channel[idx],
+									&process_req->ec_io.waitq_entry);
+						stripe_ctx->reads_expected = num_available_read;
+						stripe_ctx->reads_submitted = num_available_read;
+						stripe_ctx->reads_retry_needed = true;
+						return 0;  /* Request is in queue, will retry */
+					} else {
+						/* Read failed - mark as failed and try recovery */
+						failed_data_indices[num_failed_data++] = i;
+						SPDK_WARNLOG("Failed to read from old data device %u for rebalance stripe %lu: %s, will try recovery\n",
+							     idx, stripe_ctx->stripe_index, spdk_strerror(-rc));
+					}
+				} else {
+					/* Read submitted successfully */
+					num_available_read++;
+					stripe_ctx->reads_submitted++;
+				}
+			}
+		}
+		
+		/* If we have failed data devices, try to recover from parity devices */
+		if (num_failed_data > 0) {
+			/* Check if we have enough available devices (k total needed) */
+			uint8_t total_available = num_available_read;
+			uint8_t j;
+			
+			/* Count available parity devices */
+			for (j = 0; j < p && total_available < k; j++) {
+				idx = old_parity_indices[j];
+				base_info = &ec_bdev->base_bdev_info[idx];
+				if (base_info->desc != NULL && !base_info->is_failed) {
+					total_available++;
+				}
+			}
+			
+			if (total_available < k) {
+				SPDK_ERRLOG("Not enough available devices for rebalance stripe %lu: "
+					    "need %u, have %u (failed data: %u)\n",
+					    stripe_ctx->stripe_index, k, total_available, num_failed_data);
+				/* Free buffers and put request back to queue */
+				ec_put_rmw_stripe_buf(process->ec_ch, stripe_ctx->stripe_buf,
+						     strip_size_bytes * k);
+				spdk_dma_free(stripe_ctx->recover_buf);
+				/* Put request back to queue on error (will be reused later) */
+				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+				return -ENODEV;
+			}
+			
+			/* We have enough devices - read from parity devices to fill gaps */
+			uint8_t parity_read_idx = 0;
+			for (j = 0; j < num_failed_data && parity_read_idx < p; j++) {
+				uint8_t failed_data_idx = failed_data_indices[j];
+				
+				/* Find next available parity device */
+				while (parity_read_idx < p) {
+					idx = old_parity_indices[parity_read_idx];
+					base_info = &ec_bdev->base_bdev_info[idx];
+					if (base_info->desc != NULL && !base_info->is_failed) {
+						/* Read from parity device into data buffer (will decode later) */
+						uint64_t pd_lba = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+								  base_info->data_offset;
+						
+						/* Use a temporary buffer for parity data - we'll decode later */
+						/* For now, read into data_ptrs[failed_data_idx] - we'll reorganize in read_complete */
+						rc = spdk_bdev_read_blocks(base_info->desc,
+									   process->ec_ch->process.ch_processed->base_channel[idx],
+									   stripe_ctx->data_ptrs[failed_data_idx], pd_lba, ec_bdev->strip_size,
+									   ec_bdev_process_stripe_read_complete, process_req);
+						if (rc != 0) {
+							if (rc == -ENOMEM) {
+								/* Queue wait and retry */
+								process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+								process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+								process_req->ec_io.waitq_entry.cb_arg = process;
+								process_req->ec_io.waitq_entry.dep_unblock = true;
+								spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+												process->ec_ch->process.ch_processed->base_channel[idx],
+												&process_req->ec_io.waitq_entry);
+								stripe_ctx->reads_expected = num_available_read + j;
+								stripe_ctx->reads_submitted = num_available_read + j;
+								stripe_ctx->reads_retry_needed = true;
+								return 0;  /* Request is in queue, will retry */
+							} else {
+								SPDK_ERRLOG("Failed to read from old parity device %u for rebalance stripe %lu: %s\n",
+									     idx, stripe_ctx->stripe_index, spdk_strerror(-rc));
+								/* Free buffers and put request back to queue */
+								ec_put_rmw_stripe_buf(process->ec_ch, stripe_ctx->stripe_buf,
+										     strip_size_bytes * k);
+								spdk_dma_free(stripe_ctx->recover_buf);
+								/* Put request back to queue on error (will be reused later) */
+								TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+								return rc;
+							}
+						}
+						/* Read submitted successfully */
+						num_available_read++;
+						stripe_ctx->reads_submitted++;
+						parity_read_idx++;
+						break;  /* Move to next failed data device */
+					}
+					parity_read_idx++;
+				}
+			}
+			
+			/* Update reads_expected to include parity reads */
+			stripe_ctx->reads_expected = num_available_read;
+			/* Save complete list of failed data fragment indices for decoding */
+			stripe_ctx->num_failed_data = num_failed_data;
+			memcpy(stripe_ctx->failed_data_indices, failed_data_indices, num_failed_data * sizeof(uint8_t));
+			/* Also store first failed fragment index for compatibility */
+			stripe_ctx->failed_frag_idx = (num_failed_data > 0) ? failed_data_indices[0] : UINT8_MAX;
+			
+			/* Set up frag_map correctly for decoding:
+			 * - data_indices[i] maps to logical fragment i (0 to k-1)
+			 * - parity_indices[i] maps to logical fragment k+i (k to k+p-1)
+			 * When we read from parity devices, we need to track which parity device
+			 * was used to recover which failed data fragment
+			 */
+			memset(stripe_ctx->frag_map, 0xFF, sizeof(stripe_ctx->frag_map));
+			for (j = 0; j < k; j++) {
+				stripe_ctx->frag_map[old_data_indices[j]] = j;
+			}
+			for (j = 0; j < p; j++) {
+				stripe_ctx->frag_map[old_parity_indices[j]] = k + j;
+			}
+		} else {
+			/* No failed devices - normal path */
+			stripe_ctx->reads_expected = k;
+			stripe_ctx->num_failed_data = 0;
+			stripe_ctx->failed_frag_idx = UINT8_MAX;
+		}
+		
+		/* reads_submitted has been updated during the read submission loops above */
+		/* Ensure it matches the expected number */
+		if (stripe_ctx->reads_submitted != stripe_ctx->reads_expected) {
+			SPDK_ERRLOG("Rebalance stripe %lu: reads_submitted (%u) != reads_expected (%u)\n",
+				    stripe_ctx->stripe_index, stripe_ctx->reads_submitted, stripe_ctx->reads_expected);
+		}
+		
+		return 0;  /* Reads submitted, will continue in read_complete callback */
+	}
+	
+	/* Rebuild path continues here... */
+	if (process->type == EC_PROCESS_REBUILD) {
+		/* Allocate process request with embedded stripe context for rebuild */
+		process_req = calloc(1, sizeof(*process_req) + sizeof(*stripe_ctx));
+		if (process_req == NULL) {
+			return -ENOMEM;
+		}
+		
+		process_req->process = process;
+		process_req->target = process->target;
+		process_req->target_ch = process->ec_ch->process.target_ch;
+		
+		stripe_ctx = (struct ec_process_stripe_ctx *)(process_req + 1);
+		stripe_ctx->process_req = process_req;
+		stripe_ctx->stripe_index = stripe_index;
+		
+		/* Get data and parity indices for this stripe */
+		if (ec_bdev->selection_config.select_fn != NULL) {
+			if (ec_bdev->selection_config.wear_leveling_enabled &&
+			    ec_bdev->selection_config.select_fn == ec_select_base_bdevs_wear_leveling) {
+				rc = ec_selection_bind_group_profile(ec_bdev, stripe_index);
+				if (spdk_unlikely(rc != 0)) {
+					SPDK_ERRLOG("Failed to bind stripe %lu to wear profile during rebuild on EC bdev %s: %s\n",
+						    stripe_index, ec_bdev->bdev.name, spdk_strerror(-rc));
+					/* Put request back to queue on error (will be reused later) */
+					if (process_req != NULL) {
+						TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+					}
+					return rc;
+				}
+			}
+			rc = ec_bdev->selection_config.select_fn(ec_bdev, stripe_index,
+								data_indices, parity_indices);
+		} else {
+			rc = ec_select_base_bdevs_default(ec_bdev, stripe_index,
+							  data_indices, parity_indices);
+		}
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to select base bdevs for rebuild stripe %lu on EC bdev %s: %s\n",
+				    stripe_index, ec_bdev->bdev.name, spdk_strerror(-rc));
+			/* Put request back to queue on error (will be reused later) */
+			if (process_req != NULL) {
+				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			}
+			return rc;
+		}
+		
+		/* Copy indices to stripe context */
+		memcpy(stripe_ctx->data_indices, data_indices, sizeof(data_indices));
+		memcpy(stripe_ctx->parity_indices, parity_indices, sizeof(parity_indices));
+		
+		/* Find available devices and target slot */
+		uint8_t target_slot = ec_bdev_base_bdev_slot(process->target);
+		num_available = 0;
+		uint8_t rebuild_k = ec_bdev->k;
+		uint8_t rebuild_p = ec_bdev->p;
+		
+		for (i = 0; i < rebuild_k; i++) {
+			idx = data_indices[i];
+			stripe_ctx->frag_map[idx] = i;
+			base_info = &ec_bdev->base_bdev_info[idx];
+			if (idx == target_slot) {
+				stripe_ctx->failed_frag_idx = i;
+			} else if (base_info->desc != NULL && !base_info->is_failed) {
+				if (process->ec_ch->process.ch_processed != NULL &&
+				    process->ec_ch->process.ch_processed->base_channel[idx] != NULL) {
+					stripe_ctx->available_indices[num_available++] = idx;
+				}
+			}
+		}
+		for (i = 0; i < rebuild_p; i++) {
+			idx = parity_indices[i];
+			stripe_ctx->frag_map[idx] = rebuild_k + i;
+			base_info = &ec_bdev->base_bdev_info[idx];
+			if (idx == target_slot) {
+				stripe_ctx->failed_frag_idx = rebuild_k + i;
+			} else if (base_info->desc != NULL && !base_info->is_failed) {
+				if (process->ec_ch->process.ch_processed != NULL &&
+				    process->ec_ch->process.ch_processed->base_channel[idx] != NULL) {
+					stripe_ctx->available_indices[num_available++] = idx;
+				}
+			}
+		}
+		
+		stripe_ctx->num_available = num_available;
+		
+		if (num_available < rebuild_k) {
+			SPDK_ERRLOG("Not enough available blocks (%u < %u) for rebuild stripe %lu\n",
+				    num_available, rebuild_k, stripe_index);
+			/* Put request back to queue on error (will be reused later) */
+			if (process_req != NULL) {
+				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			}
+			return -ENODEV;
+		}
+		
+		/* Allocate buffers */
+		uint32_t rebuild_strip_size_bytes = ec_bdev->strip_size * ec_bdev->bdev.blocklen;
+		stripe_ctx->stripe_buf = ec_get_rmw_stripe_buf(process->ec_ch, ec_bdev,
+							      rebuild_strip_size_bytes * rebuild_k);
+		if (stripe_ctx->stripe_buf == NULL) {
+			SPDK_ERRLOG("Failed to allocate stripe buffer for rebuild\n");
+			/* Put request back to queue on error (will be reused later) */
+			if (process_req != NULL) {
+				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			}
+			return -ENOMEM;
+		}
+		
+		stripe_ctx->recover_buf = spdk_dma_malloc(rebuild_strip_size_bytes, ec_bdev->buf_alignment, NULL);
+		if (stripe_ctx->recover_buf == NULL) {
+			SPDK_ERRLOG("Failed to allocate recovery buffer for rebuild\n");
+			ec_put_rmw_stripe_buf(process->ec_ch, stripe_ctx->stripe_buf,
+					     rebuild_strip_size_bytes * rebuild_k);
+			/* Put request back to queue on error (will be reused later) */
+			if (process_req != NULL) {
+				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+			}
+			return -ENOMEM;
+		}
+		
+		/* Prepare data pointers */
+		for (i = 0; i < rebuild_k; i++) {
+			stripe_ctx->data_ptrs[i] = stripe_ctx->stripe_buf + i * rebuild_strip_size_bytes;
+		}
+		
+		/* Read k available blocks in parallel */
+		process->rebuild_state = EC_REBUILD_STATE_READING;
+		stripe_ctx->reads_completed = 0;
+		stripe_ctx->reads_expected = rebuild_k;
+		stripe_ctx->reads_submitted = 0;
+		stripe_ctx->reads_retry_needed = false;
+		
+		/* Update counters - request will be inserted to queue on completion
+		 * Aligned with RAID framework: window_remaining increases when request is submitted
+		 */
+		process->window_remaining++;
+		process->window_stripes_submitted++;
+		
+		/* Submit reads from available devices */
+		for (i = 0; i < rebuild_k; i++) {
+			idx = stripe_ctx->available_indices[i];
+			base_info = &ec_bdev->base_bdev_info[idx];
+			
+			if (base_info->desc == NULL || base_info->is_failed) {
+				SPDK_ERRLOG("Device %u is not available for rebuild stripe %lu\n",
+					    idx, stripe_ctx->stripe_index);
+				/* Free buffers and put request back to queue */
+				ec_put_rmw_stripe_buf(process->ec_ch, stripe_ctx->stripe_buf,
+						     rebuild_strip_size_bytes * rebuild_k);
+				spdk_dma_free(stripe_ctx->recover_buf);
+				/* Put request back to queue on error (will be reused later) */
+				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+				return -ENODEV;
+			}
+			
+			uint64_t pd_lba = (stripe_ctx->stripe_index << ec_bdev->strip_size_shift) +
+					  base_info->data_offset;
+			
+			rc = spdk_bdev_read_blocks(base_info->desc,
+						   process->ec_ch->process.ch_processed->base_channel[idx],
+						   stripe_ctx->data_ptrs[i], pd_lba, ec_bdev->strip_size,
+						   ec_bdev_process_stripe_read_complete, process_req);
+			if (rc != 0) {
+				if (rc == -ENOMEM) {
+					/* Queue wait and retry */
+					process_req->ec_io.waitq_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+					process_req->ec_io.waitq_entry.cb_fn = ec_bdev_process_thread_run_wrapper;
+					process_req->ec_io.waitq_entry.cb_arg = process;
+					process_req->ec_io.waitq_entry.dep_unblock = true;
+					spdk_bdev_queue_io_wait(process_req->ec_io.waitq_entry.bdev,
+								process->ec_ch->process.ch_processed->base_channel[idx],
+								&process_req->ec_io.waitq_entry);
+					stripe_ctx->reads_expected = i;
+					stripe_ctx->reads_submitted = i;
+					stripe_ctx->reads_retry_needed = true;
+					return 0;  /* Request is in queue, will retry */
+				} else {
+					SPDK_ERRLOG("Failed to read from device %u for rebuild stripe %lu: %s\n",
+						    idx, stripe_ctx->stripe_index, spdk_strerror(-rc));
+					/* Free buffers and put request back to queue */
+					ec_put_rmw_stripe_buf(process->ec_ch, stripe_ctx->stripe_buf,
+							     rebuild_strip_size_bytes * rebuild_k);
+					spdk_dma_free(stripe_ctx->recover_buf);
+					/* Put request back to queue on error (will be reused later) */
+					TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+					return rc;
+				}
+			}
+			stripe_ctx->reads_submitted++;
+		}
+		
+		return 0;  /* Reads submitted, will continue in read_complete callback */
+	}
 
 	/* Allocate process request with embedded stripe context */
 	process_req = calloc(1, sizeof(*process_req) + sizeof(*stripe_ctx));
@@ -950,8 +2599,7 @@ ec_bdev_submit_process_request(struct ec_bdev_process *process, uint64_t stripe_
 					stripe_ctx->reads_submitted = reads_submitted;
 					stripe_ctx->reads_retry_needed = true;  /* Mark that retry is needed */
 					
-					/* Add to queue and update window_remaining */
-					TAILQ_INSERT_TAIL(&process->requests, process_req, link);
+					/* Update window_remaining - request will be inserted to queue on completion */
 					process->window_remaining++;
 					process->window_stripes_submitted++;
 					/* Will retry remaining reads via read_complete callback when partial reads finish */
@@ -985,9 +2633,9 @@ ec_bdev_submit_process_request(struct ec_bdev_process *process, uint64_t stripe_
 				rc = -EIO;
 				/* Update expected reads to match what we've submitted */
 				stripe_ctx->reads_expected = reads_submitted;
-				/* Add to queue so completion can handle the error */
-				TAILQ_INSERT_TAIL(&process->requests, process_req, link);
-				/* Update window_remaining - stripe was attempted (even if failed) */
+				/* Update window_remaining - stripe was attempted (even if failed)
+				 * Request will be inserted to queue on completion
+				 */
 				process->window_remaining++;
 				process->window_stripes_submitted++;
 				/* Set error status - completion callback will handle cleanup */
@@ -1000,10 +2648,10 @@ ec_bdev_submit_process_request(struct ec_bdev_process *process, uint64_t stripe_
 		stripe_ctx->reads_submitted++;
 	}
 
-	/* All reads submitted successfully - add to request queue and update counters
+	/* All reads submitted successfully - update counters
+	 * Note: Request is NOT inserted to queue here - it will be inserted on completion
 	 * Aligned with RAID framework: window_remaining increases when request is submitted
 	 */
-	TAILQ_INSERT_TAIL(&process->requests, process_req, link);
 	process->window_remaining++;
 	process->window_stripes_submitted++;
 	return 0;
@@ -1056,18 +2704,30 @@ ec_bdev_process_thread_run(struct ec_bdev_process *process)
 	if (error_to_check != 0 || process->state >= EC_PROCESS_STATE_STOPPING) {
 		/* Process finished or error occurred */
 		if (error_to_check == 0 && process->window_offset >= ec_bdev->bdev.blockcnt) {
-			/* Rebuild complete */
-			SPDK_NOTICELOG("Rebuild completed for base bdev %s (slot %u) on EC bdev %s\n",
-				       process->target->name,
-				       ec_bdev_base_bdev_slot(process->target),
-				       ec_bdev->bdev.name);
+			/* Process complete - handle rebuild and rebalance differently */
+			if (process->type == EC_PROCESS_REBUILD) {
+				/* Rebuild complete */
+				SPDK_NOTICELOG("Rebuild completed for base bdev %s (slot %u) on EC bdev %s\n",
+					       process->target->name,
+					       ec_bdev_base_bdev_slot(process->target),
+					       ec_bdev->bdev.name);
 
-			/* Turn off LED for all healthy disks */
-			ec_bdev_set_healthy_disks_led(ec_bdev, SPDK_VMD_LED_STATE_OFF);
+				/* Turn off LED for all healthy disks */
+				ec_bdev_set_healthy_disks_led(ec_bdev, SPDK_VMD_LED_STATE_OFF);
 
-			/* Call completion callback */
-			if (process->rebuild_done_cb != NULL) {
-				process->rebuild_done_cb(process->rebuild_done_ctx, 0);
+				/* Call completion callback */
+				if (process->rebuild_done_cb != NULL) {
+					process->rebuild_done_cb(process->rebuild_done_ctx, 0);
+				}
+			} else if (process->type == EC_PROCESS_REBALANCE) {
+				/* Rebalance complete */
+				SPDK_NOTICELOG("Rebalance completed on EC bdev %s\n",
+					       ec_bdev->bdev.name);
+
+				/* Call rebalance completion callback */
+				if (process->rebalance_done_cb != NULL) {
+					process->rebalance_done_cb(process->rebalance_done_ctx, 0);
+				}
 			}
 
 			/* Cleanup */
@@ -1086,9 +2746,64 @@ ec_bdev_process_thread_run(struct ec_bdev_process *process)
 			SPDK_ERRLOG("EC process failed for bdev %s: %s\n",
 				    ec_bdev->bdev.name, spdk_strerror(-process->status));
 
-			/* Call completion callback */
-			if (process->rebuild_done_cb != NULL) {
-				process->rebuild_done_cb(process->rebuild_done_ctx, process->status);
+			/* Handle rebalance failure - rollback group_profile_map */
+			if (process->type == EC_PROCESS_REBALANCE) {
+				struct ec_rebalance_context *rebalance_ctx = ec_bdev->rebalance_ctx;
+				if (rebalance_ctx != NULL) {
+					struct ec_device_selection_config *config = &ec_bdev->selection_config;
+					uint32_t group_id;
+					
+					SPDK_WARNLOG("EC[rebalance] Rolling back group_profile_map for failed rebalance on EC bdev %s\n",
+						     ec_bdev->bdev.name);
+					
+					/* 【问题5修复】Rollback: 只回滚本次重平衡中更新的 group
+					 * 而不是所有匹配 new_active_profile_id 的 group
+					 * 这样可以避免回滚之前重平衡留下的 group
+					 */
+					if (config->group_profile_map != NULL && 
+					    rebalance_ctx->updated_groups != NULL &&
+					    rebalance_ctx->num_updated_groups > 0) {
+						SPDK_WARNLOG("EC[rebalance] Rolling back %u groups updated during this rebalance\n",
+							     rebalance_ctx->num_updated_groups);
+						for (uint32_t i = 0; i < rebalance_ctx->num_updated_groups; i++) {
+							group_id = rebalance_ctx->updated_groups[i];
+							if (group_id < config->group_profile_capacity &&
+							    config->group_profile_map[group_id] == rebalance_ctx->new_active_profile_id) {
+								config->group_profile_map[group_id] = rebalance_ctx->old_active_profile_id;
+							}
+						}
+						/* Mark as dirty to persist rollback */
+						ec_selection_mark_group_dirty(ec_bdev);
+					} else {
+						/* 【问题2修复】如果没有跟踪信息，说明跟踪失败或未初始化
+						 * 这种情况下，我们无法安全地回滚，只能记录错误
+						 * 不应该使用fallback逻辑，因为可能回滚错误的group
+						 */
+						SPDK_ERRLOG("EC[rebalance] Cannot rollback: updated_groups tracking unavailable for EC bdev %s\n",
+							     ec_bdev->bdev.name);
+						SPDK_ERRLOG("EC[rebalance] Manual intervention may be required to fix group_profile_map\n");
+						/* 不执行回滚，避免回滚错误的group */
+					}
+					
+					/* Revert active_profile_id to old profile */
+					config->active_profile_id = rebalance_ctx->old_active_profile_id;
+				}
+			}
+
+			/* Call completion callback based on process type */
+			if (process->type == EC_PROCESS_REBUILD) {
+				if (process->rebuild_done_cb != NULL) {
+					process->rebuild_done_cb(process->rebuild_done_ctx, process->status);
+				}
+			} else if (process->type == EC_PROCESS_REBALANCE) {
+				if (process->rebalance_done_cb != NULL) {
+					process->rebalance_done_cb(process->rebalance_done_ctx, process->status);
+				}
+			} else {
+				/* For other types, use rebuild callback as default */
+				if (process->rebuild_done_cb != NULL) {
+					process->rebuild_done_cb(process->rebuild_done_ctx, process->status);
+				}
 			}
 
 			/* Cleanup */
@@ -1191,7 +2906,12 @@ ec_bdev_start_process(struct ec_bdev *ec_bdev, enum ec_process_type type,
 {
 	struct ec_bdev_process *process;
 
-	if (ec_bdev == NULL || target == NULL) {
+	if (ec_bdev == NULL) {
+		return -EINVAL;
+	}
+
+	/* Rebuild requires a target, but rebalance does not */
+	if (type == EC_PROCESS_REBUILD && target == NULL) {
 		return -EINVAL;
 	}
 
@@ -1210,8 +2930,24 @@ ec_bdev_start_process(struct ec_bdev *ec_bdev, enum ec_process_type type,
 	process->type = type;
 	process->state = EC_PROCESS_STATE_INIT;
 	process->target = target;
-	process->rebuild_done_cb = done_cb;
-	process->rebuild_done_ctx = done_ctx;
+	/* Set callbacks based on process type */
+	if (type == EC_PROCESS_REBUILD) {
+		process->rebuild_done_cb = done_cb;
+		process->rebuild_done_ctx = done_ctx;
+		process->rebalance_done_cb = NULL;
+		process->rebalance_done_ctx = NULL;
+	} else if (type == EC_PROCESS_REBALANCE) {
+		process->rebalance_done_cb = done_cb;
+		process->rebalance_done_ctx = done_ctx;
+		process->rebuild_done_cb = NULL;
+		process->rebuild_done_ctx = NULL;
+	} else {
+		/* For other types, use rebuild callback as default */
+		process->rebuild_done_cb = done_cb;
+		process->rebuild_done_ctx = done_ctx;
+		process->rebalance_done_cb = NULL;
+		process->rebalance_done_ctx = NULL;
+	}
 	process->window_status = 0;
 	process->error_status = 0;
 	process->window_offset = 0;
@@ -1288,8 +3024,20 @@ ec_bdev_stop_process(struct ec_bdev *ec_bdev)
 	}
 
 	/* Call done callback if set */
-	if (process->rebuild_done_cb != NULL) {
-		process->rebuild_done_cb(process->rebuild_done_ctx, -ECANCELED);
+	/* Call completion callback based on process type */
+	if (process->type == EC_PROCESS_REBUILD) {
+		if (process->rebuild_done_cb != NULL) {
+			process->rebuild_done_cb(process->rebuild_done_ctx, -ECANCELED);
+		}
+	} else if (process->type == EC_PROCESS_REBALANCE) {
+		if (process->rebalance_done_cb != NULL) {
+			process->rebalance_done_cb(process->rebalance_done_ctx, -ECANCELED);
+		}
+	} else {
+		/* For other types, use rebuild callback as default */
+		if (process->rebuild_done_cb != NULL) {
+			process->rebuild_done_cb(process->rebuild_done_ctx, -ECANCELED);
+		}
 	}
 
 	/* Cleanup will be done in process thread */

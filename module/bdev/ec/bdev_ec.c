@@ -49,6 +49,9 @@ void ec_bdev_module_stop_done(struct ec_bdev *ec_bdev);
 void ec_bdev_free(struct ec_bdev *ec_bdev);
 void ec_bdev_free_base_bdev_resource(struct ec_base_bdev_info *base_info);
 
+/* Forward declarations for static functions */
+static void ec_bdev_rebalance_done_cb(void *ctx, int status);
+
 /*
  * 扩展框架骨架实现说明：
  *
@@ -84,6 +87,9 @@ ec_bdev_start_rebalance(struct ec_bdev *ec_bdev,
 			void (*done_cb)(void *ctx, int status),
 			void *done_ctx)
 {
+	struct ec_rebalance_context *rebalance_ctx;
+	uint64_t total_stripes;
+
 	if (ec_bdev == NULL) {
 		if (done_cb) {
 			done_cb(done_ctx, -EINVAL);
@@ -91,15 +97,322 @@ ec_bdev_start_rebalance(struct ec_bdev *ec_bdev,
 		return -EINVAL;
 	}
 
-	/* 骨架阶段：仅输出提示，返回不支持。不会被现有流程自动调用。 */
-	SPDK_NOTICELOG("EC[rebalance] start requested on EC bdev %s, but rebalance framework is not wired yet (skeleton only)\n",
-		       ec_bdev->bdev.name);
-
-	if (done_cb) {
-		done_cb(done_ctx, -ENOTSUP);
+	/* Check if rebalance is already in progress */
+	if (ec_bdev->rebalance_state == EC_REBALANCE_RUNNING ||
+	    ec_bdev->rebalance_state == EC_REBALANCE_PAUSED) {
+		SPDK_ERRLOG("EC[rebalance] Rebalance already in progress for EC bdev %s\n",
+			    ec_bdev->bdev.name);
+		if (done_cb) {
+			done_cb(done_ctx, -EBUSY);
+		}
+		return -EBUSY;
 	}
 
-	return -ENOTSUP;
+	/* Check if rebuild is in progress (rebuild has priority) */
+	if (ec_bdev_is_process_in_progress(ec_bdev)) {
+		struct ec_bdev_process *process = ec_bdev->process;
+		if (process != NULL && process->type == EC_PROCESS_REBUILD) {
+			SPDK_ERRLOG("EC[rebalance] Cannot start rebalance for EC bdev %s: rebuild in progress\n",
+				    ec_bdev->bdev.name);
+			if (done_cb) {
+				done_cb(done_ctx, -EBUSY);
+			}
+			return -EBUSY;
+		}
+	}
+
+	/* Allocate rebalance context */
+	rebalance_ctx = calloc(1, sizeof(*rebalance_ctx));
+	if (rebalance_ctx == NULL) {
+		SPDK_ERRLOG("EC[rebalance] Failed to allocate rebalance context for EC bdev %s\n",
+			    ec_bdev->bdev.name);
+		if (done_cb) {
+			done_cb(done_ctx, -ENOMEM);
+		}
+		return -ENOMEM;
+	}
+
+	rebalance_ctx->ec_bdev = ec_bdev;
+	rebalance_ctx->done_cb = done_cb;
+	rebalance_ctx->done_ctx = done_ctx;
+	rebalance_ctx->current_stripe = 0;
+	rebalance_ctx->error_status = 0;
+	
+	/* 【问题2修复】预分配跟踪更新的 group 的数组，避免后续 realloc 失败
+	 * 估算最大可能的 group 数量（基于总 stripe 数）
+	 */
+	uint64_t estimated_groups = 0;
+	if (ec_bdev->strip_size > 0 && ec_bdev->bdev.blockcnt > 0) {
+		uint64_t total_stripes = ec_bdev->bdev.blockcnt / (ec_bdev->strip_size * ec_bdev->k);
+		if (ec_bdev->bdev.blockcnt % (ec_bdev->strip_size * ec_bdev->k) != 0) {
+			total_stripes++;
+		}
+		uint32_t group_size = ec_bdev->selection_config.stripe_group_size;
+		if (group_size > 0) {
+			estimated_groups = (total_stripes + group_size - 1) / group_size;
+		} else {
+			estimated_groups = total_stripes;  /* Fallback: assume one group per stripe */
+		}
+	}
+	
+	/* 预分配数组，初始容量为估算值或默认值（取较大者） */
+	uint32_t initial_capacity = (estimated_groups > 100) ? (uint32_t)estimated_groups : 100;
+	rebalance_ctx->updated_groups = calloc(initial_capacity, sizeof(uint32_t));
+	if (rebalance_ctx->updated_groups == NULL) {
+		/* 如果预分配失败，使用较小的初始容量 */
+		initial_capacity = 16;
+		rebalance_ctx->updated_groups = calloc(initial_capacity, sizeof(uint32_t));
+		if (rebalance_ctx->updated_groups == NULL) {
+			SPDK_ERRLOG("EC[rebalance] Failed to allocate updated_groups array for EC bdev %s\n",
+				    ec_bdev->bdev.name);
+			free(rebalance_ctx);
+			if (done_cb) {
+				done_cb(done_ctx, -ENOMEM);
+			}
+			return -ENOMEM;
+		}
+	}
+	rebalance_ctx->num_updated_groups = 0;
+	rebalance_ctx->updated_groups_capacity = initial_capacity;
+
+	/* Get device selection config */
+	struct ec_device_selection_config *config = &ec_bdev->selection_config;
+
+	/* 【步骤1】保存旧的active profile */
+	rebalance_ctx->old_active_profile_id = config->active_profile_id;
+	if (rebalance_ctx->old_active_profile_id == 0) {
+		rebalance_ctx->old_active_profile_id = 1;  /* Default to profile 1 if not set */
+	}
+
+	/* 【步骤2】创建新profile（使用当前磨损级别，包含新设备） */
+	uint16_t new_profile_id = config->next_profile_id++;
+	if (new_profile_id == 0) {
+		new_profile_id = 1;
+		config->next_profile_id = 2;
+	}
+	struct ec_wear_profile_slot *new_profile = 
+		ec_selection_ensure_profile_slot(config, new_profile_id);
+	if (new_profile == NULL) {
+		SPDK_ERRLOG("EC[rebalance] Failed to create new profile for EC bdev %s\n",
+			    ec_bdev->bdev.name);
+		free(rebalance_ctx);
+		if (done_cb) {
+			done_cb(done_ctx, -ENOMEM);
+		}
+		return -ENOMEM;
+	}
+
+	/* 收集当前磨损级别（包含新设备） */
+	uint32_t current_wear_levels[EC_MAX_BASE_BDEVS];
+	ec_selection_collect_device_wear(ec_bdev, current_wear_levels);
+
+	/* 更新新profile的磨损级别和权重 */
+	memcpy(new_profile->wear_levels, current_wear_levels, 
+	       sizeof(current_wear_levels));
+	ec_selection_compute_weights_from_levels(ec_bdev->num_base_bdevs,
+						current_wear_levels,
+						new_profile->wear_weights);
+	new_profile->valid = true;
+
+	/* 【步骤3】保存新的active profile（但不立即修改active_profile_id）
+	 * 修复问题2：active_profile_id 不应在重平衡开始时修改，应仅在完成时修改
+	 * 这样可以避免重平衡过程中其他操作使用错误的 profile
+	 */
+	rebalance_ctx->new_active_profile_id = new_profile_id;
+	/* 不在这里修改 active_profile_id，将在重平衡完成时修改 */
+
+	/* 【步骤4】清除所有assignment_cache（强制重新计算） */
+	ec_assignment_cache_reset(&config->assignment_cache);
+	if (ec_assignment_cache_init(&config->assignment_cache, 
+				     EC_ASSIGNMENT_CACHE_DEFAULT_CAPACITY) != 0) {
+		SPDK_ERRLOG("EC[rebalance] Failed to initialize assignment cache for EC bdev %s\n",
+			    ec_bdev->bdev.name);
+		free(rebalance_ctx);
+		if (done_cb) {
+			done_cb(done_ctx, -ENOMEM);
+		}
+		return -ENOMEM;
+	}
+
+	/* 【步骤5】绑定所有未绑定的group到旧profile（关键修复，避免读取错误） */
+	if (config->group_profile_map != NULL && config->num_stripe_groups > 0) {
+		uint32_t group_id;
+		for (group_id = 0; group_id < config->num_stripe_groups; group_id++) {
+			if (config->group_profile_map[group_id] == 0) {
+				/* 未绑定的group，绑定到旧profile（数据在旧设备） */
+				config->group_profile_map[group_id] = rebalance_ctx->old_active_profile_id;
+				ec_selection_mark_group_dirty(ec_bdev);
+			}
+		}
+	}
+
+	/* 【步骤6】计算总stripe数 */
+	if (ec_bdev->strip_size > 0 && ec_bdev->bdev.blockcnt > 0) {
+		/* Total stripes = (total blocks) / (strip_size * k) */
+		total_stripes = ec_bdev->bdev.blockcnt / (ec_bdev->strip_size * ec_bdev->k);
+		if (ec_bdev->bdev.blockcnt % (ec_bdev->strip_size * ec_bdev->k) != 0) {
+			total_stripes++;  /* Round up if there's a partial stripe */
+		}
+	} else {
+		total_stripes = 0;
+	}
+	rebalance_ctx->total_stripes = total_stripes;
+
+	/* Store rebalance context in ec_bdev */
+	ec_bdev->rebalance_ctx = rebalance_ctx;
+	ec_bdev->rebalance_state = EC_REBALANCE_RUNNING;
+	ec_bdev->rebalance_progress = 0;
+
+	SPDK_NOTICELOG("EC[rebalance] Starting rebalance on EC bdev %s: "
+		       "old_profile=%u, new_profile=%u, total_stripes=%lu\n",
+		       ec_bdev->bdev.name,
+		       rebalance_ctx->old_active_profile_id,
+		       rebalance_ctx->new_active_profile_id,
+		       rebalance_ctx->total_stripes);
+
+	/* Start rebalance process (target is NULL for rebalance) */
+	int rc = ec_bdev_start_process(ec_bdev, EC_PROCESS_REBALANCE, NULL,
+					ec_bdev_rebalance_done_cb, rebalance_ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("EC[rebalance] Failed to start rebalance process for EC bdev %s: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-rc));
+		ec_bdev->rebalance_state = EC_REBALANCE_FAILED;
+		ec_bdev->rebalance_ctx = NULL;
+		free(rebalance_ctx);
+		if (done_cb) {
+			done_cb(done_ctx, rc);
+		}
+		return rc;
+	}
+
+	return 0;
+}
+
+/* Callback for superblock write after rebalance completion */
+static void
+ec_bdev_rebalance_sb_write_done(int sb_status, struct ec_bdev *ec_bdev, void *cb_ctx)
+{
+	struct ec_rebalance_context *rebalance_ctx = cb_ctx;
+	int rebalance_status = rebalance_ctx->error_status;
+
+	if (sb_status != 0) {
+		SPDK_ERRLOG("EC[rebalance] Failed to persist group_profile_map for EC bdev %s: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-sb_status));
+		/* Continue with rebalance completion even if superblock write failed */
+	}
+
+	/* Update rebalance state */
+	struct ec_device_selection_config *config = &ec_bdev->selection_config;
+	if (rebalance_status == 0) {
+		ec_bdev->rebalance_state = EC_REBALANCE_COMPLETED;
+		ec_bdev->rebalance_progress = 100;
+		
+		/* 【问题1修复】报告失败的条带列表 */
+		if (rebalance_ctx->num_failed_stripes > 0) {
+			SPDK_WARNLOG("EC[rebalance] Rebalance completed with %u failed stripes on EC bdev %s\n",
+				     rebalance_ctx->num_failed_stripes, ec_bdev->bdev.name);
+			if (rebalance_ctx->num_failed_stripes <= 10) {
+				/* 如果失败条带数量较少，打印所有失败的条带 */
+				SPDK_WARNLOG("EC[rebalance] Failed stripe indices: ");
+				for (uint32_t i = 0; i < rebalance_ctx->num_failed_stripes; i++) {
+					SPDK_WARNLOG("%lu ", rebalance_ctx->failed_stripes[i]);
+				}
+				SPDK_WARNLOG("\n");
+			} else {
+				/* 如果失败条带数量较多，只打印前10个 */
+				SPDK_WARNLOG("EC[rebalance] First 10 failed stripe indices: ");
+				for (uint32_t i = 0; i < 10; i++) {
+					SPDK_WARNLOG("%lu ", rebalance_ctx->failed_stripes[i]);
+				}
+				SPDK_WARNLOG("... (total %u failed stripes)\n", rebalance_ctx->num_failed_stripes);
+			}
+		} else {
+			SPDK_NOTICELOG("EC[rebalance] Rebalance completed successfully on EC bdev %s\n",
+				       ec_bdev->bdev.name);
+		}
+		
+		/* 【问题2修复】重平衡成功完成时，更新 active_profile_id 到新 profile */
+		if (rebalance_ctx != NULL && config != NULL) {
+			config->active_profile_id = rebalance_ctx->new_active_profile_id;
+			SPDK_NOTICELOG("EC[rebalance] Updated active_profile_id to %u for EC bdev %s\n",
+				       config->active_profile_id, ec_bdev->bdev.name);
+		}
+	} else {
+		ec_bdev->rebalance_state = EC_REBALANCE_FAILED;
+		SPDK_ERRLOG("EC[rebalance] Rebalance failed on EC bdev %s: %s\n",
+			    ec_bdev->bdev.name, spdk_strerror(-rebalance_status));
+		
+		/* 【问题1修复】即使重平衡失败，也报告失败的条带列表 */
+		if (rebalance_ctx->num_failed_stripes > 0) {
+			SPDK_ERRLOG("EC[rebalance] %u stripes were skipped during rebalance\n",
+				    rebalance_ctx->num_failed_stripes);
+		}
+		
+		/* 【问题2修复】重平衡失败时，确保 active_profile_id 保持为旧 profile
+		 * （回滚逻辑已在 process 中处理）
+		 */
+	}
+
+	/* Call user callback if provided */
+	if (rebalance_ctx->done_cb != NULL) {
+		rebalance_ctx->done_cb(rebalance_ctx->done_ctx, rebalance_status);
+	}
+
+	/* 【问题1修复】清理失败条带列表 */
+	if (rebalance_ctx->failed_stripes != NULL) {
+		free(rebalance_ctx->failed_stripes);
+		rebalance_ctx->failed_stripes = NULL;
+	}
+	
+	/* Cleanup rebalance context */
+	ec_bdev->rebalance_ctx = NULL;
+	free(rebalance_ctx);
+}
+
+static void
+ec_bdev_rebalance_done_cb(void *ctx, int status)
+{
+	struct ec_rebalance_context *rebalance_ctx = ctx;
+	struct ec_bdev *ec_bdev;
+	struct ec_device_selection_config *config;
+
+	if (rebalance_ctx == NULL) {
+		return;
+	}
+
+	ec_bdev = rebalance_ctx->ec_bdev;
+	if (ec_bdev == NULL) {
+		free(rebalance_ctx);
+		return;
+	}
+
+	/* Save status for later use */
+	rebalance_ctx->error_status = status;
+
+	config = &ec_bdev->selection_config;
+
+	/* 【问题1和2修复】检查并确保 group_profile_map 已持久化 */
+	if (status == 0 && ec_bdev->superblock_enabled && config->group_profile_map != NULL) {
+		if (config->group_map_dirty || config->group_map_flush_in_progress) {
+			/* Force immediate flush of group_profile_map */
+			SPDK_NOTICELOG("EC[rebalance] Ensuring group_profile_map persistence for EC bdev %s\n",
+				       ec_bdev->bdev.name);
+			
+			/* Save selection metadata and write superblock immediately */
+			ec_bdev_sb_save_selection_metadata(ec_bdev);
+			ec_bdev_write_superblock(ec_bdev, ec_bdev_rebalance_sb_write_done, rebalance_ctx);
+			
+			/* Mark as not dirty since we're flushing now */
+			config->group_map_dirty = false;
+			config->group_map_flush_in_progress = false;
+			
+			/* Don't call user callback here - will be called in sb_write_done */
+			return;
+		}
+	}
+
+	/* No dirty data or superblock disabled - complete immediately */
+	ec_bdev_rebalance_sb_write_done(0, ec_bdev, rebalance_ctx);
 }
 
 /* Type definition for examine load superblock callback */
@@ -616,7 +929,18 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 		}
 		spdk_json_write_named_string(w, "state", state_str);
 		spdk_json_write_named_uint8(w, "progress", ec_bdev->rebalance_progress);
-		/* TODO: 当rebalance_ctx结构实现后，添加current_stripe, total_stripes, last_error等字段 */
+		
+		/* Add detailed rebalance information if rebalance_ctx is available */
+		if (ec_bdev->rebalance_ctx != NULL) {
+			struct ec_rebalance_context *rebalance_ctx = ec_bdev->rebalance_ctx;
+			spdk_json_write_named_uint64(w, "current_stripe", rebalance_ctx->current_stripe);
+			spdk_json_write_named_uint64(w, "total_stripes", rebalance_ctx->total_stripes);
+			if (rebalance_ctx->error_status != 0) {
+				spdk_json_write_named_string_fmt(w, "last_error", "Rebalance failed: %s",
+								  spdk_strerror(-rebalance_ctx->error_status));
+			}
+		}
+		
 		spdk_json_write_object_end(w);
 	} else {
 		/* IDLE状态时，输出简单的状态字段 */
@@ -674,13 +998,13 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 				total_stripes = legacy_ctx->total_stripes;
 				if (total_stripes > 0) {
 					percent = (double)current_stripe * 100.0 / (double)total_stripes;
-				}
+		}
 				state_str = ec_rebuild_state_to_str(legacy_ctx->state);
 			}
 		}
 
 		if (rebuild_in_progress) {
-			spdk_json_write_named_object_begin(w, "rebuild");
+		spdk_json_write_named_object_begin(w, "rebuild");
 			if (target_name != NULL) {
 				spdk_json_write_named_string(w, "target", target_name);
 			} else {
@@ -689,17 +1013,17 @@ ec_bdev_write_info_json(struct ec_bdev *ec_bdev, struct spdk_json_write_ctx *w)
 			if (target_slot != UINT8_MAX) {
 				spdk_json_write_named_uint8(w, "target_slot", target_slot);
 			}
-			spdk_json_write_named_object_begin(w, "progress");
+		spdk_json_write_named_object_begin(w, "progress");
 			spdk_json_write_named_uint64(w, "current_stripe", current_stripe);
 			spdk_json_write_named_uint64(w, "total_stripes", total_stripes);
-			spdk_json_write_named_double(w, "percent", percent);
+		spdk_json_write_named_double(w, "percent", percent);
 			if (state_str != NULL) {
 				spdk_json_write_named_string(w, "state", state_str);
 			} else {
 				spdk_json_write_named_string(w, "state", "UNKNOWN");
 			}
-			spdk_json_write_object_end(w);
-			spdk_json_write_object_end(w);
+		spdk_json_write_object_end(w);
+		spdk_json_write_object_end(w);
 		}
 	}
 
@@ -2602,7 +2926,7 @@ ec_bdev_add_base_bdev(struct ec_bdev *ec_bdev, const char *name,
 			if (iter->name == NULL && spdk_uuid_is_null(&iter->uuid)) {
 				base_info = iter;
 				slot = (uint8_t)(iter - ec_bdev->base_bdev_info);
-				break;
+			break;
 			}
 		}
 	}
@@ -3656,8 +3980,8 @@ _ec_bdev_fail_base_bdev(void *ctx)
 				     ec_bdev->bdev.name,
 				     base_info->name ? base_info->name : "unknown",
 				     slot, active_count, spare_count);
-			return;
-		}
+				return;
+			}
 
 		/* 激活 spare，并清除 spare 标记 */
 		spare->is_spare = false;

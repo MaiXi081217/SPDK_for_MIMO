@@ -32,6 +32,12 @@ extern bool g_ec_encode_workers_enabled;
 /* ISA-L optimal alignment for SIMD operations */
 #define EC_ISAL_OPTIMAL_ALIGN	64
 
+/* Process framework constants */
+#define EC_OFFSET_BLOCKS_INVALID		UINT64_MAX
+#define EC_BDEV_PROCESS_MAX_QD		16
+#define EC_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT	1024
+#define EC_BDEV_PROCESS_MAX_BANDWIDTH_MB_SEC_DEFAULT	0
+
 /* RAID5F-style object pool size - pre-allocate stripe_private objects
  * Increased from 32 to 64 for better performance with sufficient memory
  * Each object is ~1-2KB, so 64 objects = ~64-128KB per io_channel
@@ -272,6 +278,9 @@ struct ec_bdev_process {
 	/* Callback for rebuild completion */
 	void (*rebuild_done_cb)(void *ctx, int status);
 	void *rebuild_done_ctx;
+	/* Callback for rebalance completion */
+	void (*rebalance_done_cb)(void *ctx, int status);
+	void *rebalance_done_ctx;
 	/* Simplified rebuild: error flag (atomic) for unified error handling */
 	volatile int		error_status;
 };
@@ -338,6 +347,38 @@ struct ec_rebuild_context {
 	
 	/* Flag to indicate if rebuild is paused */
 	bool paused;
+};
+
+/* Rebalance context for data migration during hybrid mode expansion
+ * 精简版本：只保留必要字段，最大化复用现有机制
+ */
+struct ec_rebalance_context {
+	/* 基础信息 */
+	struct ec_bdev *ec_bdev;
+	void (*done_cb)(void *ctx, int status);
+	void *done_ctx;
+	
+	/* 进度跟踪（最小化） */
+	uint64_t current_stripe;
+	uint64_t total_stripes;
+	
+	/* Profile管理（核心机制） */
+	uint16_t old_active_profile_id;  /* 重平衡前的active profile */
+	uint16_t new_active_profile_id;  /* 重平衡后的active profile（新创建） */
+	
+	/* 【问题5修复】跟踪本次重平衡中更新的 group，用于精确回滚 */
+	uint32_t *updated_groups;  /* 动态分配的数组，存储已更新的 group_id */
+	uint32_t num_updated_groups;  /* 已更新的 group 数量 */
+	uint32_t updated_groups_capacity;  /* 数组容量 */
+	
+	/* 错误处理（简化） */
+	int error_status;
+	
+	/* 【问题1修复】失败条带跟踪 */
+	uint64_t *failed_stripes;  /* 动态分配的数组，存储失败的条带索引 */
+	uint32_t num_failed_stripes;  /* 失败的条带数量 */
+	uint32_t failed_stripes_capacity;  /* 数组容量 */
+	uint32_t device_failure_retry_count;  /* 设备故障重试计数 */
 };
 
 /* Process framework helper functions */
@@ -462,6 +503,12 @@ int ec_select_base_bdevs_wear_leveling(struct ec_bdev *ec_bdev,
 		uint64_t stripe_index,
 		uint8_t *data_indices,
 		uint8_t *parity_indices);
+/* 【问题2修复】添加force_profile_id参数版本，避免全局状态切换竞态条件 */
+int ec_select_base_bdevs_wear_leveling_with_profile(struct ec_bdev *ec_bdev,
+		uint64_t stripe_index,
+		uint8_t *data_indices,
+		uint8_t *parity_indices,
+		uint16_t force_profile_id);
 
 /* Process framework functions */
 int ec_bdev_start_process(struct ec_bdev *ec_bdev, enum ec_process_type type,
@@ -487,6 +534,18 @@ void ec_bdev_set_healthy_disks_led(struct ec_bdev *ec_bdev, enum spdk_vmd_led_st
 int ec_selection_bind_group_profile(struct ec_bdev *ec_bdev, uint64_t stripe_index);
 int ec_selection_create_profile_from_devices(struct ec_bdev *ec_bdev, bool make_active,
 					     bool persist_now);
+
+/* Device selection and wear leveling functions */
+int ec_selection_collect_device_wear(struct ec_bdev *ec_bdev, uint32_t *levels);
+void ec_selection_compute_weights_from_levels(uint8_t n, const uint32_t *levels, uint32_t *weights);
+struct ec_wear_profile_slot *ec_selection_ensure_profile_slot(struct ec_device_selection_config *config, uint16_t profile_id);
+uint32_t ec_selection_calculate_group_id(const struct ec_device_selection_config *config, uint64_t stripe_index);
+void ec_selection_mark_group_dirty(struct ec_bdev *ec_bdev);
+
+/* Assignment cache functions */
+void ec_assignment_cache_reset(struct ec_assignment_cache *cache);
+int ec_assignment_cache_init(struct ec_assignment_cache *cache, uint32_t requested_capacity);
+void ec_assignment_cache_invalidate_stripe(struct ec_device_selection_config *config, uint64_t stripe_index);
 
 /* RMW stripe buffer management */
 unsigned char *ec_get_rmw_stripe_buf(struct ec_bdev_io_channel *ec_ch, struct ec_bdev *ec_bdev, uint32_t buf_size);
